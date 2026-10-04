@@ -1,5 +1,7 @@
 # SSX (2012) — rexglue static recompilation
 
+[![Play Video](https://img.youtube.com/vi/cT2P-EIpZzY/0.jpg)](https://www.youtube.com/watch?v=cT2P-EIpZzY)
+
 A native Windows build of **SSX** (Xbox 360, 2012), made by
 statically recompiling the game's PowerPC code to C++ with
 [rexglue-sdk](https://github.com/rexglue/rexglue-sdk) v0.10.0. Graphics, audio
