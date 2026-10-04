@@ -1,0 +1,1734 @@
+From bd94bda0887acb368f86c681c0b181642fb6657c Mon Sep 17 00:00:00 2001
+From: "PM.RAZOR" <hslee1659@naver.com>
+Date: Sat, 3 Oct 2026 14:08:40 +0900
+Subject: [PATCH 1/9] Fix crashes and rendering bugs found while porting SSX
+ (2012)
+
+- Input: serialize InputSystem entry points; concurrent guest polling
+  rebuilt devices_ under other readers and crashed in RefreshDevices.
+- Config/achievement/log TOML loading: open files via std::filesystem::path
+  so non-ASCII (e.g. Korean) user folders load on Windows.
+- D3D12 texture cache: clamp small-mip copies of resolution-scaled
+  textures to the destination subresource (odd sizes overran it and removed
+  the device with INVALID_CALL); size the 3D-as-2D wrapper by the draw
+  resolution scale like xenia-canary.
+- D3D12 render target cache: 8_8_8_8 <-> 8_8_8_8_GAMMA ownership transfer
+  converted in the wrong direction (inverted vs Xenia).
+- New diagnostics (off by default): --d3d12_diagnose_invalid_command_lists
+  bisects a command list that fails Close() and logs the first invalid
+  command; --log_wait_stats logs per-thread guest wait call sites.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../rex/graphics/d3d12/command_processor.h    |   3 +
+ .../graphics/d3d12/deferred_command_list.h    |  10 ++
+ include/rex/input/input_system.h              |   6 +
+ src/core/cvar.cpp                             |   3 +-
+ src/core/logging.cpp                          |   5 +-
+ src/graphics/d3d12/command_processor.cpp      |  50 +++++++-
+ src/graphics/d3d12/deferred_command_list.cpp  | 113 ++++++++++++++++++
+ src/graphics/d3d12/render_target_cache.cpp    |   5 +-
+ src/graphics/d3d12/texture_cache.cpp          |  25 ++++
+ src/input/input_system.cpp                    |   6 +
+ src/kernel/xboxkrnl/xboxkrnl_threading.cpp    |  90 ++++++++++++++
+ src/system/achievement_manager.cpp            |   6 +-
+ 12 files changed, 315 insertions(+), 7 deletions(-)
+
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 96d362b..83e7a9e 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -186,6 +186,9 @@ class D3D12CommandProcessor : public CommandProcessor {
+   // Sets the current cached values to external ones. This is for cache
+   // invalidation primarily. A submission must be open.
+   void SetExternalPipeline(ID3D12PipelineState* pipeline);
++  // Bisects deferred_command_list_ after its Close() failed and logs the
++  // offending command (see the d3d12_diagnose_invalid_command_lists cvar).
++  void DiagnoseInvalidCommandList();
+   void SetExternalGraphicsRootSignature(ID3D12RootSignature* root_signature);
+   void SetViewport(const D3D12_VIEWPORT& viewport);
+   void SetScissorRect(const D3D12_RECT& scissor_rect);
+diff --git a/include/rex/graphics/d3d12/deferred_command_list.h b/include/rex/graphics/d3d12/deferred_command_list.h
+index 7f1eb7f..774fdcc 100644
+--- a/include/rex/graphics/d3d12/deferred_command_list.h
++++ b/include/rex/graphics/d3d12/deferred_command_list.h
+@@ -11,6 +11,8 @@
+ 
+ #pragma once
+ 
++#include <string>
++
+ #include <algorithm>
+ #include <cstdint>
+ #include <cstring>
+@@ -34,6 +36,14 @@ class DeferredCommandList {
+ 
+   void Reset();
+   void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1);
++  // Records only commands [first_command, max_commands) (descriptor heap
++  // bindings before first_command are still recorded). Returns the total number
++  // of commands in the stream. Used to bisect command lists that fail Close().
++  size_t ExecuteRange(ID3D12GraphicsCommandList* command_list,
++                      ID3D12GraphicsCommandList1* command_list_1, size_t first_command,
++                      size_t max_commands);
++  // Human-readable description of the command at the given index.
++  std::string DescribeCommand(size_t index) const;
+ 
+   D3D12_RECT* ClearDepthStencilViewAllocatedRects(D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,
+                                                   D3D12_CLEAR_FLAGS clear_flags, FLOAT depth,
+diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
+index 1cb3faa..790e6c9 100644
+--- a/include/rex/input/input_system.h
++++ b/include/rex/input/input_system.h
+@@ -11,6 +11,7 @@
+  */
+ 
+ #include <memory>
++#include <mutex>
+ #include <vector>
+ 
+ #include <rex/input/device_assignment.h>
+@@ -65,6 +66,11 @@ class InputSystem : public system::IInputSystem {
+   // does not renumber pad two.
+   std::vector<DeviceInfo> devices_;
+   std::vector<InputDriver*> device_owners_;
++
++  // Guest threads poll input concurrently, and every entry point rebuilds
++  // devices_ via RefreshDevices(); serialize them so the vectors are not
++  // reallocated under another reader.
++  std::recursive_mutex mutex_;
+ };
+ 
+ /// Create a default InputSystem with SDL + NOP drivers.
+diff --git a/src/core/cvar.cpp b/src/core/cvar.cpp
+index 228728d..a8e3e78 100644
+--- a/src/core/cvar.cpp
++++ b/src/core/cvar.cpp
+@@ -643,7 +643,8 @@ void LoadConfig(const std::filesystem::path& config_path) {
+   }
+ 
+   try {
+-    auto config = toml::parse_file(config_path.string());
++    std::ifstream config_path_stream(config_path, std::ios::binary);
++    auto config = toml::parse(config_path_stream, config_path.string());
+     ApplyTomlTable(config, "");
+     REXLOG_DEBUG("Loaded config from {}", config_path.string());
+   } catch (const toml::parse_error& err) {
+diff --git a/src/core/logging.cpp b/src/core/logging.cpp
+index 1645848..ea1b089 100644
+--- a/src/core/logging.cpp
++++ b/src/core/logging.cpp
+@@ -20,6 +20,8 @@
+ #include <spdlog/sinks/rotating_file_sink.h>
+ #include <spdlog/sinks/stdout_color_sinks.h>
+ 
++#include <fstream>
++
+ #include <toml++/toml.hpp>
+ 
+ #include <rex/cvar.h>
+@@ -544,7 +546,8 @@ std::map<std::string, std::string> ParseCategoryLevelsFromConfig(
+     return result;
+ 
+   try {
+-    auto config = toml::parse_file(config_path.string());
++    std::ifstream config_path_stream(config_path, std::ios::binary);
++    auto config = toml::parse(config_path_stream, config_path.string());
+     auto* log_table = config["log"].as_table();
+     if (!log_table)
+       return result;
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 19874a5..a19e572 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -32,6 +32,10 @@
+ #include <rex/ui/d3d12/d3d12_presenter.h>
+ #include <rex/ui/d3d12/d3d12_util.h>
+ 
++REXCVAR_DEFINE_BOOL(d3d12_diagnose_invalid_command_lists, false, "GPU/D3D12",
++                    "When a command list fails Close() (the device is then removed with "
++                    "INVALID_CALL), bisect it and log the first invalid command. Works "
++                    "without the D3D12 debug layer.");
+ REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+@@ -763,6 +767,45 @@ void D3D12CommandProcessor::ReleaseScratchGPUBuffer(ID3D12Resource* buffer,
+   }
+ }
+ 
++void D3D12CommandProcessor::DiagnoseInvalidCommandList() {
++  ID3D12Device* device = GetD3D12Provider().GetDevice();
++  // A list whose Close() failed stays broken even after Reset(), so every probe
++  // records into a new allocator and list.
++  auto probe = [&](size_t first, size_t count) -> HRESULT {
++    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
++    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
++    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList1> list_1;
++    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
++                                              IID_PPV_ARGS(&allocator))) ||
++        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(),
++                                         nullptr, IID_PPV_ARGS(&list)))) {
++      return E_FAIL;
++    }
++    list.As(&list_1);
++    deferred_command_list_.ExecuteRange(list.Get(), list_1.Get(), first, count);
++    return list->Close();
++  };
++  size_t total = deferred_command_list_.ExecuteRange(nullptr, nullptr, 0, 0);
++  if (SUCCEEDED(probe(0, total))) {
++    REXGPU_ERROR("Command list diagnosis: the list re-recorded fine ({} commands)", total);
++    return;
++  }
++  // Prefix lo is valid, prefix hi is invalid.
++  size_t lo = 0, hi = total;
++  while (hi - lo > 1) {
++    size_t mid = lo + (hi - lo) / 2;
++    (SUCCEEDED(probe(0, mid)) ? lo : hi) = mid;
++  }
++  size_t bad = hi - 1;
++  REXGPU_ERROR("Command list diagnosis: first invalid command #{} of {}: {}", bad, total,
++               deferred_command_list_.DescribeCommand(bad));
++  REXGPU_ERROR("Command list diagnosis: alone it is {}",
++               SUCCEEDED(probe(bad, bad + 1)) ? "valid (depends on earlier state)" : "invalid");
++  for (size_t i = bad > 8 ? bad - 8 : 0; i < bad; ++i) {
++    REXGPU_ERROR("  preceding #{}: {}", i, deferred_command_list_.DescribeCommand(i));
++  }
++}
++
+ void D3D12CommandProcessor::SetExternalPipeline(ID3D12PipelineState* pipeline) {
+   if (current_external_pipeline_ != pipeline) {
+     current_external_pipeline_ = pipeline;
+@@ -3426,7 +3469,12 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+     command_allocator->Reset();
+     command_list_->Reset(command_allocator, nullptr);
+     deferred_command_list_.Execute(command_list_, command_list_1_);
+-    command_list_->Close();
++    if (HRESULT close_result = command_list_->Close(); FAILED(close_result)) {
++      REXGPU_ERROR("D3D12 command list Close failed: 0x{:08X}", uint32_t(close_result));
++      if (REXCVAR_GET(d3d12_diagnose_invalid_command_lists)) {
++        DiagnoseInvalidCommandList();
++      }
++    }
+     ID3D12CommandList* execute_command_lists[] = {command_list_};
+     direct_queue->ExecuteCommandLists(1, execute_command_lists);
+     command_allocator_writable_first_->last_usage_submission = submission_current_;
+diff --git a/src/graphics/d3d12/deferred_command_list.cpp b/src/graphics/d3d12/deferred_command_list.cpp
+index e6d6277..e27e3b1 100644
+--- a/src/graphics/d3d12/deferred_command_list.cpp
++++ b/src/graphics/d3d12/deferred_command_list.cpp
+@@ -9,6 +9,9 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <algorithm>
++#include <iterator>
++
+ #include <rex/assert.h>
+ #include <rex/dbg.h>
+ #include <rex/graphics/d3d12/command_processor.h>
+@@ -30,6 +33,108 @@ void DeferredCommandList::Reset() {
+ 
+ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
+                                   ID3D12GraphicsCommandList1* command_list_1) {
++  ExecuteRange(command_list, command_list_1, 0, SIZE_MAX);
++}
++
++std::string DeferredCommandList::DescribeCommand(size_t index) const {
++  static const char* const kNames[] = {
++      "ClearDepthStencilView",
++      "ClearRenderTargetView",
++      "ClearUnorderedAccessViewUint",
++      "CopyBufferRegion",
++      "CopyResource",
++      "CopyTexture",
++      "CopyTextureRegion",
++      "Dispatch",
++      "DrawIndexedInstanced",
++      "DrawInstanced",
++      "BeginQuery",
++      "EndQuery",
++      "ResolveQueryData",
++      "IASetIndexBuffer",
++      "IASetPrimitiveTopology",
++      "IASetVertexBuffers",
++      "OMSetBlendFactor",
++      "OMSetRenderTargets",
++      "OMSetStencilRef",
++      "ResourceBarrier",
++      "RSSetScissorRect",
++      "RSSetViewport",
++      "SetComputeRoot32BitConstants",
++      "SetGraphicsRoot32BitConstants",
++      "SetComputeRootConstantBufferView",
++      "SetGraphicsRootConstantBufferView",
++      "SetComputeRootDescriptorTable",
++      "SetGraphicsRootDescriptorTable",
++      "SetComputeRootShaderResourceView",
++      "SetGraphicsRootShaderResourceView",
++      "SetComputeRootSignature",
++      "SetGraphicsRootSignature",
++      "SetComputeRootUnorderedAccessView",
++      "SetGraphicsRootUnorderedAccessView",
++      "SetDescriptorHeaps",
++      "SetPipelineState",
++      "SetPipelineStateHandle",
++      "SetSamplePositions",
++      "BeginDebugMarker",
++      "EndDebugMarker",
++      "InsertDebugMarker",
++  };
++  const uintmax_t* stream = command_stream_.data();
++  size_t stream_remaining = command_stream_.size();
++  for (size_t i = 0; stream_remaining != 0; ++i) {
++    const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
++    stream += kCommandHeaderSizeElements;
++    stream_remaining -= kCommandHeaderSizeElements;
++    if (i == index) {
++      size_t type = size_t(header.command);
++      std::string text =
++          fmt::format("{} (type {})", type < std::size(kNames) ? kNames[type] : "?", type);
++      if (header.command == Command::kD3DCopyTextureRegion) {
++        auto& args = *reinterpret_cast<const D3DCopyTextureRegionArguments*>(stream);
++        if (args.dst.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
++          D3D12_RESOURCE_DESC dd = args.dst.pResource->GetDesc();
++          text += fmt::format(" dst subresource {} of {}x{}x{} mips {} fmt {} at ({}, {}, {})",
++                              args.dst.SubresourceIndex, dd.Width, dd.Height, dd.DepthOrArraySize,
++                              dd.MipLevels, int(dd.Format), args.dst_x, args.dst_y, args.dst_z);
++        }
++        if (args.src.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
++          const D3D12_SUBRESOURCE_FOOTPRINT& fp = args.src.PlacedFootprint.Footprint;
++          text += fmt::format(" src footprint {}x{}x{} pitch {} fmt {} offset {}", fp.Width,
++                              fp.Height, fp.Depth, fp.RowPitch, int(fp.Format),
++                              args.src.PlacedFootprint.Offset);
++        } else {
++          D3D12_RESOURCE_DESC sd = args.src.pResource->GetDesc();
++          text += fmt::format(" src subresource {} of {}x{}x{} mips {} fmt {}",
++                              args.src.SubresourceIndex, sd.Width, sd.Height, sd.DepthOrArraySize,
++                              sd.MipLevels, int(sd.Format));
++        }
++        if (args.has_src_box) {
++          text += fmt::format(" box ({}, {}, {})-({}, {}, {})", args.src_box.left,
++                              args.src_box.top, args.src_box.front, args.src_box.right,
++                              args.src_box.bottom, args.src_box.back);
++        }
++      } else {
++        const uint32_t* words = reinterpret_cast<const uint32_t*>(stream);
++        size_t word_count =
++            std::min<size_t>(header.arguments_size_elements * (sizeof(uintmax_t) / 4), 12);
++        text += " args";
++        for (size_t w = 0; w < word_count; ++w) {
++          text += fmt::format(" {:08X}", words[w]);
++        }
++      }
++      return text;
++    }
++    stream += header.arguments_size_elements;
++    stream_remaining -= header.arguments_size_elements;
++  }
++  return "(out of range)";
++}
++
++size_t DeferredCommandList::ExecuteRange(ID3D12GraphicsCommandList* command_list,
++                                         ID3D12GraphicsCommandList1* command_list_1,
++                                         size_t first_command, size_t max_commands) {
++  size_t command_index = 0;
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -40,6 +145,13 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
+     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
+     stream += kCommandHeaderSizeElements;
+     stream_remaining -= kCommandHeaderSizeElements;
++    size_t this_command = command_index++;
++    if (this_command >= max_commands ||
++        (this_command < first_command && header.command != Command::kSetDescriptorHeaps)) {
++      stream += header.arguments_size_elements;
++      stream_remaining -= header.arguments_size_elements;
++      continue;
++    }
+     switch (header.command) {
+       case Command::kD3DClearDepthStencilView: {
+         auto& args = *reinterpret_cast<const ClearDepthStencilViewHeader*>(stream);
+@@ -275,6 +387,7 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
+     stream += header.arguments_size_elements;
+     stream_remaining -= header.arguments_size_elements;
+   }
++  return command_index;
+ }
+ 
+ void* DeferredCommandList::WriteCommand(Command command, size_t arguments_size_bytes) {
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index dd321a5..cc89a38 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -3043,8 +3043,9 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
+                       dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
+             if (source_color_format != dest_color_format) {
+               // Color space conversion between k_8_8_8_8 and
+-              // k_8_8_8_8_GAMMA.
+-              if (dest_color_format != xenos::ColorRenderTargetFormat::k_8_8_8_8) {
++              // k_8_8_8_8_GAMMA. _GAMMA is stored as linear, so converting to
++              // plain k_8_8_8_8 encodes gamma, and converting to _GAMMA decodes.
++              if (dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8) {
+                 for (uint32_t i = 0; i < 3; ++i) {
+                   DxbcShaderTranslator::PreSaturatedLinearToPWLGamma(a, 1, i, 1, i, 2, 0, 2, 1);
+                 }
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index 2be0e8e..abc26d9 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -1920,6 +1920,25 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+                      host_block_height);
+       source_box.back = source_box.front + std::max(depth >> level, uint32_t(1));
+       source_box_ptr = &source_box;
++    } else if (level && (texture_resolution_scale_x > 1 || texture_resolution_scale_y > 1)) {
++      // The staging footprint is the unscaled mip size times the scale, but the
++      // host mip is the scaled size shifted down, which is smaller for odd
++      // sizes in the small mips (146 >> 8 = 0 -> 1, * 2 = 2, but 292 >> 8 = 1).
++      // Copying the whole footprint would overrun the destination subresource.
++      const D3D12_SUBRESOURCE_FOOTPRINT& footprint = location_source.PlacedFootprint.Footprint;
++      source_box.left = 0;
++      source_box.top = 0;
++      source_box.front = 0;
++      source_box.right = std::min(
++          footprint.Width,
++          UINT(rex::align(std::max((width * texture_resolution_scale_x) >> level, uint32_t(1)),
++                          host_block_width)));
++      source_box.bottom = std::min(
++          footprint.Height,
++          UINT(rex::align(std::max((height * texture_resolution_scale_y) >> level, uint32_t(1)),
++                          host_block_height)));
++      source_box.back = footprint.Depth;
++      source_box_ptr = &source_box;
+     } else {
+       source_box_ptr = nullptr;
+     }
+@@ -1995,6 +2014,12 @@ ID3D12Resource* D3D12TextureCache::D3D12Texture::GetOrCreate3DAs2DResource(
+   desc.Alignment = 0;
+   desc.Width = key().GetWidth();
+   desc.Height = key().GetHeight();
++  // The wrapper keeps the key (including scaled_resolve), so its data is
++  // loaded at the draw resolution scale - size the resource to match.
++  if (key().scaled_resolve) {
++    desc.Width *= d3d12_cache.draw_resolution_scale_x();
++    desc.Height *= d3d12_cache.draw_resolution_scale_y();
++  }
+   desc.DepthOrArraySize = 1;
+   desc.MipLevels = 1;
+   desc.Format = d3d12_cache.GetDXGIResourceFormat(key());
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 813bb1c..721fa61 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -48,6 +48,7 @@ X_STATUS InputSystem::Setup() {
+ }
+ 
+ void InputSystem::Shutdown() {
++  std::lock_guard<std::recursive_mutex> lock(mutex_);
+   // device_owners_ holds raw driver pointers.
+   devices_.clear();
+   device_owners_.clear();
+@@ -72,6 +73,7 @@ void InputSystem::SetActiveCallback(std::function<bool()> callback) {
+ }
+ 
+ void InputSystem::SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignment) {
++  std::lock_guard<std::recursive_mutex> lock(mutex_);
+   assignment_ = std::move(assignment);
+   if (assignment_) {
+     assignment_->OnDevicesChanged(devices_);
+@@ -187,6 +189,7 @@ const DeviceInfo* InputSystem::DeviceInfoFor(DeviceId id) const {
+ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+                                       X_INPUT_CAPABILITIES* out_caps) {
+   SCOPE_profile_cpu_f("hid");
++  std::lock_guard<std::recursive_mutex> lock(mutex_);
+   if (!out_caps || !assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+@@ -214,6 +217,7 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+ 
+ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+   SCOPE_profile_cpu_f("hid");
++  std::lock_guard<std::recursive_mutex> lock(mutex_);
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+@@ -253,6 +257,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+ 
+ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
+   SCOPE_profile_cpu_f("hid");
++  std::lock_guard<std::recursive_mutex> lock(mutex_);
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+@@ -295,6 +300,7 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
+ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
+                                    X_INPUT_KEYSTROKE* out_keystroke) {
+   SCOPE_profile_cpu_f("hid");
++  std::lock_guard<std::recursive_mutex> lock(mutex_);
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index 57fd161..c810bc4 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+@@ -13,6 +13,11 @@
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
+ #include <algorithm>
++#include <rex/cvar.h>
++#include <tuple>
++#include <string>
++#include <mutex>
++#include <map>
+ #include <atomic>
+ #include <chrono>
+ #include <memory>
+@@ -39,6 +44,85 @@
+ #include <rex/thread/atomic.h>
+ #include <rex/thread/mutex.h>
+ 
++
++REXCVAR_DEFINE_BOOL(log_wait_stats, false, "Kernel",
++                    "Every 2 seconds, log which guest call sites (by link register) spent "
++                    "time in kernel waits/delays, per thread. For finding frame limiters.");
++
++namespace rex::kernel::xboxkrnl {
++namespace {
++
++struct WaitStatKey {
++  uint32_t thread_id;
++  uint32_t kind;
++  uint32_t lr;
++  bool operator<(const WaitStatKey& o) const {
++    return std::tie(thread_id, kind, lr) < std::tie(o.thread_id, o.kind, o.lr);
++  }
++};
++struct WaitStatValue {
++  uint64_t count = 0;
++  double total_ms = 0;
++  int64_t last_timeout = 0;
++};
++
++std::mutex g_wait_stats_mutex;
++std::map<WaitStatKey, WaitStatValue> g_wait_stats;
++std::chrono::steady_clock::time_point g_wait_stats_window = std::chrono::steady_clock::now();
++
++const char* const kWaitKindNames[] = {"KeDelayExecutionThread", "KeWaitForSingleObject",
++                                      "NtWaitForSingleObjectEx", "KeWaitForMultipleObjects",
++                                      "NtWaitForMultipleObjectsEx", "NtYieldExecution"};
++
++// Measures one kernel wait and attributes it to the guest caller.
++class WaitStatScope {
++ public:
++  WaitStatScope(uint32_t kind, int64_t timeout) : enabled_(REXCVAR_GET(log_wait_stats)) {
++    if (!enabled_)
++      return;
++    kind_ = kind;
++    timeout_ = timeout;
++    PPCContext* ctx = runtime::current_ppc_context();
++    lr_ = ctx ? uint32_t(ctx->lr) : 0;
++    start_ = std::chrono::steady_clock::now();
++  }
++  ~WaitStatScope() {
++    if (!enabled_)
++      return;
++    auto now = std::chrono::steady_clock::now();
++    double ms = std::chrono::duration<double, std::milli>(now - start_).count();
++    std::lock_guard<std::mutex> lock(g_wait_stats_mutex);
++    auto& v = g_wait_stats[{runtime::ThreadState::GetThreadID(), kind_, lr_}];
++    ++v.count;
++    v.total_ms += ms;
++    v.last_timeout = timeout_;
++    double window_s = std::chrono::duration<double>(now - g_wait_stats_window).count();
++    if (window_s < 2.0)
++      return;
++    REXKRNL_INFO("Wait stats over {:.1f}s:", window_s);
++    for (const auto& [k, val] : g_wait_stats) {
++      if (val.total_ms < 50.0 && val.count < 60)
++        continue;
++      REXKRNL_INFO("  thread {:4} {:26} lr={:08X} count={:6} total={:8.1f}ms timeout={}",
++                   k.thread_id, kWaitKindNames[k.kind], k.lr, val.count, val.total_ms,
++                   val.last_timeout == INT64_MIN ? std::string("none")
++                                                 : std::to_string(val.last_timeout));
++    }
++    g_wait_stats.clear();
++    g_wait_stats_window = now;
++  }
++
++ private:
++  bool enabled_;
++  uint32_t kind_ = 0;
++  uint32_t lr_ = 0;
++  int64_t timeout_ = 0;
++  std::chrono::steady_clock::time_point start_;
++};
++
++}  // namespace
++}  // namespace rex::kernel::xboxkrnl
++
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+ using rex::runtime::current_ppc_context;
+@@ -374,6 +458,7 @@ u32 KeQueryPerformanceFrequency_entry() {
+ }
+ 
+ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 interval_ptr) {
++  WaitStatScope wait_stat_scope(0, int64_t(uint64_t(*interval_ptr)));
+   XThread* thread = XThread::GetCurrentThread();
+ 
+   if (alertable) {
+@@ -390,6 +475,7 @@ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 i
+ }
+ 
+ u32 NtYieldExecution_entry() {
++  WaitStatScope wait_stat_scope(5, INT64_MIN);
+   rex::thread::MaybeYield();
+   return X_STATUS_SUCCESS;
+ }
+@@ -838,6 +924,7 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
+ 
+ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 processor_mode,
+                                 u32 alertable, mapped_u64 timeout_ptr) {
++  WaitStatScope wait_stat_scope(1, timeout_ptr ? int64_t(uint64_t(*timeout_ptr)) : INT64_MIN);
+   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+   // REXKRNL_IMPORT_TRACE("KeWaitForSingleObject", "obj={:#x} reason={} mode={} alertable={}
+   // timeout={}",
+@@ -852,6 +939,7 @@ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 pro
+ 
+ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertable,
+                                   mapped_u64 timeout_ptr) {
++  WaitStatScope wait_stat_scope(2, timeout_ptr ? int64_t(uint64_t(*timeout_ptr)) : INT64_MIN);
+   X_STATUS result = X_STATUS_SUCCESS;
+ 
+   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
+@@ -871,6 +959,7 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
+ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_type,
+                                    u32 wait_reason, u32 processor_mode, u32 alertable,
+                                    mapped_u64 timeout_ptr, mapped_void wait_block_array_ptr) {
++  WaitStatScope wait_stat_scope(3, timeout_ptr ? int64_t(uint64_t(*timeout_ptr)) : INT64_MIN);
+   assert_true(wait_type <= 1);
+ 
+   std::vector<object_ref<XObject>> objects;
+@@ -919,6 +1008,7 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
+ 
+ u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_type, u32 wait_mode,
+                                      u32 alertable, mapped_u64 timeout_ptr) {
++  WaitStatScope wait_stat_scope(4, timeout_ptr ? int64_t(uint64_t(*timeout_ptr)) : INT64_MIN);
+   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+   return xeNtWaitForMultipleObjectsEx(count, handles, wait_type, wait_mode, alertable,
+                                       timeout_ptr ? &timeout : nullptr);
+diff --git a/src/system/achievement_manager.cpp b/src/system/achievement_manager.cpp
+index f4e0efd..80d7148 100644
+--- a/src/system/achievement_manager.cpp
++++ b/src/system/achievement_manager.cpp
+@@ -77,7 +77,8 @@ void AchievementManager::ReplaceAchievements(std::vector<AchievementInfo> achiev
+ 
+ bool AchievementManager::LoadMetadataFile(const std::filesystem::path& path) {
+   try {
+-    auto table = toml::parse_file(path.string());
++    std::ifstream path_stream(path, std::ios::binary);
++    auto table = toml::parse(path_stream, path.string());
+     const auto* entries = table["achievements"].as_array();
+     if (!entries) {
+       REXSYS_WARN("Achievement metadata has no [[achievements]] entries: {}", path.string());
+@@ -228,7 +229,8 @@ void AchievementManager::LoadUnlockState() {
+ 
+   bool migrated = false;
+   try {
+-    auto table = toml::parse_file(save_path.string());
++    std::ifstream save_path_stream(save_path, std::ios::binary);
++    auto table = toml::parse(save_path_stream, save_path.string());
+     std::lock_guard lock(mutex_);
+     if (const auto* unlocked = table["unlocked"].as_table()) {
+       for (const auto& [key, value] : *unlocked) {
+-- 
+2.55.0.windows.3
+
+
+From 03f07b3cb779aa11714c227ed536047fb19180cf Mon Sep 17 00:00:00 2001
+From: "PM.RAZOR" <hslee1659@naver.com>
+Date: Sat, 3 Oct 2026 14:52:59 +0900
+Subject: [PATCH 2/9] Add D3D12 GPU time profiler (--d3d12_gpu_profile)
+
+Timestamp queries split each submission into guest draws, render target
+ownership transfers, resolves, texture loads and swap, and the totals are
+logged per frame every 2 seconds. Used to find that EDRAM transfers take
+~70% of GPU time with the RTV path at 2x resolution scale.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../rex/graphics/d3d12/command_processor.h    |  36 +++++
+ src/graphics/d3d12/command_processor.cpp      | 132 ++++++++++++++++++
+ src/graphics/d3d12/render_target_cache.cpp    |   5 +
+ src/graphics/d3d12/texture_cache.cpp          |   5 +
+ 4 files changed, 178 insertions(+)
+
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 83e7a9e..2835c36 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -185,6 +185,20 @@ class D3D12CommandProcessor : public CommandProcessor {
+ 
+   // Sets the current cached values to external ones. This is for cache
+   // invalidation primarily. A submission must be open.
++  // GPU time profiling (--d3d12_gpu_profile). Work recorded between
++  // GpuProfilePush/Pop is attributed to the category; everything else counts
++  // as guest drawing.
++  enum class GpuProfileCategory : uint32_t {
++    kDraw,
++    kTransfer,
++    kResolve,
++    kTextureLoad,
++    kSwap,
++    kCount,
++  };
++  void GpuProfilePush(GpuProfileCategory category);
++  void GpuProfilePop();
++
+   void SetExternalPipeline(ID3D12PipelineState* pipeline);
+   // Bisects deferred_command_list_ after its Close() failed and logs the
+   // offending command (see the d3d12_diagnose_invalid_command_lists cvar).
+@@ -429,6 +443,28 @@ class D3D12CommandProcessor : public CommandProcessor {
+ 
+   bool submission_open_ = false;
+   // Values of submission_fence_.
++  // GPU time profiling state.
++  void GpuProfileMark();
++  void GpuProfileEndSubmission();
++  void GpuProfileCollect();
++  static constexpr uint32_t kGpuProfileQueryCount = 16384;
++  Microsoft::WRL::ComPtr<ID3D12QueryHeap> gpu_profile_query_heap_;
++  Microsoft::WRL::ComPtr<ID3D12Resource> gpu_profile_readback_;
++  const uint64_t* gpu_profile_readback_mapping_ = nullptr;
++  uint64_t gpu_profile_frequency_ = 0;
++  uint32_t gpu_profile_next_query_ = 0;
++  std::vector<GpuProfileCategory> gpu_profile_stack_;
++  struct GpuProfileSubmission {
++    uint64_t submission;
++    uint32_t first_query;
++    std::vector<GpuProfileCategory> segment_categories;  // one per mark
++  };
++  GpuProfileSubmission gpu_profile_open_;
++  std::deque<GpuProfileSubmission> gpu_profile_pending_;
++  double gpu_profile_totals_ms_[size_t(GpuProfileCategory::kCount)] = {};
++  uint64_t gpu_profile_window_start_ = 0;
++  uint32_t gpu_profile_window_swaps_ = 0;
++
+   uint64_t submission_current_ = 1;
+   uint64_t submission_completed_ = 0;
+   ID3D12Fence* submission_fence_ = nullptr;
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index a19e572..f34a5ba 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -36,6 +36,10 @@ REXCVAR_DEFINE_BOOL(d3d12_diagnose_invalid_command_lists, false, "GPU/D3D12",
+                     "When a command list fails Close() (the device is then removed with "
+                     "INVALID_CALL), bisect it and log the first invalid command. Works "
+                     "without the D3D12 debug layer.");
++REXCVAR_DEFINE_BOOL(d3d12_gpu_profile, false, "GPU/D3D12",
++                    "Measure GPU time per category (guest draws, render target transfers, "
++                    "resolves, texture loads, swap) with timestamp queries and log it "
++                    "every 2 seconds.");
+ REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+@@ -806,6 +810,96 @@ void D3D12CommandProcessor::DiagnoseInvalidCommandList() {
+   }
+ }
+ 
++void D3D12CommandProcessor::GpuProfilePush(GpuProfileCategory category) {
++  if (!gpu_profile_query_heap_)
++    return;
++  gpu_profile_stack_.push_back(category);
++  GpuProfileMark();
++}
++
++void D3D12CommandProcessor::GpuProfilePop() {
++  if (!gpu_profile_query_heap_ || gpu_profile_stack_.empty())
++    return;
++  gpu_profile_stack_.pop_back();
++  GpuProfileMark();
++}
++
++void D3D12CommandProcessor::GpuProfileMark() {
++  // Timestamps go into the deferred list, so only mark inside a submission and
++  // keep a submission's queries contiguous (no wrap in the middle).
++  if (!submission_open_ || gpu_profile_next_query_ >= kGpuProfileQueryCount)
++    return;
++  if (gpu_profile_open_.segment_categories.empty()) {
++    gpu_profile_open_.first_query = gpu_profile_next_query_;
++  }
++  deferred_command_list_.D3DEndQuery(gpu_profile_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                     gpu_profile_next_query_++);
++  gpu_profile_open_.segment_categories.push_back(
++      gpu_profile_stack_.empty() ? GpuProfileCategory::kDraw : gpu_profile_stack_.back());
++}
++
++void D3D12CommandProcessor::GpuProfileEndSubmission() {
++  if (!gpu_profile_query_heap_)
++    return;
++  GpuProfileMark();
++  auto& open = gpu_profile_open_;
++  if (open.segment_categories.size() >= 2) {
++    uint32_t count = uint32_t(open.segment_categories.size());
++    deferred_command_list_.D3DResolveQueryData(gpu_profile_query_heap_.Get(),
++                                               D3D12_QUERY_TYPE_TIMESTAMP, open.first_query, count,
++                                               gpu_profile_readback_.Get(),
++                                               uint64_t(open.first_query) * sizeof(uint64_t));
++    open.submission = submission_current_;
++    gpu_profile_pending_.push_back(std::move(open));
++  }
++  open = {};
++}
++
++void D3D12CommandProcessor::GpuProfileCollect() {
++  if (!gpu_profile_query_heap_)
++    return;
++  while (!gpu_profile_pending_.empty() &&
++         gpu_profile_pending_.front().submission <= submission_completed_) {
++    const auto& done = gpu_profile_pending_.front();
++    const uint64_t* ts = gpu_profile_readback_mapping_ + done.first_query;
++    for (size_t i = 0; i + 1 < done.segment_categories.size(); ++i) {
++      if (ts[i + 1] > ts[i]) {
++        gpu_profile_totals_ms_[size_t(done.segment_categories[i])] +=
++            double(ts[i + 1] - ts[i]) * 1000.0 / double(gpu_profile_frequency_);
++      }
++    }
++    gpu_profile_pending_.pop_front();
++  }
++  // Queries are reused once nothing in flight references them.
++  if (gpu_profile_pending_.empty() && gpu_profile_open_.segment_categories.empty()) {
++    gpu_profile_next_query_ = 0;
++  }
++  uint64_t now = rex::chrono::Clock::QueryHostTickCount();
++  uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
++  if (!gpu_profile_window_start_) {
++    gpu_profile_window_start_ = now;
++    return;
++  }
++  double window_s = double(now - gpu_profile_window_start_) / double(freq);
++  if (window_s < 2.0)
++    return;
++  static const char* const kNames[] = {"draw", "transfer", "resolve", "texload", "swap"};
++  double total = 0;
++  std::string text;
++  for (size_t i = 0; i < size_t(GpuProfileCategory::kCount); ++i) {
++    total += gpu_profile_totals_ms_[i];
++  }
++  double frames = std::max(1u, gpu_profile_window_swaps_);
++  for (size_t i = 0; i < size_t(GpuProfileCategory::kCount); ++i) {
++    text += fmt::format(" {}={:.2f}ms", kNames[i], gpu_profile_totals_ms_[i] / frames);
++    gpu_profile_totals_ms_[i] = 0;
++  }
++  REXGPU_INFO("GPU profile: {:.1f} fps, GPU busy {:.0f}%, per frame:{}",
++              gpu_profile_window_swaps_ / window_s, total / (window_s * 10.0), text);
++  gpu_profile_window_swaps_ = 0;
++  gpu_profile_window_start_ = now;
++}
++
+ void D3D12CommandProcessor::SetExternalPipeline(ID3D12PipelineState* pipeline) {
+   if (current_external_pipeline_ != pipeline) {
+     current_external_pipeline_ = pipeline;
+@@ -968,6 +1062,30 @@ bool D3D12CommandProcessor::SetupContext() {
+         draw_resolution_scale_x, draw_resolution_scale_y);
+   }
+ 
++  if (REXCVAR_GET(d3d12_gpu_profile)) {
++    D3D12_QUERY_HEAP_DESC query_heap_desc = {};
++    query_heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
++    query_heap_desc.Count = kGpuProfileQueryCount;
++    D3D12_RESOURCE_DESC readback_desc;
++    ui::d3d12::util::FillBufferResourceDesc(
++        readback_desc, kGpuProfileQueryCount * sizeof(uint64_t), D3D12_RESOURCE_FLAG_NONE);
++    void* readback_mapping = nullptr;
++    if (SUCCEEDED(provider.GetDevice()->CreateQueryHeap(&query_heap_desc,
++                                                        IID_PPV_ARGS(&gpu_profile_query_heap_))) &&
++        SUCCEEDED(provider.GetDevice()->CreateCommittedResource(
++            &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &readback_desc,
++            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&gpu_profile_readback_))) &&
++        SUCCEEDED(gpu_profile_readback_->Map(0, nullptr, &readback_mapping)) &&
++        SUCCEEDED(provider.GetDirectQueue()->GetTimestampFrequency(&gpu_profile_frequency_))) {
++      gpu_profile_readback_mapping_ = static_cast<const uint64_t*>(readback_mapping);
++      REXGPU_INFO("GPU profiling enabled ({} Hz timestamps)", gpu_profile_frequency_);
++    } else {
++      REXGPU_ERROR("Failed to set up GPU profiling");
++      gpu_profile_query_heap_.Reset();
++      gpu_profile_readback_.Reset();
++    }
++  }
++
+   shared_memory_ = std::make_unique<D3D12SharedMemory>(*this, *memory_);
+   if (!shared_memory_->Initialize()) {
+     REXGPU_ERROR("Failed to initialize shared memory");
+@@ -1953,6 +2071,12 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+     REXGPU_ERROR("IssueSwap: BeginSubmission failed");
+     return;
+   }
++  ++gpu_profile_window_swaps_;
++  GpuProfilePush(GpuProfileCategory::kSwap);
++  struct GpuProfileSwapPop {
++    D3D12CommandProcessor* self;
++    ~GpuProfileSwapPop() { self->GpuProfilePop(); }
++  } gpu_profile_swap_pop{this};
+ 
+   // Obtain the actual swap source texture size (resolution-scaled if it's a
+   // resolve destination, or not otherwise).
+@@ -2914,6 +3038,11 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
+ }
+ 
+ bool D3D12CommandProcessor::IssueCopy() {
++  GpuProfilePush(GpuProfileCategory::kResolve);
++  struct GpuProfileCopyPop {
++    D3D12CommandProcessor* self;
++    ~GpuProfileCopyPop() { self->GpuProfilePop(); }
++  } gpu_profile_copy_pop{this};
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -3187,6 +3316,7 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+   if (submission_completed_ < await_submission) {
+     REXGPU_ERROR("Failed to await a submission completion Direct3D 12 fence");
+   }
++  GpuProfileCollect();
+   if (submission_completed_ <= submission_completed_before) {
+     // Not updated - no need to reclaim or download things.
+     return;
+@@ -3345,6 +3475,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+     // end of the submission (when async pipeline creation requests are
+     // fulfilled).
+     deferred_command_list_.Reset();
++    GpuProfileMark();
+ 
+     // Reset cached state of the command list.
+     ff_viewport_update_needed_ = true;
+@@ -3468,6 +3599,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+         command_allocator_writable_first_->command_allocator;
+     command_allocator->Reset();
+     command_list_->Reset(command_allocator, nullptr);
++    GpuProfileEndSubmission();
+     deferred_command_list_.Execute(command_list_, command_list_1_);
+     if (HRESULT close_result = command_list_->Close(); FAILED(close_result)) {
+       REXGPU_ERROR("D3D12 command list Close failed: 0x{:08X}", uint32_t(close_result));
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index cc89a38..0a3ff22 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -3799,6 +3799,11 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
+     const std::vector<Transfer>* render_target_transfers,
+     const uint64_t* render_target_resolve_clear_values,
+     const Transfer::Rectangle* resolve_clear_rectangle) {
++  command_processor_.GpuProfilePush(D3D12CommandProcessor::GpuProfileCategory::kTransfer);
++  struct GpuProfilePop {
++    D3D12CommandProcessor& cp;
++    ~GpuProfilePop() { cp.GpuProfilePop(); }
++  } gpu_profile_pop{command_processor_};
+   assert_true(GetPath() == Path::kHostRenderTargets);
+ 
+   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index abc26d9..fc8ad84 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -1559,6 +1559,11 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
+ 
+ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
+                                                               bool load_mips) {
++  command_processor_.GpuProfilePush(D3D12CommandProcessor::GpuProfileCategory::kTextureLoad);
++  struct GpuProfilePop {
++    D3D12CommandProcessor& cp;
++    ~GpuProfilePop() { cp.GpuProfilePop(); }
++  } gpu_profile_pop{command_processor_};
+   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
+   TextureKey texture_key = d3d12_texture.key();
+ 
+-- 
+2.55.0.windows.3
+
+
+From 55a9d2cbb85945dc003de875cdd3b3743083ee31 Mon Sep 17 00:00:00 2001
+From: "PM.RAZOR" <hslee1659@naver.com>
+Date: Sat, 3 Oct 2026 15:14:18 +0900
+Subject: [PATCH 3/9] Fix GPU profiler recording timestamps with no query heap
+ when disabled
+
+GpuProfileMark ran at every submission start even with --d3d12_gpu_profile
+off, writing EndQuery on a null heap and crashing D3D12 on the first swap.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/d3d12/command_processor.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index f34a5ba..7bc0e02 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -827,7 +827,8 @@ void D3D12CommandProcessor::GpuProfilePop() {
+ void D3D12CommandProcessor::GpuProfileMark() {
+   // Timestamps go into the deferred list, so only mark inside a submission and
+   // keep a submission's queries contiguous (no wrap in the middle).
+-  if (!submission_open_ || gpu_profile_next_query_ >= kGpuProfileQueryCount)
++  if (!gpu_profile_query_heap_ || !submission_open_ ||
++      gpu_profile_next_query_ >= kGpuProfileQueryCount)
+     return;
+   if (gpu_profile_open_.segment_categories.empty()) {
+     gpu_profile_open_.first_query = gpu_profile_next_query_;
+-- 
+2.55.0.windows.3
+
+
+From e9329e90fdc90da14bbdd80f758c3bff788ba258 Mon Sep 17 00:00:00 2001
+From: "PM.RAZOR" <hslee1659@naver.com>
+Date: Sat, 3 Oct 2026 15:51:48 +0900
+Subject: [PATCH 4/9] Add --d3d12_log_texture_loads texture (re)load statistics
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/d3d12/texture_cache.cpp | 53 ++++++++++++++++++++++++++++
+ 1 file changed, 53 insertions(+)
+
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index fc8ad84..b27ddd7 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -14,10 +14,14 @@
+ #include <cfloat>
+ #include <cstddef>
+ #include <cstring>
++#include <map>
+ #include <memory>
++#include <tuple>
+ #include <utility>
+ 
+ #include <rex/assert.h>
++#include <rex/chrono/clock.h>
++#include <rex/cvar.h>
+ #include <rex/dbg.h>
+ #include <rex/graphics/d3d12/command_processor.h>
+ #include <rex/graphics/d3d12/shared_memory.h>
+@@ -32,6 +36,10 @@
+ #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
+ #include <rex/ui/d3d12/d3d12_util.h>
+ 
++REXCVAR_DEFINE_BOOL(d3d12_log_texture_loads, false, "GPU/D3D12",
++                    "Every 2 seconds, log which guest textures were (re)loaded and how many "
++                    "host texels that took.");
++
+ namespace rex::graphics::d3d12 {
+ 
+ // Generated with `xb buildshaders`.
+@@ -1608,6 +1616,51 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+   uint32_t texture_resolution_scale_x = texture_resolution_scaled ? draw_resolution_scale_x() : 1;
+   uint32_t texture_resolution_scale_y = texture_resolution_scaled ? draw_resolution_scale_y() : 1;
+ 
++  if (REXCVAR_GET(d3d12_log_texture_loads)) {
++    struct LoadStat {
++      uint64_t count = 0;
++      uint64_t host_texels = 0;
++    };
++    static std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>,
++                    LoadStat>
++        load_stats;
++    static uint64_t load_window_start = rex::chrono::Clock::QueryHostTickCount();
++    uint64_t texels = uint64_t(width) * height * depth_or_array_size * texture_resolution_scale_x *
++                      texture_resolution_scale_y;
++    auto& stat = load_stats[{uint32_t(texture_key.base_page) << 12, width, height,
++                             depth_or_array_size, uint32_t(guest_format),
++                             uint32_t(texture_resolution_scaled),
++                             uint32_t(load_base) | (uint32_t(load_mips) << 1) |
++                                 (uint32_t(texture_key.mip_max_level) << 2)}];
++    ++stat.count;
++    stat.host_texels += texels;
++    uint64_t now = rex::chrono::Clock::QueryHostTickCount();
++    if (double(now - load_window_start) / double(rex::chrono::Clock::QueryHostTickFrequency()) >=
++        2.0) {
++      std::vector<std::pair<uint64_t, std::string>> rows;
++      uint64_t total_count = 0, total_texels = 0;
++      for (const auto& [k, v] : load_stats) {
++        total_count += v.count;
++        total_texels += v.host_texels;
++        rows.emplace_back(
++            v.host_texels,
++            fmt::format("addr {:08X} {}x{}x{} fmt {} scaled {} base/mips/mipmax {:X} -> {} loads, "
++                        "{:.1f} Mtexels",
++                        std::get<0>(k), std::get<1>(k), std::get<2>(k), std::get<3>(k),
++                        std::get<4>(k), std::get<5>(k), std::get<6>(k), v.count,
++                        v.host_texels / 1.0e6));
++      }
++      std::sort(rows.begin(), rows.end(), [](auto& a, auto& b) { return a.first > b.first; });
++      REXGPU_INFO("Texture loads in 2s: {} loads, {:.1f} Mtexels, {} distinct", total_count,
++                  total_texels / 1.0e6, rows.size());
++      for (size_t i = 0; i < std::min<size_t>(rows.size(), 12); ++i) {
++        REXGPU_INFO("  {}", rows[i].second);
++      }
++      load_stats.clear();
++      load_window_start = now;
++    }
++  }
++
+   // The loop counter can mean two things depending on whether the packed mip
+   // tail is stored as mip 0, because in this case, it would be ambiguous since
+   // both the base and the mips would be on "level 0", but stored in separate
+-- 
+2.55.0.windows.3
+
+
+From a3ab07c3c098dbc0fc9b2af5b4bce1aecd846bdd Mon Sep 17 00:00:00 2001
+From: "PM.RAZOR" <hslee1659@naver.com>
+Date: Sat, 3 Oct 2026 16:15:17 +0900
+Subject: [PATCH 5/9] Reload only GPU-written slices of 2D array textures
+
+Guest code resolves into one slice of large 2D arrays per frame (SSX: a
+128x128x256 snow trail atlas), and the texture cache reloaded the whole
+array on every change - about 80% of all texture load work in races with
+resolution scaling. A global watch now accumulates the range written by the
+GPU while the base is outdated, and the D3D12 load only processes those
+slices. CPU writes or initial loads still reload everything.
+--texture_partial_array_reload=false restores the old behavior.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/graphics/pipeline/texture/cache.h | 24 +++++++
+ src/graphics/d3d12/texture_cache.cpp          | 42 ++++++++++-
+ src/graphics/pipeline/texture/cache.cpp       | 69 +++++++++++++++++++
+ 3 files changed, 133 insertions(+), 2 deletions(-)
+
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+index d26cd4f..7045182 100644
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -230,6 +230,18 @@ class TextureCache {
+ 
+     void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
+ 
++    // Partial base reloads for 2D array textures without mips: guest code often
++    // resolves into one slice per frame, and reloading every slice each time is
++    // very expensive with resolution scaling. GPU writes to the base are
++    // accumulated here while the base is outdated; any CPU write, or a write
++    // while nothing is accumulated yet (initial load), requires a full reload.
++    bool partial_reload_tracked() const { return partial_reload_tracked_; }
++    void NoteBaseWrite(const std::unique_lock<std::recursive_mutex>& global_lock,
++                       uint32_t address_first, uint32_t address_last, bool by_gpu);
++    // Returns whether only [address_first, address_last] of the base changed.
++    bool GetBasePartialReload(const std::unique_lock<std::recursive_mutex>& global_lock,
++                              uint32_t& address_first, uint32_t& address_last) const;
++
+     // For LRU caching - updates the last usage frame and moves the texture to
+     // the end of the usage queue. Must be called any time the texture is
+     // referenced by any GPU work in the implementation to make sure it's not
+@@ -262,6 +274,7 @@ class TextureCache {
+     Texture* used_next_;
+     bool in_usage_list_;
+     bool force_load_3d_tiling_ = false;
++    bool partial_reload_tracked_ = false;
+ 
+     // These are to be accessed within the global critical region to synchronize
+     // with shared memory.
+@@ -270,6 +283,10 @@ class TextureCache {
+     // Whether the recent mip data needs reloading from the memory.
+     bool mips_outdated_ = false;
+     std::atomic<uint32_t> outdated_mask_{0};
++    // Within the global critical region, see NoteBaseWrite.
++    bool base_partial_valid_ = false;
++    uint32_t base_dirty_first_ = 0;
++    uint32_t base_dirty_last_ = 0;
+     // Watch handles for the memory ranges.
+     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
+     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
+@@ -600,6 +617,13 @@ class TextureCache {
+   // Global watch for scaled resolve data invalidation.
+   SharedMemory::GlobalWatchHandle scaled_resolve_global_watch_handle_ = nullptr;
+ 
++  // Textures eligible for partial base reloads, fed by a global watch.
++  static void PartialReloadGlobalWatchCallbackThunk(
++      const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
++      uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu);
++  std::vector<Texture*> partial_reload_textures_;
++  SharedMemory::GlobalWatchHandle partial_reload_global_watch_handle_ = nullptr;
++
+   uint64_t current_submission_index_ = 0;
+   uint64_t current_submission_time_ = 0;
+ 
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index b27ddd7..c9489a4 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -36,6 +36,9 @@
+ #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
+ #include <rex/ui/d3d12/d3d12_util.h>
+ 
++REXCVAR_DEFINE_BOOL(texture_partial_array_reload, true, "GPU",
++                    "Reload only the slices of 2D array textures that the GPU wrote "
++                    "(resolves) instead of the whole array.");
+ REXCVAR_DEFINE_BOOL(d3d12_log_texture_loads, false, "GPU/D3D12",
+                     "Every 2 seconds, log which guest textures were (re)loaded and how many "
+                     "host texels that took.");
+@@ -1616,6 +1619,30 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+   uint32_t texture_resolution_scale_x = texture_resolution_scaled ? draw_resolution_scale_x() : 1;
+   uint32_t texture_resolution_scale_y = texture_resolution_scaled ? draw_resolution_scale_y() : 1;
+ 
++  // Base slices to (re)load - only the ones the GPU wrote since the last load
++  // for tracked 2D arrays (see Texture::NoteBaseWrite), otherwise all.
++  uint32_t base_slice_first = 0;
++  uint32_t base_slice_count = array_size;
++  if (load_base && d3d12_texture.partial_reload_tracked() &&
++      REXCVAR_GET(texture_partial_array_reload)) {
++    uint32_t dirty_first, dirty_last;
++    bool partial;
++    {
++      auto lock = rex::thread::global_critical_region::AcquireDirect();
++      partial = d3d12_texture.GetBasePartialReload(lock, dirty_first, dirty_last);
++    }
++    uint32_t slice_stride = d3d12_texture.guest_layout().base.array_slice_stride_bytes;
++    uint32_t base_address = uint32_t(texture_key.base_page) << 12;
++    if (partial && slice_stride && dirty_first >= base_address) {
++      uint32_t first = (dirty_first - base_address) / slice_stride;
++      uint32_t last = std::min((dirty_last - base_address) / slice_stride, array_size - 1);
++      if (first <= last) {
++        base_slice_first = first;
++        base_slice_count = last - first + 1;
++      }
++    }
++  }
++
+   if (REXCVAR_GET(d3d12_log_texture_loads)) {
+     struct LoadStat {
+       uint64_t count = 0;
+@@ -1917,7 +1944,14 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+     uint32_t level_array_slice_stride_bytes_scaled =
+         level_guest_layout.array_slice_stride_bytes *
+         (texture_resolution_scale_x * texture_resolution_scale_y);
+-    for (uint32_t slice = 0; slice < array_size; ++slice) {
++    uint32_t dispatch_slice_first = is_base ? base_slice_first : 0;
++    uint32_t dispatch_slice_end =
++        is_base ? base_slice_first + base_slice_count : array_size;
++    if (dispatch_slice_first) {
++      load_constants.guest_offset += level_array_slice_stride_bytes_scaled * dispatch_slice_first;
++      load_constants.host_offset += host_slice_size * dispatch_slice_first;
++    }
++    for (uint32_t slice = dispatch_slice_first; slice < dispatch_slice_end; ++slice) {
+       if (slice != 0) {
+         command_list.D3DSetComputeRoot32BitConstants(
+             0, sizeof(load_constants.guest_offset) / sizeof(uint32_t), &load_constants.guest_offset,
+@@ -2000,7 +2034,11 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+     } else {
+       source_box_ptr = nullptr;
+     }
+-    for (uint32_t slice = 0; slice < array_size; ++slice) {
++    uint32_t copy_slice_first = level == 0 ? base_slice_first : 0;
++    uint32_t copy_slice_end = level == 0 ? base_slice_first + base_slice_count : array_size;
++    location_dest.SubresourceIndex += texture_level_count * copy_slice_first;
++    location_source.PlacedFootprint.Offset += host_slice_size * copy_slice_first;
++    for (uint32_t slice = copy_slice_first; slice < copy_slice_end; ++slice) {
+       command_list.D3DCopyTextureRegion(&location_dest, 0, 0, 0, &location_source, source_box_ptr);
+       location_dest.SubresourceIndex += texture_level_count;
+       location_source.PlacedFootprint.Offset += host_slice_size;
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 76f5600..081feea 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -228,6 +228,10 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
+ TextureCache::~TextureCache() {
+   DestroyAllTextures(true);
+ 
++  if (partial_reload_global_watch_handle_) {
++    shared_memory().UnregisterGlobalWatch(partial_reload_global_watch_handle_);
++    partial_reload_global_watch_handle_ = nullptr;
++  }
+   if (scaled_resolve_global_watch_handle_) {
+     shared_memory().UnregisterGlobalWatch(scaled_resolve_global_watch_handle_);
+   }
+@@ -656,6 +660,19 @@ TextureCache::Texture::Texture(TextureCache& texture_cache, const TextureKey& ke
+ 
+   // Never try to upload data that doesn't exist.
+   base_outdated_ = guest_layout().base.level_data_extent_bytes != 0;
++
++  if (key.dimension == xenos::DataDimension::k2DOrStacked && key.mip_max_level == 0 &&
++      key.GetDepthOrArraySize() > 1 && guest_layout().base.array_slice_stride_bytes != 0 &&
++      base_outdated_) {
++    partial_reload_tracked_ = true;
++    auto lock = rex::thread::global_critical_region::AcquireDirect();
++    texture_cache.partial_reload_textures_.push_back(this);
++    if (!texture_cache.partial_reload_global_watch_handle_) {
++      texture_cache.partial_reload_global_watch_handle_ =
++          texture_cache.shared_memory().RegisterGlobalWatch(
++              PartialReloadGlobalWatchCallbackThunk, &texture_cache);
++    }
++  }
+   mips_outdated_ = guest_layout().mips_total_extent_bytes != 0;
+   outdated_mask_.store(
+       (base_outdated_ ? kOutdatedBitBase : 0) | (mips_outdated_ ? kOutdatedBitMips : 0),
+@@ -663,6 +680,11 @@ TextureCache::Texture::Texture(TextureCache& texture_cache, const TextureKey& ke
+ }
+ 
+ TextureCache::Texture::~Texture() {
++  if (partial_reload_tracked_) {
++    auto lock = rex::thread::global_critical_region::AcquireDirect();
++    auto& list = texture_cache_.partial_reload_textures_;
++    list.erase(std::remove(list.begin(), list.end(), this), list.end());
++  }
+   if (mips_watch_handle_) {
+     texture_cache().shared_memory().UnwatchMemoryRange(mips_watch_handle_);
+   }
+@@ -692,6 +714,7 @@ void TextureCache::Texture::MakeUpToDateAndWatch(
+   if (base_outdated_) {
+     assert_not_zero(GetGuestBaseSize());
+     base_outdated_ = false;
++    base_partial_valid_ = false;
+     base_watch_handle_ = shared_memory.WatchMemoryRange(
+         key().base_page << 12, GetGuestBaseSize(), TextureCache::WatchCallback, this, nullptr, 0);
+     outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
+@@ -732,6 +755,52 @@ void TextureCache::Texture::MarkAsUsed() {
+   texture_cache_.texture_used_last_ = this;
+ }
+ 
++void TextureCache::Texture::NoteBaseWrite(
++    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock,
++    uint32_t address_first, uint32_t address_last, bool by_gpu) {
++  uint32_t base_first = key().base_page << 12;
++  uint32_t base_last = base_first + GetGuestBaseSize() - 1;
++  if (address_last < base_first || address_first > base_last) {
++    return;
++  }
++  address_first = std::max(address_first, base_first);
++  address_last = std::min(address_last, base_last);
++  if (!base_outdated_) {
++    // First write since the last load - the per-range watch fires right
++    // after the global ones and marks the base outdated.
++    base_partial_valid_ = by_gpu;
++    base_dirty_first_ = address_first;
++    base_dirty_last_ = address_last;
++  } else if (base_partial_valid_) {
++    if (by_gpu) {
++      base_dirty_first_ = std::min(base_dirty_first_, address_first);
++      base_dirty_last_ = std::max(base_dirty_last_, address_last);
++    } else {
++      base_partial_valid_ = false;
++    }
++  }
++}
++
++bool TextureCache::Texture::GetBasePartialReload(
++    [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock,
++    uint32_t& address_first, uint32_t& address_last) const {
++  if (!partial_reload_tracked_ || !base_outdated_ || !base_partial_valid_) {
++    return false;
++  }
++  address_first = base_dirty_first_;
++  address_last = base_dirty_last_;
++  return true;
++}
++
++void TextureCache::PartialReloadGlobalWatchCallbackThunk(
++    const std::unique_lock<std::recursive_mutex>& global_lock, void* context,
++    uint32_t address_first, uint32_t address_last, bool invalidated_by_gpu) {
++  auto* texture_cache = static_cast<TextureCache*>(context);
++  for (Texture* texture : texture_cache->partial_reload_textures_) {
++    texture->NoteBaseWrite(global_lock, address_first, address_last, invalidated_by_gpu);
++  }
++}
++
+ void TextureCache::Texture::WatchCallback(
+     [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip) {
+   if (is_mip) {
+-- 
+2.55.0.windows.3
+
+
+From bcae94cf46283b366e634901bf309daf73d3a0e9 Mon Sep 17 00:00:00 2001
+From: "PM.RAZOR" <hslee1659@naver.com>
+Date: Sat, 3 Oct 2026 17:07:55 +0900
+Subject: [PATCH 6/9] Split GPU profiler texture loads into array/large/other
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../rex/graphics/d3d12/command_processor.h    |  4 +++-
+ src/graphics/d3d12/command_processor.cpp      |  3 ++-
+ src/graphics/d3d12/texture_cache.cpp          | 19 ++++++++++++++-----
+ 3 files changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 2835c36..22f20b0 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -192,7 +192,9 @@ class D3D12CommandProcessor : public CommandProcessor {
+     kDraw,
+     kTransfer,
+     kResolve,
+-    kTextureLoad,
++    kTextureLoad,       // other textures
++    kTextureLoadArray,  // tracked 2D arrays (partial slice reloads)
++    kTextureLoadLarge,  // at least 1M host texels per load
+     kSwap,
+     kCount,
+   };
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 7bc0e02..1523eb6 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -884,7 +884,8 @@ void D3D12CommandProcessor::GpuProfileCollect() {
+   double window_s = double(now - gpu_profile_window_start_) / double(freq);
+   if (window_s < 2.0)
+     return;
+-  static const char* const kNames[] = {"draw", "transfer", "resolve", "texload", "swap"};
++  static const char* const kNames[] = {"draw",         "transfer",     "resolve", "texload",
++                                       "texload_array", "texload_large", "swap"};
+   double total = 0;
+   std::string text;
+   for (size_t i = 0; i < size_t(GpuProfileCategory::kCount); ++i) {
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index c9489a4..719cee5 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -1570,11 +1570,6 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
+ 
+ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
+                                                               bool load_mips) {
+-  command_processor_.GpuProfilePush(D3D12CommandProcessor::GpuProfileCategory::kTextureLoad);
+-  struct GpuProfilePop {
+-    D3D12CommandProcessor& cp;
+-    ~GpuProfilePop() { cp.GpuProfilePop(); }
+-  } gpu_profile_pop{command_processor_};
+   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
+   TextureKey texture_key = d3d12_texture.key();
+ 
+@@ -1619,6 +1614,20 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+   uint32_t texture_resolution_scale_x = texture_resolution_scaled ? draw_resolution_scale_x() : 1;
+   uint32_t texture_resolution_scale_y = texture_resolution_scaled ? draw_resolution_scale_y() : 1;
+ 
++  {
++    uint64_t host_texels = uint64_t(width) * height * depth_or_array_size *
++                           texture_resolution_scale_x * texture_resolution_scale_y;
++    command_processor_.GpuProfilePush(
++        d3d12_texture.partial_reload_tracked()
++            ? D3D12CommandProcessor::GpuProfileCategory::kTextureLoadArray
++        : host_texels >= (1u << 20) ? D3D12CommandProcessor::GpuProfileCategory::kTextureLoadLarge
++                                    : D3D12CommandProcessor::GpuProfileCategory::kTextureLoad);
++  }
++  struct GpuProfilePop {
++    D3D12CommandProcessor& cp;
++    ~GpuProfilePop() { cp.GpuProfilePop(); }
++  } gpu_profile_pop{command_processor_};
++
+   // Base slices to (re)load - only the ones the GPU wrote since the last load
+   // for tracked 2D arrays (see Texture::NoteBaseWrite), otherwise all.
+   uint32_t base_slice_first = 0;
+-- 
+2.55.0.windows.3
+
+
+From 6b351a6a602c5ebd136f39f3324df7d95e7a868e Mon Sep 17 00:00:00 2001
+From: "PM.RAZOR" <hslee1659@naver.com>
+Date: Sat, 3 Oct 2026 17:27:42 +0900
+Subject: [PATCH 7/9] Partial reloads for tiled 3D textures in groups of 8
+ slices
+
+SSX's snow trail texture is a tiled 128x128x256 volume, not a 2D array, so
+the previous change never applied. The Xenos 3D tiled address is linear in
+whole groups of 8 depth slices (odd and even groups of 4 interleave
+differently), so GPU-written ranges map to 8-slice groups, and the load
+shader starts at a group boundary with shifted guest/host offsets. The
+texture load log now counts the texels actually processed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/d3d12/texture_cache.cpp    | 66 ++++++++++++++++++++++---
+ src/graphics/pipeline/texture/cache.cpp | 12 +++--
+ 2 files changed, 67 insertions(+), 11 deletions(-)
+
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index 719cee5..2e385e4 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -1632,6 +1632,12 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+   // for tracked 2D arrays (see Texture::NoteBaseWrite), otherwise all.
+   uint32_t base_slice_first = 0;
+   uint32_t base_slice_count = array_size;
++  // Tiled 3D: depth range in whole groups of 8 slices, and the byte stride of
++  // such a group (unscaled).
++  constexpr uint32_t kZGroupDepth = 8;
++  uint32_t base_z_first = 0;
++  uint32_t base_z_count = depth;
++  uint32_t base_z_group_stride = 0;
+   if (load_base && d3d12_texture.partial_reload_tracked() &&
+       REXCVAR_GET(texture_partial_array_reload)) {
+     uint32_t dirty_first, dirty_last;
+@@ -1642,7 +1648,22 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+     }
+     uint32_t slice_stride = d3d12_texture.guest_layout().base.array_slice_stride_bytes;
+     uint32_t base_address = uint32_t(texture_key.base_page) << 12;
+-    if (partial && slice_stride && dirty_first >= base_address) {
++    if (is_3d) {
++      const auto& base_layout = d3d12_texture.guest_layout().base;
++      base_z_group_stride = uint32_t(texture_util::GetTiledOffset3D(
++          0, 0, int32_t(kZGroupDepth), base_layout.row_pitch_bytes / bytes_per_block,
++          base_layout.z_slice_stride_block_rows, rex::log2_floor(bytes_per_block)));
++      if (partial && base_z_group_stride && dirty_first >= base_address) {
++        uint32_t group_first = (dirty_first - base_address) / base_z_group_stride;
++        uint32_t group_last = (dirty_last - base_address) / base_z_group_stride;
++        uint32_t z_first = group_first * kZGroupDepth;
++        uint32_t z_end = std::min((group_last + 1) * kZGroupDepth, depth);
++        if (z_first < z_end) {
++          base_z_first = z_first;
++          base_z_count = z_end - z_first;
++        }
++      }
++    } else if (partial && slice_stride && dirty_first >= base_address) {
+       uint32_t first = (dirty_first - base_address) / slice_stride;
+       uint32_t last = std::min((dirty_last - base_address) / slice_stride, array_size - 1);
+       if (first <= last) {
+@@ -1661,13 +1682,18 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+                     LoadStat>
+         load_stats;
+     static uint64_t load_window_start = rex::chrono::Clock::QueryHostTickCount();
+-    uint64_t texels = uint64_t(width) * height * depth_or_array_size * texture_resolution_scale_x *
+-                      texture_resolution_scale_y;
++    // Texels actually processed (partial reloads only cover part of the base).
++    uint64_t texels = uint64_t(width) * height * (is_3d ? base_z_count : base_slice_count) *
++                      texture_resolution_scale_x * texture_resolution_scale_y;
+     auto& stat = load_stats[{uint32_t(texture_key.base_page) << 12, width, height,
+                              depth_or_array_size, uint32_t(guest_format),
+-                             uint32_t(texture_resolution_scaled),
++                             uint32_t(texture_resolution_scaled) |
++                                 (uint32_t(texture_key.dimension) << 4) |
++                                 (uint32_t(d3d12_texture.partial_reload_tracked()) << 8) |
++                                 (uint32_t(texture_key.tiled) << 12),
+                              uint32_t(load_base) | (uint32_t(load_mips) << 1) |
+-                                 (uint32_t(texture_key.mip_max_level) << 2)}];
++                                 (uint32_t(texture_key.mip_max_level) << 2) |
++                                 (d3d12_texture.guest_layout().base.array_slice_stride_bytes << 8)}];
+     ++stat.count;
+     stat.host_texels += texels;
+     uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+@@ -1680,8 +1706,8 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+         total_texels += v.host_texels;
+         rows.emplace_back(
+             v.host_texels,
+-            fmt::format("addr {:08X} {}x{}x{} fmt {} scaled {} base/mips/mipmax {:X} -> {} loads, "
+-                        "{:.1f} Mtexels",
++            fmt::format("addr {:08X} {}x{}x{} fmt {} scaled/dim/tracked/tiled {:X} "
++                        "base/mips/mipmax/slicestride {:X} -> {} loads, {:.1f} Mtexels",
+                         std::get<0>(k), std::get<1>(k), std::get<2>(k), std::get<3>(k),
+                         std::get<4>(k), std::get<5>(k), std::get<6>(k), v.count,
+                         v.host_texels / 1.0e6));
+@@ -1947,6 +1973,16 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+     load_constants.host_offset = uint32_t(level_host_slice_layout.Offset);
+     load_constants.host_pitch = level_host_slice_layout.Footprint.RowPitch;
+ 
++    if (is_base && is_3d && base_z_count != depth) {
++      // The tiled 3D address is linear in whole groups of 8 slices, so the
++      // shader can start at a group boundary with only the offsets shifted.
++      load_constants.guest_offset += base_z_group_stride * (base_z_first / kZGroupDepth) *
++                                     (texture_resolution_scale_x * texture_resolution_scale_y);
++      load_constants.host_offset +=
++          level_host_slice_layout.Footprint.RowPitch *
++          (level_host_slice_layout.Footprint.Height / host_block_height) * base_z_first;
++      load_constants.size_blocks[2] = base_z_count;
++    }
+     command_list.D3DSetComputeRoot32BitConstants(0, sizeof(load_constants) / sizeof(uint32_t),
+                                                  &load_constants, 0);
+ 
+@@ -2043,12 +2079,26 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+     } else {
+       source_box_ptr = nullptr;
+     }
++    uint32_t copy_dest_z = 0;
++    if (level == 0 && is_3d && base_z_count != depth) {
++      const D3D12_SUBRESOURCE_FOOTPRINT& footprint = location_source.PlacedFootprint.Footprint;
++      D3D12_RESOURCE_DESC texture_desc = texture_resource->GetDesc();
++      source_box.left = 0;
++      source_box.top = 0;
++      source_box.right = std::min(footprint.Width, UINT(texture_desc.Width));
++      source_box.bottom = std::min(footprint.Height, UINT(texture_desc.Height));
++      source_box.front = base_z_first;
++      source_box.back = base_z_first + base_z_count;
++      source_box_ptr = &source_box;
++      copy_dest_z = base_z_first;
++    }
+     uint32_t copy_slice_first = level == 0 ? base_slice_first : 0;
+     uint32_t copy_slice_end = level == 0 ? base_slice_first + base_slice_count : array_size;
+     location_dest.SubresourceIndex += texture_level_count * copy_slice_first;
+     location_source.PlacedFootprint.Offset += host_slice_size * copy_slice_first;
+     for (uint32_t slice = copy_slice_first; slice < copy_slice_end; ++slice) {
+-      command_list.D3DCopyTextureRegion(&location_dest, 0, 0, 0, &location_source, source_box_ptr);
++      command_list.D3DCopyTextureRegion(&location_dest, 0, 0, copy_dest_z, &location_source,
++                                        source_box_ptr);
+       location_dest.SubresourceIndex += texture_level_count;
+       location_source.PlacedFootprint.Offset += host_slice_size;
+     }
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 081feea..729bdbb 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -661,9 +661,15 @@ TextureCache::Texture::Texture(TextureCache& texture_cache, const TextureKey& ke
+   // Never try to upload data that doesn't exist.
+   base_outdated_ = guest_layout().base.level_data_extent_bytes != 0;
+ 
+-  if (key.dimension == xenos::DataDimension::k2DOrStacked && key.mip_max_level == 0 &&
+-      key.GetDepthOrArraySize() > 1 && guest_layout().base.array_slice_stride_bytes != 0 &&
+-      base_outdated_) {
++  // 2D arrays reload by slice; tiled 3D textures by groups of 8 depth slices,
++  // which is the period of the 3D tiling (the in-tile layout alternates between
++  // odd and even groups of 4 slices).
++  bool partial_eligible =
++      (key.dimension == xenos::DataDimension::k2DOrStacked && key.GetDepthOrArraySize() > 1 &&
++       guest_layout().base.array_slice_stride_bytes != 0) ||
++      (key.dimension == xenos::DataDimension::k3D && key.tiled &&
++       key.GetDepthOrArraySize() >= 16);
++  if (partial_eligible && key.mip_max_level == 0 && base_outdated_) {
+     partial_reload_tracked_ = true;
+     auto lock = rex::thread::global_critical_region::AcquireDirect();
+     texture_cache.partial_reload_textures_.push_back(this);
+-- 
+2.55.0.windows.3
+
+
+From b8229f8e03af8888a232f4904df448b9b5572a71 Mon Sep 17 00:00:00 2001
+From: "PM.RAZOR" <hslee1659@naver.com>
+Date: Sat, 3 Oct 2026 22:07:24 +0900
+Subject: [PATCH 8/9] Use RB_COPY_SURFACE_SLICE height for volume resolves
+ (from xenia-canary)
+
+For resolves into 3D textures, D3D writes pitch * level height to
+RB_COPY_SURFACE_SLICE, while copy_dest_height includes the top of the
+source rectangle. Using copy_dest_height for the 3D tiling put slices at
+wrong addresses - SSX's snow trail volume showed square blocks at the
+wrong place.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/util/draw.cpp | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/src/graphics/util/draw.cpp b/src/graphics/util/draw.cpp
+index 305380e..1c2cc1b 100644
+--- a/src/graphics/util/draw.cpp
++++ b/src/graphics/util/draw.cpp
+@@ -951,8 +951,19 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+       (rb_copy_dest_pitch.copy_dest_pitch + (xenos::kTextureTileWidthHeight - 1)) >>
+       xenos::kTextureTileWidthHeightLog2;
+   info_out.copy_dest_coordinate_info.pitch_aligned_div_32 = copy_dest_pitch_aligned_div_32;
++  // For volume resolves, D3D writes pitch * level height in blocks to
++  // RB_COPY_SURFACE_SLICE - that's the height the 3D tiling uses. Only fall
++  // back to copy_dest_height, which instead includes the top of the source
++  // rectangle (as in xenia-canary).
++  uint32_t copy_dest_height = rb_copy_dest_pitch.copy_dest_height;
++  if (rb_copy_dest_info.copy_dest_array) {
++    uint32_t rb_copy_surface_slice = regs[XE_GPU_REG_RB_COPY_SURFACE_SLICE];
++    if (rb_copy_surface_slice && rb_copy_dest_pitch.copy_dest_pitch) {
++      copy_dest_height = rb_copy_surface_slice / rb_copy_dest_pitch.copy_dest_pitch;
++    }
++  }
+   info_out.copy_dest_coordinate_info.height_aligned_div_32 =
+-      (rb_copy_dest_pitch.copy_dest_height + (xenos::kTextureTileWidthHeight - 1)) >>
++      (copy_dest_height + (xenos::kTextureTileWidthHeight - 1)) >>
+       xenos::kTextureTileWidthHeightLog2;
+   const FormatInfo& dest_format_info = *FormatInfo::Get(dest_format);
+   if (is_depth || dest_format_info.type == FormatType::kResolvable) {
+@@ -974,17 +985,17 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+       // 3-bit).
+       copy_dest_base_adjusted += texture_util::GetTiledOffset3D(
+           int32_t(dest_base_x), int32_t(dest_base_y), 0, rb_copy_dest_pitch.copy_dest_pitch,
+-          rb_copy_dest_pitch.copy_dest_height, bpp_log2);
++          copy_dest_height, bpp_log2);
+       copy_dest_extent_start =
+           rb_copy_dest_base + texture_util::GetTiledAddressLowerBound3D(
+                                   uint32_t(x0), uint32_t(y0), rb_copy_dest_info.copy_dest_slice,
+                                   rb_copy_dest_pitch.copy_dest_pitch,
+-                                  rb_copy_dest_pitch.copy_dest_height, bpp_log2);
++                                  copy_dest_height, bpp_log2);
+       copy_dest_extent_end =
+           rb_copy_dest_base + texture_util::GetTiledAddressUpperBound3D(
+                                   uint32_t(x1), uint32_t(y1), rb_copy_dest_info.copy_dest_slice + 1,
+                                   rb_copy_dest_pitch.copy_dest_pitch,
+-                                  rb_copy_dest_pitch.copy_dest_height, bpp_log2);
++                                  copy_dest_height, bpp_log2);
+     } else {
+       copy_dest_base_adjusted += texture_util::GetTiledOffset2D(
+           int32_t(dest_base_x), int32_t(dest_base_y), rb_copy_dest_pitch.copy_dest_pitch, bpp_log2);
+-- 
+2.55.0.windows.3
+
+
+From 5f79de941cdd04e262fbbd81c40a12e2c6260ad2 Mon Sep 17 00:00:00 2001
+From: "PM.RAZOR" <hslee1659@naver.com>
+Date: Sat, 3 Oct 2026 22:20:23 +0900
+Subject: [PATCH 9/9] GPU profiler: split guest draws by render target MSAA
+ sample count
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../rex/graphics/d3d12/command_processor.h    |  4 ++++
+ src/graphics/d3d12/command_processor.cpp      | 19 ++++++++++++++++---
+ 2 files changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 22f20b0..c5e6497 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -196,6 +196,8 @@ class D3D12CommandProcessor : public CommandProcessor {
+     kTextureLoadArray,  // tracked 2D arrays (partial slice reloads)
+     kTextureLoadLarge,  // at least 1M host texels per load
+     kSwap,
++    kDrawMsaa2x,  // guest draws into 2x MSAA render targets
++    kDrawMsaa4x,  // guest draws into 4x MSAA render targets
+     kCount,
+   };
+   void GpuProfilePush(GpuProfileCategory category);
+@@ -456,6 +458,8 @@ class D3D12CommandProcessor : public CommandProcessor {
+   uint64_t gpu_profile_frequency_ = 0;
+   uint32_t gpu_profile_next_query_ = 0;
+   std::vector<GpuProfileCategory> gpu_profile_stack_;
++  // Category of guest drawing outside pushed scopes (by MSAA sample count).
++  GpuProfileCategory gpu_profile_draw_category_ = GpuProfileCategory::kDraw;
+   struct GpuProfileSubmission {
+     uint64_t submission;
+     uint32_t first_query;
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 1523eb6..acadd7b 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -836,7 +836,7 @@ void D3D12CommandProcessor::GpuProfileMark() {
+   deferred_command_list_.D3DEndQuery(gpu_profile_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                      gpu_profile_next_query_++);
+   gpu_profile_open_.segment_categories.push_back(
+-      gpu_profile_stack_.empty() ? GpuProfileCategory::kDraw : gpu_profile_stack_.back());
++      gpu_profile_stack_.empty() ? gpu_profile_draw_category_ : gpu_profile_stack_.back());
+ }
+ 
+ void D3D12CommandProcessor::GpuProfileEndSubmission() {
+@@ -884,8 +884,9 @@ void D3D12CommandProcessor::GpuProfileCollect() {
+   double window_s = double(now - gpu_profile_window_start_) / double(freq);
+   if (window_s < 2.0)
+     return;
+-  static const char* const kNames[] = {"draw",         "transfer",     "resolve", "texload",
+-                                       "texload_array", "texload_large", "swap"};
++  static const char* const kNames[] = {"draw",          "transfer",      "resolve",
++                                       "texload",       "texload_array", "texload_large",
++                                       "swap",          "draw_msaa2x",   "draw_msaa4x"};
+   double total = 0;
+   std::string text;
+   for (size_t i = 0; i < size_t(GpuProfileCategory::kCount); ++i) {
+@@ -2533,6 +2534,18 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   uint32_t normalized_color_mask =
+       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
+                    : 0;
++  if (gpu_profile_query_heap_) {
++    xenos::MsaaSamples draw_msaa = regs.Get<reg::RB_SURFACE_INFO>().msaa_samples;
++    GpuProfileCategory draw_category = draw_msaa == xenos::MsaaSamples::k4X
++                                           ? GpuProfileCategory::kDrawMsaa4x
++                                       : draw_msaa == xenos::MsaaSamples::k2X
++                                           ? GpuProfileCategory::kDrawMsaa2x
++                                           : GpuProfileCategory::kDraw;
++    if (draw_category != gpu_profile_draw_category_) {
++      gpu_profile_draw_category_ = draw_category;
++      GpuProfileMark();
++    }
++  }
+   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+                                     normalized_color_mask, *vertex_shader)) {
+     return false;
+-- 
+2.55.0.windows.3
+

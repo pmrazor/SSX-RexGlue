@@ -1,0 +1,18 @@
+# Game content (copyrighted, never commit)
+*.iso
+/game/
+
+# Build output and regenerable codegen output
+/out/
+/generated/
+/tools/xexdump/build/
+
+# Decrypted image dump and analysis scratch files
+/tools/default_image.bin
+/tools/d3d_region.txt
+/tools/cg_out.txt
+/tools/dangling.txt
+/tools/missing_filtered.txt
+
+# Logs
+*.log

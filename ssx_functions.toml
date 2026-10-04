@@ -1,0 +1,10 @@
+# Manual function boundaries for default.xex (codegen missed these leaf functions;
+# they are only reached via tail-call branches).
+
+[functions]
+# vector<uint32> inequality (tail-called from 0x829F2140)
+0x829F2308 = { end = 0x829F2380 }
+# tail-called from 0x82EEA870
+0x82EEAF88 = { end = 0x82EEAFA0 }
+# analyzer split this function at 0x82BF7944, leaving the shared "return 0" tail unresolved
+0x82BF7930 = { end = 0x82BF79A4 }
