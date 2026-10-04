@@ -1,11 +1,10 @@
 # SSX (2012) — rexglue static recompilation
 
-A native Windows build of **SSX** (Xbox 360, 2012, title ID `4541096D`), made by
+A native Windows build of **SSX** (Xbox 360, 2012), made by
 statically recompiling the game's PowerPC code to C++ with
 [rexglue-sdk](https://github.com/rexglue/rexglue-sdk) v0.10.0. Graphics, audio
 and the kernel still go through rexglue's runtime (derived from Xenia).
 
-> **No game content is included.** This repository contains only the project
 > setup, hand-written hooks, tools and SDK fixes. You need your own copy of the
 > game; the recompiled C++ (`generated/`) is produced locally from your
 > `default.xex` and must not be redistributed.
@@ -113,7 +112,7 @@ python tools/build_datarefs.py tools/missing.txt tools/missing2.txt [--exclude c
 python tools/check_gotos.py   # dangling labels left by mid-function candidates
 ```
 
-## 한국어 요약
+## 한국어
 
 SSX(2012, Xbox 360)를 rexglue-sdk로 정적 리컴파일한 Windows 네이티브 빌드입니다.
 **게임 파일과 리컴파일된 코드는 포함되어 있지 않습니다.** 직접 소유한 게임에서
