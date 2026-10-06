@@ -1,0 +1,25 @@
+diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
+index 7bd264b..feccf97 100644
+--- a/tests/unit/CMakeLists.txt
++++ b/tests/unit/CMakeLists.txt
+@@ -35,6 +35,7 @@ target_include_directories(unit_tests PRIVATE
+ target_link_libraries(unit_tests PRIVATE
+     rexcodegen
+     rexruntime
++    xxhash
+     Catch2::Catch2WithMain
+ )
+ 
+diff --git a/tests/unit/codegen/output_stamp_test.cpp b/tests/unit/codegen/output_stamp_test.cpp
+index d97edb5..99a2cfd 100644
+--- a/tests/unit/codegen/output_stamp_test.cpp
++++ b/tests/unit/codegen/output_stamp_test.cpp
+@@ -224,6 +224,6 @@ TEST_CASE("Depfile escapes characters make treats as syntax", "[output_stamp]")
+   std::ifstream in(depfile, std::ios::binary);
+   std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+ 
+-  CHECK(content.find("has\ space.toml") != std::string::npos);
+-  CHECK(content.find("hash\#.toml") != std::string::npos);
++  CHECK(content.find(R"(has\ space.toml)") != std::string::npos);
++  CHECK(content.find(R"(hash\#.toml)") != std::string::npos);
+ }

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <unordered_set>
 
 #include <rex/cvar.h>
 #include <rex/hook.h>
@@ -11,6 +12,9 @@
 
 REXCVAR_DEFINE_BOOL(ssx_show_fps, true, "SSX",
                     "Show the guest frame rate overlay in the top-left corner.");
+REXCVAR_DEFINE_BOOL(ssx_frame_timing_trace, false, "SSX",
+                    "Log guest scheduler callbacks and present call sites for native Reflex "
+                    "integration. Diagnostics only; does not emit simulation markers.");
 REXCVAR_DEFINE_INT32(ssx_present_interval, -1, "SSX",
                      "Guest vblanks between flips (-1 keeps the game's 2). 1 allows one flip "
                      "per vblank, so frames are capped at video_mode_refresh_rate.");
@@ -30,6 +34,12 @@ REX_HOOK_RAW(sub_83046110) {
 // FPS overlay twice a second and log the guest frame rate every 5 seconds.
 REX_EXTERN(__imp__sub_8233D770);
 REX_HOOK_RAW(sub_8233D770) {
+  if (REXCVAR_GET(ssx_frame_timing_trace)) {
+    thread_local std::unordered_set<uint32_t> callers;
+    if (callers.insert(uint32_t(ctx.lr)).second)
+      REXLOG_INFO("SSX_FRAME_TIMING present_caller={:08X} device={:08X} reflex_markers=false",
+                  uint32_t(ctx.lr), ctx.r3.u32);
+  }
   using clock = std::chrono::steady_clock;
   static clock::time_point last_present = clock::now();
   static clock::time_point overlay_window = last_present;
@@ -72,6 +82,19 @@ REX_EXTERN(__imp__sub_83046C48);
 REX_HOOK_RAW(sub_83046C48) {
   constexpr uint32_t kRenderLoopVtable = 0x82007738;
   constexpr uint32_t kIntervalOffset = 72;
+  if (REXCVAR_GET(ssx_frame_timing_trace)) {
+    const auto object = ctx.r3.u32;
+    const auto word = [base](uint32_t address) {
+      return __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + address));
+    };
+    const auto vtable = word(object);
+    thread_local std::unordered_set<uint32_t> seen;
+    if (seen.insert(vtable).second)
+      REXLOG_INFO("SSX_FRAME_TIMING scheduler={:08X} vtable={:08X} check={:08X} "
+                  "init={:08X} shutdown={:08X} eligible={:08X} wait={:08X} tick={:08X} caller={:08X} "
+                  "reflex_markers=false", object, vtable, word(vtable+20), word(vtable+24),
+                  word(vtable+28), word(vtable+32), word(vtable+36), word(vtable+8), uint32_t(ctx.lr));
+  }
   int32_t fps = REXCVAR_GET(ssx_render_fps);
   if (fps != 60) {
     uint32_t object = ctx.r3.u32;
@@ -83,6 +106,25 @@ REX_HOOK_RAW(sub_83046C48) {
     }
   }
   __imp__sub_83046C48(ctx, base);
+}
+
+// Scheduler +8 calls this dispatcher. +32 above is only an eligibility predicate,
+// not simulation. Resolve the embedded delegate before choosing Reflex hooks.
+REX_EXTERN(__imp__sub_8236E958);
+REX_HOOK_RAW(sub_8236E958) {
+  if (REXCVAR_GET(ssx_frame_timing_trace)) {
+    const auto word = [base](uint32_t address) {
+      return __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + address));
+    };
+    const auto scheduler = word(ctx.r3.u32);
+    const auto delegate = word(ctx.r3.u32 + 176);
+    thread_local std::unordered_set<uint32_t> seen;
+    if (seen.insert(delegate).second)
+      REXLOG_INFO("SSX_FRAME_TIMING scheduler_vtable={:08X} delegate={:08X} "
+                  "tick_direct={:08X} tick_synchronized={:08X} reflex_markers=false",
+                  scheduler, delegate, word(delegate+24), word(delegate+28));
+  }
+  __imp__sub_8236E958(ctx, base);
 }
 
 // sub_8233C870 is D3D's swap scheduler, called from the CP interrupt for each

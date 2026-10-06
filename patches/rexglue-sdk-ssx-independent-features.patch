@@ -1,0 +1,1791 @@
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 4380c2d..6771796 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -612,6 +612,7 @@ class D3D12CommandProcessor : public CommandProcessor {
+   std::unique_ptr<PipelineCache> ssx_other_pipeline_cache_;
+   std::unique_ptr<D3D12RenderTargetCache> ssx_other_render_target_cache_;
+   uint64_t ssx_quality_frame_ = UINT64_MAX;
++  uint32_t ssx_post_scale_ = 1, ssx_raster_scale_ = 1;
+   bool ssx_quality_scene_started_ = false;
+   bool BeginSsxQualityFrame();
+   bool SwitchSsxQualityScale(uint32_t scale);
+diff --git a/include/rex/ui/d3d12/guest_frame_inputs.h b/include/rex/ui/d3d12/guest_frame_inputs.h
+index 31ac219..9a5ea0a 100644
+--- a/include/rex/ui/d3d12/guest_frame_inputs.h
++++ b/include/rex/ui/d3d12/guest_frame_inputs.h
+@@ -43,8 +43,13 @@ inline SsxPass IdentifySsxPass(uint32_t title, uint64_t vs, uint64_t ps, uint32_
+ 
+ struct SsxFrameMetadata {
+   uint64_t guest_frame = 0;
++  // Native scheduler identity, available without NVIDIA or temporal AA.
++  uint64_t render_frame_id = 0;
+   uint32_t scene_width = 0, scene_height = 0;
+   uint32_t scale_x = 0, scale_y = 0;
++  uint32_t post_scale_x = 0, post_scale_y = 0;
++  uint32_t PostScaleX() const { return post_scale_x ? post_scale_x : scale_x; }
++  uint32_t PostScaleY() const { return post_scale_y ? post_scale_y : scale_y; }
+   uint32_t output_width = 0, output_height = 0;
+   uint32_t captured_mask = 0;
+   uint32_t failed_mask = 0;
+diff --git a/include/rex/ui/d3d12/ssx_hdr.h b/include/rex/ui/d3d12/ssx_hdr.h
+index fa61461..856af45 100644
+--- a/include/rex/ui/d3d12/ssx_hdr.h
++++ b/include/rex/ui/d3d12/ssx_hdr.h
+@@ -57,7 +57,7 @@ static_assert(sizeof(SsxHDRConstants) == 1296);
+ // Bypass is for the ungraded diagnostic regression only; presentation requires grading.
+ bool PlanSsxHDR(const SsxFrameInputs& input, SsxHDRConstants& constants,
+                 bool require_grading = true, bool require_layers = false,
+-                SsxHDRPath* path = nullptr);
++                SsxHDRPath* path = nullptr, ID3D12Resource* decoded_scene = nullptr);
+ bool PlanSsxHDRLayers(const SsxFrameInputs& input, SsxHDRConstants& constants);
+ bool PlanSsxHDRGrading(const SsxFrameInputs& input, SsxHDRConstants& constants);
+ // FG requires complete native composition, never an SDR fallback or calibration.
+@@ -107,7 +107,10 @@ class SsxHDR {
+                          uint32_t slot, ID3D12Resource* overlay,
+                          const std::shared_ptr<const SsxFrameInputs>& frame,
+                          const SsxHDRConstants& constants, ID3D12Resource* hudless = nullptr,
+-                         bool trace_light = false);
++                         bool trace_light = false, ID3D12Resource* decoded_scene = nullptr);
++  // decoded_scene is the matching SsxSceneColor::Record result when temporal AA
++  // is disabled. It enters/leaves kReadState and shares this paint submission's
++  // fence. It never supplies FG motion, tokens or invented reconstruction data.
+   // Same caller-owned slot/fence contract as Record: call only after the GPU
+   // has completed that slot. Consumes one pending readback, never waits or
+   // retains guest textures. Record logs a completed trace when reusing a slot.
+diff --git a/include/rex/ui/d3d12/ssx_reconstruction.h b/include/rex/ui/d3d12/ssx_reconstruction.h
+index 21f518e..2f640c6 100644
+--- a/include/rex/ui/d3d12/ssx_reconstruction.h
++++ b/include/rex/ui/d3d12/ssx_reconstruction.h
+@@ -5,6 +5,10 @@
+ 
+ namespace rex::ui::d3d12 {
+ class D3D12Provider;
++// Startup-only settings shared by the guest renderer and reconstruction bridge.
++Streamline::Quality SsxSelectedQuality();
++const char* SsxSelectedQualityName();
++uint32_t SsxRasterScale(uint32_t output_scale);
+ // Decompose the captured unjittered world-to-clip transform. Reject skewed,
+ // off-axis and non-perspective cameras rather than supplying invented constants.
+ // The returned projection and history use SSX's reversed device-depth space.
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 7a37498..bbf1857 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -1384,14 +1384,19 @@ bool D3D12CommandProcessor::SetupContext() {
+   }
+ 
+   if (REXCVAR_GET(d3d12_ssx_quality)) {
+-    if (draw_resolution_scale_x != 3 || draw_resolution_scale_y != 3 ||
++    ssx_post_scale_ = draw_resolution_scale_x;
++    ssx_raster_scale_ = ui::d3d12::SsxRasterScale(ssx_post_scale_);
++    if (ssx_post_scale_ < 1 || ssx_post_scale_ > 3 ||
++        draw_resolution_scale_y != ssx_post_scale_ ||
+         render_target_cache_->GetPath() != RenderTargetCache::Path::kPixelShaderInterlock ||
+         !provider.GetStreamline() || !provider.GetStreamline()->support().sr) {
+-      REXGPU_ERROR("SSX Quality requires 3x output, ROV and available DLSS");
++      REXGPU_ERROR("SSX DLSS requires symmetric 1x-3x output, ROV and available DLSS");
+       return false;
+     }
++    if (ssx_raster_scale_ != ssx_post_scale_) {
+     ssx_other_render_target_cache_ =
+-        std::make_unique<D3D12RenderTargetCache>(*register_file_, *memory_, 2, 2, *this, false);
++        std::make_unique<D3D12RenderTargetCache>(*register_file_, *memory_,
++                                               ssx_raster_scale_, ssx_raster_scale_, *this, false);
+     if (!ssx_other_render_target_cache_->Initialize())
+       return false;
+     render_target_cache_->EnableEdramLayoutTracking();
+@@ -1400,8 +1405,10 @@ bool D3D12CommandProcessor::SetupContext() {
+         *this, *register_file_, *ssx_other_render_target_cache_, false);
+     if (!ssx_other_pipeline_cache_->Initialize())
+       return false;
+-    ssx_other_pipeline_cache_->SetTextureResolutionScale(3, 3);
+-    REXGPU_INFO("SSX_QUALITY configured raster=2x reconstruction=3x post=3x preset=L");
++    ssx_other_pipeline_cache_->SetTextureResolutionScale(ssx_post_scale_, ssx_post_scale_);
++    }
++    REXGPU_INFO("SSX_UPSCALING mode={} raster={}x post={}x input=optimal-resampled experimental=true",
++                ui::d3d12::SsxSelectedQualityName(), ssx_raster_scale_, ssx_post_scale_);
+   }
+ 
+   D3D12_HEAP_FLAGS heap_flag_create_not_zeroed = provider.GetHeapFlagCreateNotZeroed();
+@@ -2797,14 +2804,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   if (!ReconstructSsxScene(vertex_shader->ucode_data_hash(),
+                            pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+                            viewport_info, ssx_restarted)) return false;
+-  if (ssx_other_render_target_cache_ && render_target_cache_->draw_resolution_scale_x() == 2 &&
++  if (ssx_other_render_target_cache_ && render_target_cache_->draw_resolution_scale_x() == ssx_raster_scale_ &&
+       ui::d3d12::IdentifySsxPass(ssx_title_id_, vertex_shader->ucode_data_hash(),
+                                  pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+-                                 viewport_info.xy_extent[0] / 2,
+-                                 viewport_info.xy_extent[1] / 2) == ui::d3d12::SsxPass::kToneMap) {
++                                 viewport_info.xy_extent[0] / ssx_raster_scale_,
++                                 viewport_info.xy_extent[1] / ssx_raster_scale_) == ui::d3d12::SsxPass::kToneMap) {
+     // Missing/ambiguous inputs still get ordinary spatial fallback and 3x post.
+     ssx_reconstruction_frame_ = frame_current_;
+-    if (!SwitchSsxQualityScale(3))
++    if (!SwitchSsxQualityScale(ssx_post_scale_))
+       return false;
+     ssx_restarted = true;
+   }
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index 750e6fd..4c605fa 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -210,7 +210,8 @@ bool D3D12RenderTargetCache::Initialize() {
+   uint32_t edram_buffer_size =
+       xenos::kEdramSizeBytes * (draw_resolution_scale_x() * draw_resolution_scale_y());
+   ssx_layers_allocated_ = REXCVAR_GET(d3d12_ssx_hdr_preview) && REXCVAR_GET(d3d12_ssx_hdr_layers) &&
+-      path_ == Path::kPixelShaderInterlock && draw_resolution_scale_x() == 3 && draw_resolution_scale_y() == 3;
++      path_ == Path::kPixelShaderInterlock && draw_resolution_scale_x() >= 1 &&
++      draw_resolution_scale_y() >= 1 && draw_resolution_scale_x() <= 3 && draw_resolution_scale_y() <= 3;
+   if (ssx_layers_allocated_) edram_buffer_size += 2 * ui::d3d12::kSsxLayerBytes;
+   D3D12_RESOURCE_DESC edram_buffer_desc;
+   ui::d3d12::util::FillBufferResourceDesc(edram_buffer_desc, edram_buffer_size,
+diff --git a/src/graphics/d3d12/ssx_frame_inputs.cpp b/src/graphics/d3d12/ssx_frame_inputs.cpp
+index 6a5659d..c9ea695 100644
+--- a/src/graphics/d3d12/ssx_frame_inputs.cpp
++++ b/src/graphics/d3d12/ssx_frame_inputs.cpp
+@@ -32,7 +32,7 @@ REXCVAR_DEFINE_BOOL(d3d12_ssx_fg_inputs, false, "GPU/D3D12",
+ 
+ namespace rex::graphics::d3d12 {
+ bool D3D12CommandProcessor::SsxJitterTranslationEnabled() const {
+-  if (ssx_other_render_target_cache_ && render_target_cache_->draw_resolution_scale_x() == 3)
++  if (ssx_other_render_target_cache_ && render_target_cache_->draw_resolution_scale_x() == ssx_post_scale_)
+     return false;  // Post-reconstruction passes must not reapply scene jitter.
+   if ((REXCVAR_GET(d3d12_ssx_dlaa) || REXCVAR_GET(d3d12_ssx_quality)) &&
+       (ssx_reconstruction_failed_ || !GetD3D12Provider().GetStreamline() ||
+@@ -162,7 +162,7 @@ bool D3D12CommandProcessor::CopySsxInputTexture(SsxInput role, uint32_t fetch, D
+   auto desc = source.resource->GetDesc();
+   if (desc.Format != format || mip >= desc.MipLevels)
+     return false;
+-  const bool extract = ssx_other_render_target_cache_ && metadata.scale_x == 2 && source.scaled &&
++  const bool extract = ssx_other_render_target_cache_ && metadata.scale_x == ssx_raster_scale_ && source.scaled &&
+                        role != SsxInput::kLogExposure;
+   const uint32_t sx = source.scaled ? texture_cache_->draw_resolution_scale_x() : 1;
+   const uint32_t sy = source.scaled ? texture_cache_->draw_resolution_scale_y() : 1;
+@@ -180,8 +180,8 @@ bool D3D12CommandProcessor::CopySsxInputTexture(SsxInput role, uint32_t fetch, D
+   auto& snapshot = ssx_inputs_->textures[size_t(role)];
+   bool created;
+   if (!snapshot.Prepare(GetD3D12Provider().GetDevice(), format,
+-                        extract ? metadata.scene_width * 2 : width,
+-                        extract ? metadata.scene_height * 2 : height, created, extract))
++                        extract ? metadata.scene_width * metadata.scale_x : width,
++                        extract ? metadata.scene_height * metadata.scale_y : height, created, extract))
+     return false;
+   if (created) {
+     static constexpr const wchar_t* names[] = {L"SSX encoded scene color snapshot",
+@@ -233,7 +233,7 @@ void D3D12CommandProcessor::CollectSsxFrameInputs(uint64_t vs, uint64_t ps,
+   CollectSsxHudless(vs, ps, viewport);
+   CollectSsxGrading(vs, ps, viewport);
+   if (!REXCVAR_GET(d3d12_ssx_frame_inputs) || ssx_title_id_ != 0x4541096D ||
+-      (ssx_other_render_target_cache_ && render_target_cache_->draw_resolution_scale_x() != 2))
++      (ssx_other_render_target_cache_ && render_target_cache_->draw_resolution_scale_x() != ssx_raster_scale_))
+     return;
+   const auto sx = render_target_cache_->draw_resolution_scale_x();
+   const auto sy = render_target_cache_->draw_resolution_scale_y();
+@@ -345,7 +345,7 @@ void D3D12CommandProcessor::CollectSsxFrameInputs(uint64_t vs, uint64_t ps,
+ void D3D12CommandProcessor::CollectSsxGrading(uint64_t vs, uint64_t ps,
+                                               const draw_util::ViewportInfo& viewport) {
+   if (!REXCVAR_GET(d3d12_ssx_hdr_preview) || ssx_title_id_ != 0x4541096D ||
+-      ssx_other_render_target_cache_ || !ssx_inputs_ ||
++      !ssx_inputs_ ||
+       ssx_inputs_->metadata.guest_frame != frame_current_)
+     return;
+   if (ps == 0x86455B1D2BA4A035ull || ps == 0x418794134AA3A6AFull || ps == 0x94262AE20BE5EC7Aull ||
+@@ -385,9 +385,13 @@ void D3D12CommandProcessor::CollectSsxGrading(uint64_t vs, uint64_t ps,
+       scene_source.guest_height != ssx_inputs_->metadata.scene_height)
+     return;
+   auto& f = ssx_inputs_->metadata;
+-  if (viewport.xy_offset[0] || viewport.xy_offset[1] || f.scale_x != 3 || f.scale_y != 3 ||
+-      viewport.xy_extent[0] != f.scene_width * 3 || viewport.xy_extent[1] != f.scene_height * 3)
++  const uint32_t sx = render_target_cache_->draw_resolution_scale_x();
++  const uint32_t sy = render_target_cache_->draw_resolution_scale_y();
++  if (viewport.xy_offset[0] || viewport.xy_offset[1] || !sx || !sy || sx > 3 || sy > 3 ||
++      viewport.xy_extent[0] != f.scene_width * sx || viewport.xy_extent[1] != f.scene_height * sy)
+     return;
++  f.post_scale_x = sx;
++  f.post_scale_y = sy;
+   if (f.grading_captured || f.grading_failed) {
+     f.grading_duplicate = true;
+     return;
+@@ -461,8 +465,8 @@ bool D3D12CommandProcessor::CopySsxBloom() {
+     return false;
+   const auto d = source.resource->GetDesc();
+   const auto& m = ssx_inputs_->metadata;
+-  if (!source.scaled || d.Format != DXGI_FORMAT_R8G8B8A8_TYPELESS ||
+-      d.Width != m.scene_width * 3 / 4 || d.Height != m.scene_height * 3 / 4)
++  if (d.Format != DXGI_FORMAT_R8G8B8A8_TYPELESS ||
++      d.Width != m.scene_width * m.PostScaleX() / 4 || d.Height != m.scene_height * m.PostScaleY() / 4)
+     return false;
+   return CopySsxPostTexture(1, ssx_inputs_->hdr_bloom);
+ }
+@@ -514,7 +518,7 @@ void D3D12CommandProcessor::PrepareSsxHDRLayerDraw(uint64_t vs, uint64_t ps,
+   uint32_t parameters[4]{};
+   [&] {
+     if (!REXCVAR_GET(d3d12_ssx_hdr_layers) || !REXCVAR_GET(d3d12_ssx_hdr_preview) ||
+-        ssx_title_id_ != 0x4541096D || ssx_other_render_target_cache_ || !ssx_inputs_ ||
++        ssx_title_id_ != 0x4541096D || !ssx_inputs_ ||
+         ssx_inputs_->metadata.guest_frame != frame_current_ ||
+         !render_target_cache_->SsxLayerBase(false))
+       return;
+@@ -523,7 +527,9 @@ void D3D12CommandProcessor::PrepareSsxHDRLayerDraw(uint64_t vs, uint64_t ps,
+       ssx_hdr_layer_phase_ = 0;
+     }
+     auto& m = ssx_inputs_->metadata;
+-    const uint32_t w = m.scene_width * 3, h = m.scene_height * 3;
++    const uint32_t sx = render_target_cache_->draw_resolution_scale_x();
++    const uint32_t sy = render_target_cache_->draw_resolution_scale_y();
++    const uint32_t w = m.scene_width * sx, h = m.scene_height * sy;
+     if (vs == 0xE857B4AF9617DC29ull && ps == 0xA2CD8E82699B2C0Aull && !viewport.xy_offset[0] &&
+         !viewport.xy_offset[1] && viewport.xy_extent[0] == w && viewport.xy_extent[1] == h) {
+       if (ssx_hdr_layer_phase_ != 0)
+@@ -547,7 +553,7 @@ void D3D12CommandProcessor::PrepareSsxHDRLayerDraw(uint64_t vs, uint64_t ps,
+       return;
+     }
+     if (vs == 0xE930F82AAE4ACF59ull && ps == 0xE7D07D83F716C69Dull && !viewport.xy_offset[0] &&
+-        !viewport.xy_offset[1] && viewport.xy_extent[0] == 3840 && viewport.xy_extent[1] == 2160) {
++        !viewport.xy_offset[1] && viewport.xy_extent[0] == 1280 * sx && viewport.xy_extent[1] == 720 * sy) {
+       if (ssx_hdr_layer_phase_ != 2)
+         m.hdr_layer_fail_reasons |= 8;
+       if (!render_target_cache_->ClearSsxLayer(true))
+@@ -595,8 +601,8 @@ void D3D12CommandProcessor::PrepareSsxHDRLayerDraw(uint64_t vs, uint64_t ps,
+       return;
+     }
+     parameters[0] = render_target_cache_->SsxLayerBase(hud);
+-    parameters[1] = hud ? 3840 : w;
+-    parameters[2] = hud ? 2160 : h;
++    parameters[1] = hud ? 1280 * sx : w;
++    parameters[2] = hud ? 720 * sy : h;
+     parameters[3] = blend;
+     if (hud)
+       ++m.hdr_hud_draws;
+@@ -635,7 +641,7 @@ void D3D12CommandProcessor::CollectSsxHudless(uint64_t vs, uint64_t ps,
+   if (!texture_cache_->GetActiveTextureSnapshotSource(0, source))
+     return;
+   const auto desc = source.resource->GetDesc();
+-  if (!source.scaled || desc.Format != DXGI_FORMAT_R8G8B8A8_TYPELESS || desc.MipLevels != 1 ||
++  if (desc.Format != DXGI_FORMAT_R8G8B8A8_TYPELESS || desc.MipLevels != 1 ||
+       source.guest_width != f.scene_width || source.guest_height != f.scene_height ||
+       desc.Width != f.scene_width * sx || desc.Height != f.scene_height * sy)
+     return;
+@@ -723,7 +729,7 @@ bool D3D12CommandProcessor::ReconstructSsxScene(uint64_t vs, uint64_t ps,
+                                   guest_render_marker_.id());
+   const auto result = ssx_reconstruction_->Submit(
+       GetD3D12Provider(), frozen, source.resource, source.state, seconds,
+-      ssx_other_render_target_cache_ ? Streamline::Quality::kQuality : Streamline::Quality::kDLAA,
++      SsxSelectedQuality(),
+       REXCVAR_GET(d3d12_gpu_profile), REXCVAR_GET(d3d12_ssx_fg_inputs),
+       REXCVAR_GET(d3d12_ssx_hdr_preview));
+   ui::GuestFrameTiming::Get().Add(ui::GuestFrameTiming::Event::kReconstructionEnd, frame_current_,
+@@ -739,16 +745,16 @@ bool D3D12CommandProcessor::ReconstructSsxScene(uint64_t vs, uint64_t ps,
+         "reason={} insertion=before_tone_map output={}x{} post_scale={} timed_frame={} "
+         "inputs_ms={:.3f} dlss_ms={:.3f} encode_ms={:.3f} "
+         "color_ms={:.3f} camera_ms={:.3f} native_ms={:.3f}",
+-        ssx_other_render_target_cache_ ? "Quality" : "DLAA", frame_current_,
++        SsxSelectedQualityName(), frame_current_,
+         frozen->textures[0].width, frozen->textures[0].height, f.scene_msaa_samples, result.applied,
+         result.reset, result.reason, frozen->metadata.output_width, frozen->metadata.output_height,
+-        ssx_other_render_target_cache_ ? 3 : f.scale_x, result.timed_frame, result.inputs_ms,
++        ssx_other_render_target_cache_ ? ssx_post_scale_ : f.scale_x, result.timed_frame, result.inputs_ms,
+         result.dlss_ms, result.encode_ms, result.color_ms, result.camera_ms, result.native_ms);
+   }
+   restarted = true;
+   if (!BeginSubmission(true))
+     return false;
+-  return !ssx_other_render_target_cache_ || SwitchSsxQualityScale(3);
++  return !ssx_other_render_target_cache_ || SwitchSsxQualityScale(ssx_post_scale_);
+ }
+ 
+ std::shared_ptr<const ui::d3d12::SsxFrameInputs> D3D12CommandProcessor::SealSsxFrameInputs(
+@@ -778,10 +784,12 @@ std::shared_ptr<const ui::d3d12::SsxFrameInputs> D3D12CommandProcessor::SealSsxF
+     return nullptr;
+   }
+   auto& data = ssx_inputs_->metadata;
++  data.render_frame_id = guest_render_marker_.id();
+   if (REXCVAR_GET(d3d12_ssx_hdr_layers)) {
+     if (ssx_hdr_layer_frame_ == frame_current_ && ssx_hdr_layer_phase_ == 3 &&
+         !data.hdr_hud_captured) {
+-      data.hdr_hud_captured = render_target_cache_->CopySsxLayer(true, ssx_inputs_->hdr_hud, ssx_inputs_->hdr_hud_transmission, 3840, 2160);
++      data.hdr_hud_captured = render_target_cache_->CopySsxLayer(true, ssx_inputs_->hdr_hud,
++          ssx_inputs_->hdr_hud_transmission, 1280 * data.PostScaleX(), 720 * data.PostScaleY());
+       data.hdr_layers_failed |= !data.hdr_hud_captured;
+       if (!data.hdr_hud_captured) data.hdr_layer_fail_reasons |= 256;
+       ssx_inputs_->last_copy_submission = submission_current_;
+@@ -894,7 +902,7 @@ bool D3D12CommandProcessor::BeginSsxQualityFrame() {
+   if (ssx_quality_frame_ != frame_current_) {
+     ssx_quality_frame_ = frame_current_;
+     ssx_quality_scene_started_ = false;
+-    if (!SwitchSsxQualityScale(3))
++    if (!SwitchSsxQualityScale(ssx_post_scale_))
+       return false;
+   }
+   const auto& regs = *register_file_;
+@@ -918,17 +926,17 @@ bool D3D12CommandProcessor::BeginSsxQualityFrame() {
+       !ui::d3d12::IsKnownSsxScene(viewport.xy_extent[0], viewport.xy_extent[1]))
+     return true;
+   ssx_quality_scene_started_ = true;
+-  return SwitchSsxQualityScale(2);
++  return SwitchSsxQualityScale(ssx_raster_scale_);
+ }
+ 
+ bool D3D12CommandProcessor::ResolveSsxQuality(uint32_t& address, uint32_t& length) {
+-  if (!ssx_other_render_target_cache_ || render_target_cache_->draw_resolution_scale_x() == 3)
++  if (!ssx_other_render_target_cache_ || render_target_cache_->draw_resolution_scale_x() == ssx_post_scale_)
+     return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, address,
+                                          length);
+-  // Resolve storage stays at 3x, independent of native raster resolution.
++  // Resolve storage stays at post scale, independent of native raster resolution.
+   // Copy and clear only touched EDRAM tile spans, including depth clears.
+   draw_util::ResolveInfo info;
+-  if (!draw_util::GetResolveInfo(*register_file_, *memory_, 3, 3, false, false, info))
++  if (!draw_util::GetResolveInfo(*register_file_, *memory_, ssx_post_scale_, ssx_post_scale_, false, false, info))
+     return false;
+   if (!info.coordinate_info.width_div_8 || !info.height_div_8) {
+     address = length = 0;
+@@ -991,7 +999,7 @@ bool D3D12CommandProcessor::ExtractSsxQualityInput(ID3D12Resource* source,
+                                        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0}};
+     D3D12_ROOT_PARAMETER params[3]{};
+     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+-    params[0].Constants = {0, 0, 2};
++    params[0].Constants = {0, 0, 4};
+     for (uint32_t i = 0; i < 2; ++i) {
+       params[i + 1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+       params[i + 1].DescriptorTable = {1, &ranges[i]};
+@@ -1026,8 +1034,8 @@ bool D3D12CommandProcessor::ExtractSsxQualityInput(ID3D12Resource* source,
+                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+   SubmitBarriers();
+   deferred_command_list_.D3DSetComputeRootSignature(ssx_extract_root_.Get());
+-  const uint32_t k[] = {output.width, output.height};
+-  deferred_command_list_.D3DSetComputeRoot32BitConstants(0, 2, k, 0);
++  const uint32_t k[] = {output.width, output.height, ssx_post_scale_, ssx_raster_scale_};
++  deferred_command_list_.D3DSetComputeRoot32BitConstants(0, 4, k, 0);
+   deferred_command_list_.D3DSetComputeRootDescriptorTable(1, descriptors[0].second);
+   deferred_command_list_.D3DSetComputeRootDescriptorTable(2, descriptors[1].second);
+   SetExternalPipeline(ssx_extract_pipeline_.Get());
+diff --git a/src/graphics/shaders/bytecode/d3d12_5_1/ssx_quality_extract_cs.h b/src/graphics/shaders/bytecode/d3d12_5_1/ssx_quality_extract_cs.h
+index 80440d7..9cc3336 100644
+--- a/src/graphics/shaders/bytecode/d3d12_5_1/ssx_quality_extract_cs.h
++++ b/src/graphics/shaders/bytecode/d3d12_5_1/ssx_quality_extract_cs.h
+@@ -10,6 +10,8 @@
+ //
+ //   uint width;                        // Offset:    0 Size:     4
+ //   uint height;                       // Offset:    4 Size:     4
++//   uint post_scale;                   // Offset:    8 Size:     4
++//   uint raster_scale;                 // Offset:   12 Size:     4
+ //
+ // }
+ //
+@@ -48,32 +50,34 @@ or r0.x, r0.y, r0.x
+ if_nz r0.x
+   ret
+ endif
+-imad r0.xy, vThreadID.xyxx, l(6, 6, 0, 0), l(3, 3, 0, 0)
+-ushr r0.xy, r0.xyxx, l(2, 2, 0, 0)
++imad r0.xy, vThreadID.xyxx, l(2, 2, 0, 0), l(1, 1, 0, 0)
++imul null, r0.xy, r0.xyxx, CB0[0][0].zzzz
++ishl r0.z, CB0[0][0].w, l(1)
++udiv r0.xy, null, r0.xyxx, r0.zzzz
+ mov r0.zw, l(0,0,0,0)
+ ld r0.xyzw, r0.xyzw, T0[0].xyzw
+ store_uav_typed U0[0].xyzw, vThreadID.xyyy, r0.xyzw
+ ret
+-// Approximately 11 instruction slots used
++// Approximately 13 instruction slots used
+ #endif
+ 
+ const BYTE ssx_quality_extract_cs[] =
+ {
+-     68,  88,  66,  67,  77, 175,
+-    168, 103, 201, 197, 189, 114,
+-     96, 194, 211,  31, 247, 106,
+-     70, 210,   1,   0,   0,   0,
+-     44,   4,   0,   0,   5,   0,
++     68,  88,  66,  67, 188,  38,
++     89, 141,  46, 227,  33, 222,
++    149,  45, 206, 225, 238, 185,
++    105, 162,   1,   0,   0,   0,
++    216,   4,   0,   0,   5,   0,
+       0,   0,  52,   0,   0,   0,
+-    216,   1,   0,   0, 232,   1,
+-      0,   0, 248,   1,   0,   0,
+-    144,   3,   0,   0,  82,  68,
+-     69,  70, 156,   1,   0,   0,
++     64,   2,   0,   0,  80,   2,
++      0,   0,  96,   2,   0,   0,
++     60,   4,   0,   0,  82,  68,
++     69,  70,   4,   2,   0,   0,
+       1,   0,   0,   0, 212,   0,
+       0,   0,   3,   0,   0,   0,
+      60,   0,   0,   0,   1,   5,
+      83,  67,   0, 133,   0,   0,
+-    115,   1,   0,   0,  19,  19,
++    219,   1,   0,   0,  19,  19,
+      68,  37,  60,   0,   0,   0,
+      24,   0,   0,   0,  40,   0,
+       0,   0,  40,   0,   0,   0,
+@@ -105,127 +109,156 @@ const BYTE ssx_quality_extract_cs[] =
+       0,  80,  97, 114,  97, 109,
+     101, 116, 101, 114, 115,   0,
+     171, 171, 199,   0,   0,   0,
+-      2,   0,   0,   0, 236,   0,
++      4,   0,   0,   0, 236,   0,
+       0,   0,  16,   0,   0,   0,
+       0,   0,   0,   0,   0,   0,
+-      0,   0,  60,   1,   0,   0,
++      0,   0, 140,   1,   0,   0,
+       0,   0,   0,   0,   4,   0,
+       0,   0,   2,   0,   0,   0,
+-     72,   1,   0,   0,   0,   0,
++    152,   1,   0,   0,   0,   0,
+       0,   0, 255, 255, 255, 255,
+       0,   0,   0,   0, 255, 255,
+     255, 255,   0,   0,   0,   0,
+-    108,   1,   0,   0,   4,   0,
++    188,   1,   0,   0,   4,   0,
+       0,   0,   4,   0,   0,   0,
+-      2,   0,   0,   0,  72,   1,
++      2,   0,   0,   0, 152,   1,
+       0,   0,   0,   0,   0,   0,
+     255, 255, 255, 255,   0,   0,
+       0,   0, 255, 255, 255, 255,
+-      0,   0,   0,   0, 119, 105,
+-    100, 116, 104,   0, 100, 119,
+-    111, 114, 100,   0,   0,   0,
+-     19,   0,   1,   0,   1,   0,
++      0,   0,   0,   0, 195,   1,
++      0,   0,   8,   0,   0,   0,
++      4,   0,   0,   0,   2,   0,
++      0,   0, 152,   1,   0,   0,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0, 206,   1,   0,   0,
++     12,   0,   0,   0,   4,   0,
++      0,   0,   2,   0,   0,   0,
++    152,   1,   0,   0,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++    119, 105, 100, 116, 104,   0,
++    100, 119, 111, 114, 100,   0,
++      0,   0,  19,   0,   1,   0,
++      1,   0,   0,   0,   0,   0,
+       0,   0,   0,   0,   0,   0,
+       0,   0,   0,   0,   0,   0,
+       0,   0,   0,   0,   0,   0,
++      0,   0, 146,   1,   0,   0,
++    104, 101, 105, 103, 104, 116,
++      0, 112, 111, 115, 116,  95,
++    115,  99,  97, 108, 101,   0,
++    114,  97, 115, 116, 101, 114,
++     95, 115,  99,  97, 108, 101,
++      0,  77, 105,  99, 114, 111,
++    115, 111, 102, 116,  32,  40,
++     82,  41,  32,  72,  76,  83,
++     76,  32,  83, 104,  97, 100,
++    101, 114,  32,  67, 111, 109,
++    112, 105, 108, 101, 114,  32,
++     49,  48,  46,  49,   0, 171,
++     73,  83,  71,  78,   8,   0,
+       0,   0,   0,   0,   0,   0,
+-     66,   1,   0,   0, 104, 101,
+-    105, 103, 104, 116,   0,  77,
+-    105,  99, 114, 111, 115, 111,
+-    102, 116,  32,  40,  82,  41,
+-     32,  72,  76,  83,  76,  32,
+-     83, 104,  97, 100, 101, 114,
+-     32,  67, 111, 109, 112, 105,
+-    108, 101, 114,  32,  49,  48,
+-     46,  49,   0, 171,  73,  83,
++      8,   0,   0,   0,  79,  83,
+      71,  78,   8,   0,   0,   0,
+       0,   0,   0,   0,   8,   0,
+-      0,   0,  79,  83,  71,  78,
+-      8,   0,   0,   0,   0,   0,
+-      0,   0,   8,   0,   0,   0,
+-     83,  72,  69,  88, 144,   1,
+-      0,   0,  81,   0,   5,   0,
+-    100,   0,   0,   0, 106,   8,
+-      0,   1,  89,   0,   0,   7,
+-     70, 142,  48,   0,   0,   0,
++      0,   0,  83,  72,  69,  88,
++    212,   1,   0,   0,  81,   0,
++      5,   0, 117,   0,   0,   0,
++    106,   8,   0,   1,  89,   0,
++      0,   7,  70, 142,  48,   0,
+       0,   0,   0,   0,   0,   0,
+-      0,   0,   0,   0,   1,   0,
+       0,   0,   0,   0,   0,   0,
+-     88,  24,   0,   7,  70, 126,
+-     48,   0,   0,   0,   0,   0,
+-      0,   0,   0,   0,   0,   0,
+-      0,   0,  85,  85,   0,   0,
+-      0,   0,   0,   0, 156,  24,
+-      0,   7,  70, 238,  49,   0,
++      1,   0,   0,   0,   0,   0,
++      0,   0,  88,  24,   0,   7,
++     70, 126,  48,   0,   0,   0,
+       0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  85,  85,
+       0,   0,   0,   0,   0,   0,
+-     85,  85,   0,   0,   0,   0,
+-      0,   0,  95,   0,   0,   2,
+-     50,   0,   2,   0, 104,   0,
+-      0,   2,   1,   0,   0,   0,
+-    155,   0,   0,   4,   8,   0,
+-      0,   0,   8,   0,   0,   0,
+-      1,   0,   0,   0,  80,   0,
+-      0,   8,  50,   0,  16,   0,
+-      0,   0,   0,   0,  70,   0,
+-      2,   0,  70, 128,  48,   0,
++    156,  24,   0,   7,  70, 238,
++     49,   0,   0,   0,   0,   0,
+       0,   0,   0,   0,   0,   0,
++      0,   0,  85,  85,   0,   0,
++      0,   0,   0,   0,  95,   0,
++      0,   2,  50,   0,   2,   0,
++    104,   0,   0,   2,   1,   0,
++      0,   0, 155,   0,   0,   4,
++      8,   0,   0,   0,   8,   0,
++      0,   0,   1,   0,   0,   0,
++     80,   0,   0,   8,  50,   0,
++     16,   0,   0,   0,   0,   0,
++     70,   0,   2,   0,  70, 128,
++     48,   0,   0,   0,   0,   0,
+       0,   0,   0,   0,   0,   0,
+-     60,   0,   0,   7,  18,   0,
++      0,   0,  60,   0,   0,   7,
++     18,   0,  16,   0,   0,   0,
++      0,   0,  26,   0,  16,   0,
++      0,   0,   0,   0,  10,   0,
+      16,   0,   0,   0,   0,   0,
+-     26,   0,  16,   0,   0,   0,
+-      0,   0,  10,   0,  16,   0,
+-      0,   0,   0,   0,  31,   0,
+-      4,   3,  10,   0,  16,   0,
+-      0,   0,   0,   0,  62,   0,
+-      0,   1,  21,   0,   0,   1,
+-     35,   0,   0,  14,  50,   0,
++     31,   0,   4,   3,  10,   0,
+      16,   0,   0,   0,   0,   0,
+-     70,   0,   2,   0,   2,  64,
+-      0,   0,   6,   0,   0,   0,
+-      6,   0,   0,   0,   0,   0,
++     62,   0,   0,   1,  21,   0,
++      0,   1,  35,   0,   0,  14,
++     50,   0,  16,   0,   0,   0,
++      0,   0,  70,   0,   2,   0,
++      2,  64,   0,   0,   2,   0,
++      0,   0,   2,   0,   0,   0,
+       0,   0,   0,   0,   0,   0,
+-      2,  64,   0,   0,   3,   0,
+-      0,   0,   3,   0,   0,   0,
++      0,   0,   2,  64,   0,   0,
++      1,   0,   0,   0,   1,   0,
+       0,   0,   0,   0,   0,   0,
+-      0,   0,  85,   0,   0,  10,
++      0,   0,   0,   0,  38,   0,
++      0,  10,   0, 208,   0,   0,
+      50,   0,  16,   0,   0,   0,
+       0,   0,  70,   0,  16,   0,
++      0,   0,   0,   0, 166, 138,
++     48,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  41,   0,   0,   9,
++     66,   0,  16,   0,   0,   0,
++      0,   0,  58, 128,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,  64,   0,   0,   1,   0,
++      0,   0,  78,   0,   0,   8,
++     50,   0,  16,   0,   0,   0,
++      0,   0,   0, 208,   0,   0,
++     70,   0,  16,   0,   0,   0,
++      0,   0, 166,  10,  16,   0,
++      0,   0,   0,   0,  54,   0,
++      0,   8, 194,   0,  16,   0,
+       0,   0,   0,   0,   2,  64,
+-      0,   0,   2,   0,   0,   0,
+-      2,   0,   0,   0,   0,   0,
+       0,   0,   0,   0,   0,   0,
+-     54,   0,   0,   8, 194,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     45,   0,   0,   8, 242,   0,
+      16,   0,   0,   0,   0,   0,
+-      2,  64,   0,   0,   0,   0,
++     70,  14,  16,   0,   0,   0,
++      0,   0,  70, 126,  32,   0,
+       0,   0,   0,   0,   0,   0,
++      0,   0, 164,   0,   0,   7,
++    242, 224,  33,   0,   0,   0,
+       0,   0,   0,   0,   0,   0,
+-      0,   0,  45,   0,   0,   8,
+-    242,   0,  16,   0,   0,   0,
+-      0,   0,  70,  14,  16,   0,
+-      0,   0,   0,   0,  70, 126,
+-     32,   0,   0,   0,   0,   0,
+-      0,   0,   0,   0, 164,   0,
+-      0,   7, 242, 224,  33,   0,
++     70,   5,   2,   0,  70,  14,
++     16,   0,   0,   0,   0,   0,
++     62,   0,   0,   1,  83,  84,
++     65,  84, 148,   0,   0,   0,
++     13,   0,   0,   0,   1,   0,
+       0,   0,   0,   0,   0,   0,
+-      0,   0,  70,   5,   2,   0,
+-     70,  14,  16,   0,   0,   0,
+-      0,   0,  62,   0,   0,   1,
+-     83,  84,  65,  84, 148,   0,
+-      0,   0,  11,   0,   0,   0,
+       1,   0,   0,   0,   0,   0,
+-      0,   0,   1,   0,   0,   0,
+-      0,   0,   0,   0,   1,   0,
+       0,   0,   3,   0,   0,   0,
+-      2,   0,   0,   0,   1,   0,
++      3,   0,   0,   0,   2,   0,
++      0,   0,   1,   0,   0,   0,
+       0,   0,   0,   0,   0,   0,
+       0,   0,   0,   0,   0,   0,
+       0,   0,   0,   0,   0,   0,
+       0,   0,   0,   0,   0,   0,
+-      0,   0,   1,   0,   0,   0,
++      1,   0,   0,   0,   0,   0,
+       0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
+       0,   0,   0,   0,   0,   0,
+-      1,   0,   0,   0,   0,   0,
+       0,   0,   0,   0,   0,   0,
+       0,   0,   0,   0,   0,   0,
+       0,   0,   0,   0,   0,   0,
+@@ -236,5 +269,5 @@ const BYTE ssx_quality_extract_cs[] =
+       0,   0,   0,   0,   0,   0,
+       0,   0,   0,   0,   0,   0,
+       0,   0,   0,   0,   0,   0,
+-      0,   0,   1,   0,   0,   0
++      1,   0,   0,   0
+ };
+diff --git a/src/graphics/shaders/ssx_quality_extract.cs.hlsl b/src/graphics/shaders/ssx_quality_extract.cs.hlsl
+index 43cd746..0543218 100644
+--- a/src/graphics/shaders/ssx_quality_extract.cs.hlsl
++++ b/src/graphics/shaders/ssx_quality_extract.cs.hlsl
+@@ -1,9 +1,9 @@
+-// Recover the exact original 2x sample from canonical 3x resolve storage.
++// Recover the original integer-raster sample from canonical post-scale storage.
+ Texture2D<float4> source : register(t0);
+ RWTexture2D<float4> destination : register(u0);
+-cbuffer Parameters : register(b0) { uint width, height; };
++cbuffer Parameters : register(b0) { uint width, height, post_scale, raster_scale; };
+ [numthreads(8,8,1)]
+ void main(uint3 id : SV_DispatchThreadID) {
+   if (id.x >= width || id.y >= height) return;
+-  destination[id.xy] = source.Load(int3(((2 * id.xy + 1) * 3) / 4, 0));
++  destination[id.xy] = source.Load(int3(((2 * id.xy + 1) * post_scale) / (2 * raster_scale), 0));
+ }
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index c3ace33..5b5ed5c 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -48,8 +48,8 @@ REXCVAR_DEFINE_BOOL(
+     d3d12_ssx_fg_enable, false, "UI/D3D12",
+     "Enable experimental gameplay FG after HUD-free color validation. Requires FG launcher.");
+ REXCVAR_DEFINE_INT32(d3d12_ssx_fg_multiplier, 2, "UI/D3D12",
+-                    "Total FG output multiplier: 2x or 3x, subject to NVIDIA runtime support.")
+-    .range(2, 3)
++                    "Total FG output multiplier: 2x through 6x, subject to NVIDIA runtime support.")
++    .range(2, 6)
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ REXCVAR_DEFINE_BOOL(d3d12_log_presenter, false, "UI/D3D12",
+                     "Log swap chain dimensions and format on surface connect or resize.");
+@@ -761,6 +761,17 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+ 
+   ID3D12Device* device = provider_.GetDevice();
+ 
++  const auto inputs_completed = paint_context_.paint_submission_tracker.GetCompletedSubmission();
++  ID3D12Resource* hdr_decoded_scene = nullptr;
++  if ((hdr_preview || REXCVAR_GET(d3d12_ssx_scene_color)) && !REXCVAR_GET(d3d12_ssx_dlaa) &&
++      !REXCVAR_GET(d3d12_ssx_quality)) {
++    // Decode the retained pre-tone-map guest color directly. This path has no
++    // NVIDIA, jitter, motion-vector or reconstruction prerequisite. The decoder
++    // owns its resources until this same paint submission completes.
++    hdr_decoded_scene = paint_context_.scene_color.Record(provider_, command_list, frame_inputs,
++        current_paint_submission, inputs_completed).color;
++  }
++
+   // Obtain the RTV heap and the back buffer.
+   D3D12_CPU_DESCRIPTOR_HANDLE rtv_heap_start =
+       paint_context_.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+@@ -787,14 +798,16 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+     hdr_constants.hdr_output = paint_context_.hdr_active;
+     hdr_constants.calibration = REXCVAR_GET(ssx_hdr_calibration) && paint_context_.hdr_active;
+     const auto* sl = provider_.GetStreamline();
+-    hdr_race = sl && sl->GetFrameRenderId(frame_token, hdr_render_id) &&
+-               GuestFrameTiming::Get().FrameGenerationScene(hdr_render_id);
++    hdr_render_id = frame_inputs ? frame_inputs->metadata.render_frame_id : 0;
++    if (!hdr_render_id && sl) sl->GetFrameRenderId(frame_token, hdr_render_id);
++    hdr_race = GuestFrameTiming::Get().FrameGenerationScene(hdr_render_id);
+     if (!paint_context_.hdr_active) hdr_path = SsxHDRPath::kSDRDisplay;
+     else if (hdr_constants.calibration) hdr_path = SsxHDRPath::kCalibration;
+     else if (!hdr_render_id) hdr_path = SsxHDRPath::kFrameTiming;
+     else if (!hdr_race) hdr_path = SsxHDRPath::kFrontend;
+     else if (!frame_inputs) hdr_path = SsxHDRPath::kFrameInputs;
+-    else PlanSsxHDR(*frame_inputs, hdr_constants, true, REXCVAR_GET(d3d12_ssx_hdr_layers), &hdr_path);
++    else PlanSsxHDR(*frame_inputs, hdr_constants, true, REXCVAR_GET(d3d12_ssx_hdr_layers),
++                    &hdr_path, hdr_decoded_scene);
+     SsxHDRStatus::Get().SetCurrent(hdr_path);
+     const uint64_t post = frame_inputs ? frame_inputs->metadata.hdr_post_shader : 0;
+     if (hdr_path != paint_context_.hdr_last_path || post != paint_context_.hdr_last_post_logged) {
+@@ -824,7 +837,6 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+ 
+   // Draw the guest output.
+ 
+-  const auto inputs_completed = paint_context_.paint_submission_tracker.GetCompletedSubmission();
+   paint_context_.fg_color.Collect(inputs_completed);
+   paint_context_.fg_capture.Record(device, command_list, frame_inputs, guest_output_resource.Get(),
+                                    current_paint_submission, inputs_completed);
+@@ -843,11 +855,6 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+     }
+   }
+ 
+-  if (REXCVAR_GET(d3d12_ssx_scene_color) && !REXCVAR_GET(d3d12_ssx_dlaa) &&
+-      !REXCVAR_GET(d3d12_ssx_quality))
+-    paint_context_.scene_color.Record(provider_, command_list, frame_inputs,
+-                                      current_paint_submission, inputs_completed);
+-
+   if (REXCVAR_GET(d3d12_ssx_camera_motion) && !REXCVAR_GET(d3d12_ssx_dlaa) &&
+       !REXCVAR_GET(d3d12_ssx_quality)) {
+     const double seconds = std::chrono::duration<double>(
+@@ -1414,7 +1421,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+           current_paint_submission, inputs_completed);
+     auto* pq = paint_context_.hdr.Record(provider_, command_list, hdr_slot, back_buffer,
+                                          frame_inputs, hdr_constants, fg_color ? fg_color->color.Get() : nullptr,
+-                                         REXCVAR_GET(d3d12_ssx_hdr_light_trace));
++                                         REXCVAR_GET(d3d12_ssx_hdr_light_trace), hdr_decoded_scene);
+     if (!pq) {
+       if (auto* sl = provider_.GetStreamline()) sl->SetFrameGenerationActive(false);
+       paint_context_.fg_active = false;
+diff --git a/src/ui/d3d12/ssx_fg_color.cpp b/src/ui/d3d12/ssx_fg_color.cpp
+index 70a76da..27a6862 100644
+--- a/src/ui/d3d12/ssx_fg_color.cpp
++++ b/src/ui/d3d12/ssx_fg_color.cpp
+@@ -24,13 +24,14 @@ void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
+ bool CanBuildSsxFGColor(const SsxFrameInputs& input, uint32_t width, uint32_t height) {
+   const auto& m = input.metadata;
+   const auto& t = input.fg_hudless;
+-  // Deliberately limited to the measured DLAA full-screen composition. Window
+-  // scaling, PWL ramps and arbitrary/cropped guest UVs need their own validation.
++  // The audited final copy uses full-screen normalized UVs. Internal scene and
++  // presentation dimensions may differ; both outputs must keep its 16:9 mapping.
+   if (!m.fg_hudless_captured || m.fg_hudless_failed || m.fg_hudless_duplicate || m.fg_gamma_pwl ||
+-      !m.depth_before_lighting || !m.camera_samples || m.camera_conflict || m.scale_x != 3 ||
+-      m.scale_y != 3 || !IsKnownSsxScene(m.scene_width, m.scene_height) || width != 3840 ||
+-      height != 2160 || m.output_width != width || m.output_height != height ||
+-      t.width != m.scene_width * 3 || t.height != m.scene_height * 3 ||
++      !m.depth_before_lighting || !m.camera_samples || m.camera_conflict || !m.scale_x ||
++      m.scale_x > 3 || m.scale_y != m.scale_x || !IsKnownSsxScene(m.scene_width, m.scene_height) ||
++      !width || !height || width > 16384 || height > 16384 || uint64_t(width) * 9 != uint64_t(height) * 16 ||
++      m.output_width != 1280 * m.scale_x || m.output_height != 720 * m.scale_y ||
++      t.width != m.scene_width * m.scale_x || t.height != m.scene_height * m.scale_y ||
+       t.view_format != DXGI_FORMAT_R8G8B8A8_UNORM || t.host_swizzle != 0x60A || t.swizzled_signs ||
+       !t.resource)
+     return false;
+@@ -137,8 +138,10 @@ std::shared_ptr<SsxFGColorFrame> SsxFGColor::AcquireHDR(
+     const D3D12Provider& provider, const std::shared_ptr<const SsxFrameInputs>& frame,
+     uint32_t width, uint32_t height, uint64_t submission, uint64_t completed) {
+   SsxHDRConstants k;
+-  if (!frame || width != 3840 || height != 2160 ||
+-      frame->metadata.output_width != width || frame->metadata.output_height != height ||
++  if (!frame || !width || !height || width > 16384 || height > 16384 ||
++      uint64_t(width) * 9 != uint64_t(height) * 16 ||
++      frame->metadata.output_width != 1280 * frame->metadata.scale_x ||
++      frame->metadata.output_height != 720 * frame->metadata.scale_y ||
+       !PlanSsxHDR(*frame, k, true, true)) return {};
+   for (auto& slot : impl_->slots) {
+     auto& out = slot.output;
+diff --git a/src/ui/d3d12/ssx_hdr.cpp b/src/ui/d3d12/ssx_hdr.cpp
+index 70f7c90..2c39de2 100644
+--- a/src/ui/d3d12/ssx_hdr.cpp
++++ b/src/ui/d3d12/ssx_hdr.cpp
+@@ -192,13 +192,15 @@ bool PlanSsxHDRLayers(const SsxFrameInputs& input, SsxHDRConstants& k) {
+            d.DepthOrArraySize == 1 && d.MipLevels == 1 && d.SampleDesc.Count == 1 &&
+            d.Format == fmt;
+   };
+-  if (!texture(input.hdr_world_transmission, m.scene_width * 3, m.scene_height * 3,
++  const uint32_t sx = m.PostScaleX(), sy = m.PostScaleY();
++  if (!sx || !sy || sx > 3 || sy > 3) return false;
++  if (!texture(input.hdr_world_transmission, m.scene_width * sx, m.scene_height * sy,
+                DXGI_FORMAT_R16G16B16A16_FLOAT) ||
+-      !texture(input.hdr_hud_transmission, 3840, 2160, DXGI_FORMAT_R16G16B16A16_FLOAT) ||
+-      !texture(input.hdr_world, m.scene_width * 3, m.scene_height * 3,
++      !texture(input.hdr_hud_transmission, 1280 * sx, 720 * sy, DXGI_FORMAT_R16G16B16A16_FLOAT) ||
++      !texture(input.hdr_world, m.scene_width * sx, m.scene_height * sy,
+                DXGI_FORMAT_R16G16B16A16_FLOAT) ||
+-      !texture(input.hdr_hud, 3840, 2160, DXGI_FORMAT_R16G16B16A16_FLOAT) ||
+-      !texture(input.hdr_bloom, m.scene_width * 3 / 4, m.scene_height * 3 / 4,
++      !texture(input.hdr_hud, 1280 * sx, 720 * sy, DXGI_FORMAT_R16G16B16A16_FLOAT) ||
++      !texture(input.hdr_bloom, m.scene_width * sx / 4, m.scene_height * sy / 4,
+                DXGI_FORMAT_R8G8B8A8_TYPELESS))
+     return false;
+   const auto& b = input.hdr_bloom;
+@@ -260,7 +262,7 @@ bool PlanSsxHDRLayers(const SsxFrameInputs& input, SsxHDRConstants& k) {
+   return true;
+ }
+ bool PlanSsxHDR(const SsxFrameInputs& input, SsxHDRConstants& k, bool require_grading,
+-                bool require_layers, SsxHDRPath* path) {
++                bool require_layers, SsxHDRPath* path, ID3D12Resource* decoded_scene) {
+   const auto stage = [path](SsxHDRPath value) { if (path) *path = value; };
+   k.native_scene = 0;
+   k.grading_enabled = 0;
+@@ -268,17 +270,22 @@ bool PlanSsxHDR(const SsxFrameInputs& input, SsxHDRConstants& k, bool require_gr
+   SsxColorConstants decode;
+   const auto& retained = input.fg_temporal;
+   stage(SsxHDRPath::kRetainedScene);
+-  if (!retained || !retained->hdr_valid || retained->guest_frame != input.metadata.guest_frame ||
+-      !retained->hdr_color.resource)
++  if (!decoded_scene && (!retained || !retained->hdr_valid ||
++      retained->guest_frame != input.metadata.guest_frame || !retained->hdr_color.resource))
+     return false;
+   stage(SsxHDRPath::kSceneColor);
+   if (!IsKnownSsxScene(input.metadata.scene_width, input.metadata.scene_height) ||
+-      input.metadata.scale_x != 3 || input.metadata.scale_y != 3 ||
++      !input.metadata.scale_x || !input.metadata.scale_y ||
++      input.metadata.scale_x > 3 || input.metadata.scale_y > 3 ||
+       !PlanSsxSceneColor(input, decode) || decode.exposure_enabled == 2)
+     return false;
+-  const auto desc = retained->hdr_color.resource->GetDesc();
+-  if (desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || desc.Width != decode.width ||
+-      desc.Height != decode.height || desc.DepthOrArraySize != 1 || desc.MipLevels != 1 ||
++  const auto desc = (decoded_scene ? decoded_scene : retained->hdr_color.resource.Get())->GetDesc();
++  const uint32_t scene_width = decoded_scene ? decode.width :
++      input.metadata.scene_width * input.metadata.PostScaleX();
++  const uint32_t scene_height = decoded_scene ? decode.height :
++      input.metadata.scene_height * input.metadata.PostScaleY();
++  if (desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || desc.Width != scene_width ||
++      desc.Height != scene_height || desc.DepthOrArraySize != 1 || desc.MipLevels != 1 ||
+       desc.SampleDesc.Count != 1 || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+     return false;
+   if (decode.exposure_enabled) {
+@@ -446,7 +453,7 @@ ID3D12Resource* SsxHDR::Record(const D3D12Provider& provider, ID3D12GraphicsComm
+                                uint32_t index, ID3D12Resource* overlay,
+                                const std::shared_ptr<const SsxFrameInputs>& frame,
+                                const SsxHDRConstants& k, ID3D12Resource* hudless,
+-                               bool trace_light) {
++                               bool trace_light, ID3D12Resource* decoded_scene) {
+   if (!list || !overlay || index >= impl_->slots.size() || !impl_->pipeline)
+     return nullptr;
+   const SsxHDRSettings settings{k.peak_nits, k.paper_white_nits, k.ui_nits, k.exposure_ev,
+@@ -502,7 +509,8 @@ ID3D12Resource* SsxHDR::Record(const D3D12Provider& provider, ID3D12GraphicsComm
+   ID3D12Resource* exposure = nullptr;
+   if (k.native_scene) {
+     SsxHDRConstants checked = k;
+-    if (!frame || !PlanSsxHDR(*frame, checked, k.grading_enabled != 0, k.layers_enabled != 0) ||
++    if (!frame || !PlanSsxHDR(*frame, checked, k.grading_enabled != 0, k.layers_enabled != 0,
++                             nullptr, decoded_scene) ||
+         checked.exposure_enabled != k.exposure_enabled ||
+         checked.exposure_scale != k.exposure_scale || checked.exposure_key != k.exposure_key ||
+         checked.log_scale != k.log_scale || checked.exposure_linear != k.exposure_linear ||
+@@ -513,7 +521,7 @@ ID3D12Resource* SsxHDR::Record(const D3D12Provider& provider, ID3D12GraphicsComm
+         checked.bloom_gain != k.bloom_gain || checked.post != k.post ||
+         checked.post_mode != k.post_mode || checked.post_linear != k.post_linear)
+       return nullptr;
+-    scene = frame->fg_temporal->hdr_color.resource.Get();
++    scene = decoded_scene ? decoded_scene : frame->fg_temporal->hdr_color.resource.Get();
+     if (k.exposure_enabled)
+       exposure = frame->textures[size_t(SsxInput::kLogExposure)].resource.Get();
+   }
+@@ -626,7 +634,7 @@ ID3D12Resource* SsxHDR::Record(const D3D12Provider& provider, ID3D12GraphicsComm
+     slot.light_pending = true;
+     slot.light_frame = frame->metadata.guest_frame;
+     slot.light_post = frame->metadata.hdr_post_shader;
+-    slot.light_reset = frame->fg_temporal->reset;
++    slot.light_reset = frame->fg_temporal ? frame->fg_temporal->reset : false;
+     slot.light_white = k.curve_efs_white[3];
+   }
+   Transition(list, slot.output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+diff --git a/src/ui/d3d12/ssx_reconstruction.cpp b/src/ui/d3d12/ssx_reconstruction.cpp
+index b678c4b..a8bcd1e 100644
+--- a/src/ui/d3d12/ssx_reconstruction.cpp
++++ b/src/ui/d3d12/ssx_reconstruction.cpp
+@@ -14,13 +14,44 @@ REXCVAR_DEFINE_BOOL(
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ REXCVAR_DEFINE_BOOL(d3d12_ssx_quality, false, "GPU/D3D12",
+-                    "Experimental SSX Quality: 2x native scene, DLSS L to 3x before tone map, 3x "
+-                    "post/HUD. ROV only.")
++                    "Enable experimental SSX upscaling before tone map; mode selected by "
++                    "d3d12_ssx_dlss_mode. ROV only.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_STRING(d3d12_ssx_dlss_mode, "quality", "GPU/D3D12",
++                      "Experimental DLSS scaling mode; requires d3d12_ssx_quality.")
++    .allowed({"quality", "balanced", "performance"})
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ namespace rex::ui::d3d12 {
++Streamline::Quality SsxSelectedQuality() {
++  if (!REXCVAR_GET(d3d12_ssx_quality)) return Streamline::Quality::kDLAA;
++  const auto mode = REXCVAR_GET(d3d12_ssx_dlss_mode);
++  if (mode == "balanced") return Streamline::Quality::kBalanced;
++  if (mode == "performance") return Streamline::Quality::kPerformance;
++  return Streamline::Quality::kQuality;
++}
++const char* SsxSelectedQualityName() {
++  switch (SsxSelectedQuality()) {
++    case Streamline::Quality::kQuality: return "Quality";
++    case Streamline::Quality::kBalanced: return "Balanced";
++    case Streamline::Quality::kPerformance: return "Performance";
++    default: return "DLAA";
++  }
++}
++uint32_t SsxRasterScale(uint32_t output_scale) {
++  // ReXGlue raster/EDRAM allocation supports integer scales. Round UP so the
++  // experimental input resampler never invents detail below the selected size.
++  // NVIDIA's optimal input dimensions are queried separately at reconstruction.
++  switch (SsxSelectedQuality()) {
++    case Streamline::Quality::kQuality: return (output_scale * 2 + 2) / 3;
++    case Streamline::Quality::kBalanced: return (output_scale * 58 + 99) / 100;
++    case Streamline::Quality::kPerformance: return (output_scale + 1) / 2;
++    default: return output_scale;
++  }
++}
+ namespace {
+ #include "ui/shaders/bytecode/d3d12_5_1/ssx_reconstruction_encode_cs.h"
++#include "ui/shaders/bytecode/d3d12_5_1/ssx_reconstruction_inputs_cs.h"
+ using Microsoft::WRL::ComPtr;
+ void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
+                 D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
+@@ -38,6 +69,9 @@ struct SsxReconstruction::Impl {
+     ComPtr<ID3D12GraphicsCommandList> list;
+     ComPtr<ID3D12Resource> output, encoded, destination;
+     ComPtr<ID3D12DescriptorHeap> heap;
++    std::array<ComPtr<ID3D12Resource>, 3> resized_inputs;
++    ComPtr<ID3D12DescriptorHeap> input_heap;
++    uint32_t input_width = 0, input_height = 0;
+     std::shared_ptr<const SsxFrameInputs> input;
+     uint64_t submission = 0;
+     uint64_t timed_frame = 0;
+@@ -52,6 +86,8 @@ struct SsxReconstruction::Impl {
+   Streamline* sr = nullptr;
+   ComPtr<ID3D12RootSignature> root;
+   ComPtr<ID3D12PipelineState> pipeline;
++  ComPtr<ID3D12RootSignature> input_root;
++  ComPtr<ID3D12PipelineState> input_pipeline;
+   ComPtr<ID3D12QueryHeap> queries;
+   ComPtr<ID3D12Resource> timings;
+   uint64_t timestamp_frequency = 0;
+@@ -141,6 +177,89 @@ struct SsxReconstruction::Impl {
+     slot.height = h;
+     return true;
+   }
++  bool ResizeInputs(const D3D12Provider& provider, Slot& slot, Streamline::SRFrame& frame,
++                    uint32_t w, uint32_t h) {
++    const auto source_desc = frame.color->GetDesc();
++    if (source_desc.Width == w && source_desc.Height == h) return true;
++    auto* device = provider.GetDevice();
++    if (!input_root) {
++      D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0},
++                                         {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0, 3}};
++      D3D12_ROOT_PARAMETER params[2]{};
++      params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++      params[0].Constants = {0, 0, 4};
++      params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++      params[1].DescriptorTable = {2, ranges};
++      D3D12_ROOT_SIGNATURE_DESC desc{};
++      desc.NumParameters = 2; desc.pParameters = params;
++      input_root.Attach(util::CreateRootSignature(provider, desc));
++      if (!input_root) return false;
++    }
++    if (!input_pipeline) {
++      input_pipeline.Attach(util::CreateComputePipeline(device, ssx_reconstruction_inputs_cs,
++          sizeof(ssx_reconstruction_inputs_cs), input_root.Get()));
++      if (!input_pipeline) return false;
++    }
++    if (!slot.input_heap) {
++      D3D12_DESCRIPTOR_HEAP_DESC desc{};
++      desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
++      desc.NumDescriptors = 6; desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
++      if (FAILED(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&slot.input_heap)))) return false;
++    }
++    const DXGI_FORMAT formats[] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT,
++                                   DXGI_FORMAT_R32G32_FLOAT};
++    if (slot.input_width != w || slot.input_height != h) {
++      D3D12_RESOURCE_DESC desc = source_desc;
++      desc.Width = w; desc.Height = h;
++      desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++      std::array<ComPtr<ID3D12Resource>, 3> resources;
++      for (uint32_t i = 0; i < 3; ++i) {
++        desc.Format = formats[i];
++        if (FAILED(device->CreateCommittedResource(&util::kHeapPropertiesDefault,
++            D3D12_HEAP_FLAG_NONE, &desc, GuestInputTexture::kReadState, nullptr,
++            IID_PPV_ARGS(&resources[i])))) return false;
++      }
++      slot.resized_inputs = std::move(resources);
++      slot.input_width = w; slot.input_height = h;
++    }
++    auto* list = slot.list.Get();
++    ID3D12Resource* sources[] = {frame.color, frame.depth, frame.motion};
++    auto handle = slot.input_heap->GetCPUDescriptorHandleForHeapStart();
++    const auto step = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++    for (uint32_t i = 0; i < 3; ++i) {
++      D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
++      srv.Format = sources[i]->GetDesc().Format;
++      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++      srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++      srv.Texture2D.MipLevels = 1;
++      device->CreateShaderResourceView(sources[i], &srv, handle); handle.ptr += step;
++    }
++    for (uint32_t i = 0; i < 3; ++i) {
++      D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
++      uav.Format = formats[i]; uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
++      device->CreateUnorderedAccessView(slot.resized_inputs[i].Get(), nullptr, &uav, handle);
++      handle.ptr += step;
++      Transition(list, slot.resized_inputs[i].Get(), GuestInputTexture::kReadState,
++                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++    }
++    auto* heap = slot.input_heap.Get();
++    list->SetDescriptorHeaps(1, &heap);
++    list->SetComputeRootSignature(input_root.Get());
++    list->SetPipelineState(input_pipeline.Get());
++    const uint32_t constants[] = {uint32_t(source_desc.Width), source_desc.Height, w, h};
++    list->SetComputeRoot32BitConstants(0, 4, constants, 0);
++    list->SetComputeRootDescriptorTable(1, heap->GetGPUDescriptorHandleForHeapStart());
++    list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
++    for (auto& resource : slot.resized_inputs)
++      Transition(list, resource.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++                 GuestInputTexture::kReadState);
++    frame.color = slot.resized_inputs[0].Get();
++    frame.depth = slot.resized_inputs[1].Get();
++    frame.motion = slot.resized_inputs[2].Get();
++    frame.jitter_pixels[0] *= float(w) / float(source_desc.Width);
++    frame.jitter_pixels[1] *= float(h) / float(source_desc.Height);
++    return true;
++  }
+ };
+ SsxReconstruction::SsxReconstruction() : impl_(std::make_unique<Impl>()) {}
+ SsxReconstruction::~SsxReconstruction() = default;
+@@ -175,7 +294,8 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+       dest.Height > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
+       dest.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || dest.SampleDesc.Count != 1 ||
+       dest.DepthOrArraySize != 1 ||
+-      (quality != Streamline::Quality::kDLAA && quality != Streamline::Quality::kQuality)) {
++      (quality != Streamline::Quality::kDLAA && quality != Streamline::Quality::kQuality &&
++       quality != Streamline::Quality::kBalanced && quality != Streamline::Quality::kPerformance)) {
+     result.reason = "destination_contract";
+     return result;
+   }
+@@ -196,13 +316,16 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+       p.timings.Reset();
+     }
+   }
+-  // Do not let a caller label a same-size dispatch "Quality" or accept a target
+-  // that would silently crop/downsample reconstruction back to the input size.
++  // Query real mode/preset dimensions. Noninteger inputs are prepared below;
++  // DLAA must remain an exact same-size dispatch with no input resampling.
+   const bool reconfigure = p.width != dest.Width || p.height != dest.Height || p.quality != quality;
+   auto optimal = p.optimal;
+   if ((reconfigure &&
+        !p.sr->GetOptimalSettings(quality, uint32_t(dest.Width), dest.Height, optimal)) ||
+-      optimal.width != decode.width || optimal.height != decode.height) {
++      !optimal.width || !optimal.height ||
++      optimal.width > decode.width || optimal.height > decode.height ||
++      (quality == Streamline::Quality::kDLAA &&
++       (optimal.width != decode.width || optimal.height != decode.height))) {
+     result.reason = "quality_dimensions";
+     return result;
+   }
+@@ -291,6 +414,11 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+     sr_frame.depth = frame->textures[size_t(SsxInput::kResolvedDepth)].resource.Get();
+     sr_frame.motion = motion.vectors;
+     sr_frame.output = slot.output.Get();
++    if (!p.ResizeInputs(provider, slot, sr_frame, optimal.width, optimal.height)) {
++      // No partial NVIDIA evaluation. Close/submit any recorded preparation so
++      // resource state bookkeeping stays valid and the caller uses its fallback.
++      result.reason = "input_resize";
++    } else {
+     for (auto* resource : {sr_frame.color, sr_frame.depth, sr_frame.motion})
+       Transition(list, resource, GuestInputTexture::kReadState,
+                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+@@ -303,7 +431,7 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+     result.reset = evaluation.history_reset;
+     result.reason = evaluation.rejection;
+     if (evaluation.recorded) {
+-      if ((retain_fg_inputs || retain_hdr_color) && quality == Streamline::Quality::kDLAA) {
++      if (retain_hdr_color || (retain_fg_inputs && quality == Streamline::Quality::kDLAA)) {
+         fg_temporal = p.fg_temporal_pool.Acquire(f.guest_frame, completed);
+         bool created = false;
+         if (fg_temporal &&
+@@ -314,10 +442,10 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+           if (!created)
+             Transition(list, retained, GuestInputTexture::kReadState,
+                        D3D12_RESOURCE_STATE_COPY_DEST);
+-          Transition(list, sr_frame.motion, GuestInputTexture::kReadState,
++          Transition(list, motion.vectors, GuestInputTexture::kReadState,
+                      D3D12_RESOURCE_STATE_COPY_SOURCE);
+-          list->CopyResource(retained, sr_frame.motion);
+-          Transition(list, sr_frame.motion, D3D12_RESOURCE_STATE_COPY_SOURCE,
++          list->CopyResource(retained, motion.vectors);
++          Transition(list, motion.vectors, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                      GuestInputTexture::kReadState);
+           Transition(list, retained, D3D12_RESOURCE_STATE_COPY_DEST, GuestInputTexture::kReadState);
+           fg_temporal->motion.view_format = DXGI_FORMAT_R32G32_FLOAT;
+@@ -393,6 +521,7 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+       result.applied = true;
+       result.reason = "applied";
+     }
++    }
+   }
+   if (!evaluated)
+     stamp(4);
+diff --git a/src/ui/d3d12/streamline.cpp b/src/ui/d3d12/streamline.cpp
+index 227d9d6..4635a16 100644
+--- a/src/ui/d3d12/streamline.cpp
++++ b/src/ui/d3d12/streamline.cpp
+@@ -15,6 +15,10 @@ REXCVAR_DEFINE_STRING(ssx_reflex_mode, "on", "SSX/Reflex",
+                       "NVIDIA Reflex Low Latency: off, on, boost (On + Boost). Applies live when "
+                       "the Reflex launcher is active.")
+     .allowed({"off", "on", "boost"});
++REXCVAR_DEFINE_STRING(d3d12_ssx_dlss_preset, "L", "GPU/D3D12",
++                      "DLAA/DLSS model: default, E/F (legacy), J, K, L or M. Restart required.")
++    .allowed({"default", "E", "F", "J", "K", "L", "M"})
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ #if REX_HAS_STREAMLINE
+ #include <sl.h>
+@@ -138,14 +142,16 @@ sl::DLSSOptions SsxOptions(Streamline::Quality quality, uint32_t width, uint32_t
+   }
+   options.outputWidth = width;
+   options.outputHeight = height;
+-  // Explicit user-selected transformer model, independent of the scaling mode.
+-  // In particular, Quality must not silently keep the SDK's default preset K.
+-  options.dlaaPreset = sl::DLSSPreset::ePresetL;
+-  options.qualityPreset = sl::DLSSPreset::ePresetL;
+-  options.balancedPreset = sl::DLSSPreset::ePresetL;
+-  options.performancePreset = sl::DLSSPreset::ePresetL;
+-  options.ultraPerformancePreset = sl::DLSSPreset::ePresetL;
+-  options.ultraQualityPreset = sl::DLSSPreset::ePresetL;
++  const auto selected = REXCVAR_GET(d3d12_ssx_dlss_preset);
++  auto preset = sl::DLSSPreset::eDefault;
++  if (selected == "E") preset = sl::DLSSPreset::ePresetE;
++  else if (selected == "F") preset = sl::DLSSPreset::ePresetF;
++  else if (selected == "J") preset = sl::DLSSPreset::ePresetJ;
++  else if (selected == "K") preset = sl::DLSSPreset::ePresetK;
++  else if (selected == "L") preset = sl::DLSSPreset::ePresetL;
++  else if (selected == "M") preset = sl::DLSSPreset::ePresetM;
++  options.dlaaPreset = options.qualityPreset = options.balancedPreset = preset;
++  options.performancePreset = options.ultraPerformancePreset = options.ultraQualityPreset = preset;
+   options.colorBuffersHDR = sl::Boolean::eTrue;
+   options.useAutoExposure = sl::Boolean::eTrue;
+   options.preExposure = SsxReconstructionColorPolicy::pre_exposure;
+@@ -454,9 +460,10 @@ bool Streamline::ConfigureSsxSR(Quality quality, uint32_t width, uint32_t height
+   impl_->sr_bounds = bounds;
+   impl_->sr_reset |= changed;
+   if (changed)
+-    REXGPU_INFO("SSX_DLSS_CONFIG mode={} preset=L output={}x{} optimal_input={}x{}",
+-                quality == Quality::kDLAA ? "DLAA" : quality == Quality::kQuality ? "Quality" : "other",
+-                width, height, bounds.width, bounds.height);
++    REXGPU_INFO("SSX_DLSS_CONFIG mode={} preset={} output={}x{} optimal_input={}x{}",
++                quality == Quality::kDLAA ? "DLAA" : quality == Quality::kQuality ? "Quality" :
++                quality == Quality::kBalanced ? "Balanced" : quality == Quality::kPerformance ? "Performance" : "UltraPerformance",
++                REXCVAR_GET(d3d12_ssx_dlss_preset), width, height, bounds.width, bounds.height);
+   return true;
+ #else
+   (void)quality;
+diff --git a/src/ui/guest_frame_timing.cpp b/src/ui/guest_frame_timing.cpp
+index 07a61e0..9037aee 100644
+--- a/src/ui/guest_frame_timing.cpp
++++ b/src/ui/guest_frame_timing.cpp
+@@ -7,6 +7,8 @@
+ #include <thread>
+ #include <utility>
+ 
++REXCVAR_DECLARE(bool, d3d12_ssx_hdr_preview);
++
+ REXCVAR_DEFINE_BOOL(
+     ssx_frame_token_handoff, false, "SSX",
+     "Experimental NVIDIA token transport through DLAA and Present; no Reflex pacing or FG.")
+@@ -92,7 +94,8 @@ GuestFrameTiming& GuestFrameTiming::Get() {
+   return trace;
+ }
+ bool GuestFrameTiming::ContinuousMarkersEnabled() {
+-  return REXCVAR_GET(ssx_frame_token_handoff) || GuestReflex::RequestedMode() != "disabled";
++  return REXCVAR_GET(ssx_frame_token_handoff) || GuestReflex::RequestedMode() != "disabled" ||
++         REXCVAR_GET(d3d12_ssx_hdr_preview);
+ }
+ uint64_t GuestFrameTiming::CurrentRender() {
+   return render_id;
+diff --git a/src/ui/shaders/bytecode/d3d12_5_1/ssx_reconstruction_inputs_cs.h b/src/ui/shaders/bytecode/d3d12_5_1/ssx_reconstruction_inputs_cs.h
+new file mode 100644
+index 0000000..61398b7
+--- /dev/null
++++ b/src/ui/shaders/bytecode/d3d12_5_1/ssx_reconstruction_inputs_cs.h
+@@ -0,0 +1,539 @@
++#if 0
++//
++// Generated by Microsoft (R) HLSL Shader Compiler 10.1
++//
++//
++// Buffer Definitions:
++//
++// cbuffer Parameters
++// {
++//
++//   uint2 source_size;                 // Offset:    0 Size:     8
++//   uint2 target_size;                 // Offset:    8 Size:     8
++//
++// }
++//
++//
++// Resource Bindings:
++//
++// Name                                 Type  Format         Dim      ID      HLSL Bind  Count
++// ------------------------------ ---------- ------- ----------- ------- -------------- ------
++// color_in                          texture  float4          2d      T0             t0      1
++// depth_in                          texture   float          2d      T1             t1      1
++// motion_in                         texture  float2          2d      T2             t2      1
++// color_out                             UAV  float4          2d      U0             u0      1
++// depth_out                             UAV   float          2d      U1             u1      1
++// motion_out                            UAV  float2          2d      U2             u2      1
++// Parameters                        cbuffer      NA          NA     CB0            cb0      1
++//
++//
++//
++// Input signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Input
++//
++// Output signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Output
++cs_5_1
++dcl_globalFlags refactoringAllowed
++dcl_constantbuffer CB0[0:0][1], immediateIndexed, space=0
++dcl_resource_texture2d (float,float,float,float) T0[0:0], space=0
++dcl_resource_texture2d (float,float,float,float) T1[1:1], space=0
++dcl_resource_texture2d (float,float,float,float) T2[2:2], space=0
++dcl_uav_typed_texture2d (float,float,float,float) U0[0:0], space=0
++dcl_uav_typed_texture2d (float,float,float,float) U1[1:1], space=0
++dcl_uav_typed_texture2d (float,float,float,float) U2[2:2], space=0
++dcl_input vThreadID.xy
++dcl_temps 7
++dcl_thread_group 8, 8, 1
++uge r0.xy, vThreadID.xyxx, CB0[0][0].zwzz
++or r0.x, r0.y, r0.x
++if_nz r0.x
++  ret
++endif
++utof r0.xy, vThreadID.xyxx
++add r0.xy, r0.xyxx, l(0.500000, 0.500000, 0.000000, 0.000000)
++utof r1.xyzw, CB0[0][0].xyzw
++mul r0.xy, r0.xyxx, r1.xyxx
++div r0.xy, r0.xyxx, r1.zwzz
++iadd r0.zw, CB0[0][0].xxxy, l(0, 0, -1, -1)
++ftoi r2.xy, r0.xyxx
++imax r2.xy, r2.xyxx, l(0, 0, 0, 0)
++imin r2.xy, r0.zwzz, r2.xyxx
++add r0.xy, r0.xyxx, l(-0.500000, -0.500000, 0.000000, 0.000000)
++round_ni r3.xy, r0.xyxx
++ftoi r3.xy, r3.xyxx
++frc r0.xy, r0.xyxx
++imax r3.zw, r3.xxxy, l(0, 0, 0, 0)
++imin r4.xy, r0.zwzz, r3.zwzz
++mov r4.zw, l(0,0,0,0)
++ld r4.xyzw, r4.xyzw, T0[0].xyzw
++iadd r5.xyzw, r3.xyxy, l(1, 0, 0, 1)
++imax r5.xyzw, r5.xyzw, l(0, 0, 0, 0)
++imin r5.xyzw, r0.zwzw, r5.zwxy
++mov r6.xy, r5.zwzz
++mov r6.zw, l(0,0,0,0)
++ld r6.xyzw, r6.xyzw, T0[0].xyzw
++mov r5.zw, l(0,0,0,0)
++ld r5.xyzw, r5.xyzw, T0[0].xyzw
++iadd r3.xy, r3.xyxx, l(1, 1, 0, 0)
++imax r3.xy, r3.xyxx, l(0, 0, 0, 0)
++imin r3.xy, r0.zwzz, r3.xyxx
++mov r3.zw, l(0,0,0,0)
++ld r3.xyzw, r3.xyzw, T0[0].xyzw
++add r6.xyzw, -r4.xyzw, r6.xyzw
++mad r4.xyzw, r0.xxxx, r6.xyzw, r4.xyzw
++add r3.xyzw, -r5.xyzw, r3.xyzw
++mad r3.xyzw, r0.xxxx, r3.xyzw, r5.xyzw
++add r3.xyzw, -r4.xyzw, r3.xyzw
++mad r0.xyzw, r0.yyyy, r3.xyzw, r4.xyzw
++store_uav_typed U0[0].xyzw, vThreadID.xyyy, r0.xyzw
++mov r2.zw, l(0,0,0,0)
++ld r0.x, r2.xyww, T1[1].xyzw
++store_uav_typed U1[1].xyzw, vThreadID.xyyy, r0.xxxx
++ld r0.xy, r2.xyzw, T2[2].xyzw
++mul r0.xyzw, r1.zwzz, r0.xyxx
++div r0.xyzw, r0.xyzw, r1.xyxx
++store_uav_typed U2[2].xyzw, vThreadID.xyyy, r0.xyzw
++ret
++// Approximately 50 instruction slots used
++#endif
++
++const BYTE ssx_reconstruction_inputs_cs[] =
++{
++     68,  88,  66,  67, 158, 241,
++    219, 185, 175,  42, 227,  29,
++    236, 248, 179, 234, 231, 101,
++     44, 132,   1,   0,   0,   0,
++     20,  10,   0,   0,   5,   0,
++      0,   0,  52,   0,   0,   0,
++    172,   2,   0,   0, 188,   2,
++      0,   0, 204,   2,   0,   0,
++    120,   9,   0,   0,  82,  68,
++     69,  70, 112,   2,   0,   0,
++      1,   0,   0,   0, 156,   1,
++      0,   0,   7,   0,   0,   0,
++     60,   0,   0,   0,   1,   5,
++     83,  67,   0, 133,   0,   0,
++     72,   2,   0,   0,  19,  19,
++     68,  37,  60,   0,   0,   0,
++     24,   0,   0,   0,  40,   0,
++      0,   0,  40,   0,   0,   0,
++     36,   0,   0,   0,  12,   0,
++      0,   0,   0,   0,   0,   0,
++     84,   1,   0,   0,   2,   0,
++      0,   0,   5,   0,   0,   0,
++      4,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++      1,   0,   0,   0,  12,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  93,   1,
++      0,   0,   2,   0,   0,   0,
++      5,   0,   0,   0,   4,   0,
++      0,   0, 255, 255, 255, 255,
++      1,   0,   0,   0,   1,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
++      0,   0, 102,   1,   0,   0,
++      2,   0,   0,   0,   5,   0,
++      0,   0,   4,   0,   0,   0,
++    255, 255, 255, 255,   2,   0,
++      0,   0,   1,   0,   0,   0,
++      4,   0,   0,   0,   0,   0,
++      0,   0,   2,   0,   0,   0,
++    112,   1,   0,   0,   4,   0,
++      0,   0,   5,   0,   0,   0,
++      4,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++      1,   0,   0,   0,  12,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0, 122,   1,
++      0,   0,   4,   0,   0,   0,
++      5,   0,   0,   0,   4,   0,
++      0,   0, 255, 255, 255, 255,
++      1,   0,   0,   0,   1,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
++      0,   0, 132,   1,   0,   0,
++      4,   0,   0,   0,   5,   0,
++      0,   0,   4,   0,   0,   0,
++    255, 255, 255, 255,   2,   0,
++      0,   0,   1,   0,   0,   0,
++      4,   0,   0,   0,   0,   0,
++      0,   0,   2,   0,   0,   0,
++    143,   1,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,   1,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  99, 111,
++    108, 111, 114,  95, 105, 110,
++      0, 100, 101, 112, 116, 104,
++     95, 105, 110,   0, 109, 111,
++    116, 105, 111, 110,  95, 105,
++    110,   0,  99, 111, 108, 111,
++    114,  95, 111, 117, 116,   0,
++    100, 101, 112, 116, 104,  95,
++    111, 117, 116,   0, 109, 111,
++    116, 105, 111, 110,  95, 111,
++    117, 116,   0,  80,  97, 114,
++     97, 109, 101, 116, 101, 114,
++    115,   0, 171, 171, 143,   1,
++      0,   0,   2,   0,   0,   0,
++    180,   1,   0,   0,  16,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   4,   2,
++      0,   0,   0,   0,   0,   0,
++      8,   0,   0,   0,   2,   0,
++      0,   0,  24,   2,   0,   0,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0,  60,   2,   0,   0,
++      8,   0,   0,   0,   8,   0,
++      0,   0,   2,   0,   0,   0,
++     24,   2,   0,   0,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++    115, 111, 117, 114,  99, 101,
++     95, 115, 105, 122, 101,   0,
++    117, 105, 110, 116,  50,   0,
++    171, 171,   1,   0,  19,   0,
++      1,   0,   2,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  16,   2,
++      0,   0, 116,  97, 114, 103,
++    101, 116,  95, 115, 105, 122,
++    101,   0,  77, 105,  99, 114,
++    111, 115, 111, 102, 116,  32,
++     40,  82,  41,  32,  72,  76,
++     83,  76,  32,  83, 104,  97,
++    100, 101, 114,  32,  67, 111,
++    109, 112, 105, 108, 101, 114,
++     32,  49,  48,  46,  49,   0,
++     73,  83,  71,  78,   8,   0,
++      0,   0,   0,   0,   0,   0,
++      8,   0,   0,   0,  79,  83,
++     71,  78,   8,   0,   0,   0,
++      0,   0,   0,   0,   8,   0,
++      0,   0,  83,  72,  69,  88,
++    164,   6,   0,   0,  81,   0,
++      5,   0, 169,   1,   0,   0,
++    106,   8,   0,   1,  89,   0,
++      0,   7,  70, 142,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,   0,   0,
++      0,   0,  88,  24,   0,   7,
++     70, 126,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  85,  85,
++      0,   0,   0,   0,   0,   0,
++     88,  24,   0,   7,  70, 126,
++     48,   0,   1,   0,   0,   0,
++      1,   0,   0,   0,   1,   0,
++      0,   0,  85,  85,   0,   0,
++      0,   0,   0,   0,  88,  24,
++      0,   7,  70, 126,  48,   0,
++      2,   0,   0,   0,   2,   0,
++      0,   0,   2,   0,   0,   0,
++     85,  85,   0,   0,   0,   0,
++      0,   0, 156,  24,   0,   7,
++     70, 238,  49,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  85,  85,
++      0,   0,   0,   0,   0,   0,
++    156,  24,   0,   7,  70, 238,
++     49,   0,   1,   0,   0,   0,
++      1,   0,   0,   0,   1,   0,
++      0,   0,  85,  85,   0,   0,
++      0,   0,   0,   0, 156,  24,
++      0,   7,  70, 238,  49,   0,
++      2,   0,   0,   0,   2,   0,
++      0,   0,   2,   0,   0,   0,
++     85,  85,   0,   0,   0,   0,
++      0,   0,  95,   0,   0,   2,
++     50,   0,   2,   0, 104,   0,
++      0,   2,   7,   0,   0,   0,
++    155,   0,   0,   4,   8,   0,
++      0,   0,   8,   0,   0,   0,
++      1,   0,   0,   0,  80,   0,
++      0,   8,  50,   0,  16,   0,
++      0,   0,   0,   0,  70,   0,
++      2,   0, 230, 138,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     60,   0,   0,   7,  18,   0,
++     16,   0,   0,   0,   0,   0,
++     26,   0,  16,   0,   0,   0,
++      0,   0,  10,   0,  16,   0,
++      0,   0,   0,   0,  31,   0,
++      4,   3,  10,   0,  16,   0,
++      0,   0,   0,   0,  62,   0,
++      0,   1,  21,   0,   0,   1,
++     86,   0,   0,   4,  50,   0,
++     16,   0,   0,   0,   0,   0,
++     70,   0,   2,   0,   0,   0,
++      0,  10,  50,   0,  16,   0,
++      0,   0,   0,   0,  70,   0,
++     16,   0,   0,   0,   0,   0,
++      2,  64,   0,   0,   0,   0,
++      0,  63,   0,   0,   0,  63,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  86,   0,   0,   7,
++    242,   0,  16,   0,   1,   0,
++      0,   0,  70, 142,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     56,   0,   0,   7,  50,   0,
++     16,   0,   0,   0,   0,   0,
++     70,   0,  16,   0,   0,   0,
++      0,   0,  70,   0,  16,   0,
++      1,   0,   0,   0,  14,   0,
++      0,   7,  50,   0,  16,   0,
++      0,   0,   0,   0,  70,   0,
++     16,   0,   0,   0,   0,   0,
++    230,  10,  16,   0,   1,   0,
++      0,   0,  30,   0,   0,  12,
++    194,   0,  16,   0,   0,   0,
++      0,   0,   6, 132,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      2,  64,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++    255, 255, 255, 255, 255, 255,
++    255, 255,  27,   0,   0,   5,
++     50,   0,  16,   0,   2,   0,
++      0,   0,  70,   0,  16,   0,
++      0,   0,   0,   0,  36,   0,
++      0,  10,  50,   0,  16,   0,
++      2,   0,   0,   0,  70,   0,
++     16,   0,   2,   0,   0,   0,
++      2,  64,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  37,   0,   0,   7,
++     50,   0,  16,   0,   2,   0,
++      0,   0, 230,  10,  16,   0,
++      0,   0,   0,   0,  70,   0,
++     16,   0,   2,   0,   0,   0,
++      0,   0,   0,  10,  50,   0,
++     16,   0,   0,   0,   0,   0,
++     70,   0,  16,   0,   0,   0,
++      0,   0,   2,  64,   0,   0,
++      0,   0,   0, 191,   0,   0,
++      0, 191,   0,   0,   0,   0,
++      0,   0,   0,   0,  65,   0,
++      0,   5,  50,   0,  16,   0,
++      3,   0,   0,   0,  70,   0,
++     16,   0,   0,   0,   0,   0,
++     27,   0,   0,   5,  50,   0,
++     16,   0,   3,   0,   0,   0,
++     70,   0,  16,   0,   3,   0,
++      0,   0,  26,   0,   0,   5,
++     50,   0,  16,   0,   0,   0,
++      0,   0,  70,   0,  16,   0,
++      0,   0,   0,   0,  36,   0,
++      0,  10, 194,   0,  16,   0,
++      3,   0,   0,   0,   6,   4,
++     16,   0,   3,   0,   0,   0,
++      2,  64,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  37,   0,   0,   7,
++     50,   0,  16,   0,   4,   0,
++      0,   0, 230,  10,  16,   0,
++      0,   0,   0,   0, 230,  10,
++     16,   0,   3,   0,   0,   0,
++     54,   0,   0,   8, 194,   0,
++     16,   0,   4,   0,   0,   0,
++      2,  64,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  45,   0,   0,   8,
++    242,   0,  16,   0,   4,   0,
++      0,   0,  70,  14,  16,   0,
++      4,   0,   0,   0,  70, 126,
++     32,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  30,   0,
++      0,  10, 242,   0,  16,   0,
++      5,   0,   0,   0,  70,   4,
++     16,   0,   3,   0,   0,   0,
++      2,  64,   0,   0,   1,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
++      0,   0,  36,   0,   0,  10,
++    242,   0,  16,   0,   5,   0,
++      0,   0,  70,  14,  16,   0,
++      5,   0,   0,   0,   2,  64,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     37,   0,   0,   7, 242,   0,
++     16,   0,   5,   0,   0,   0,
++    230,  14,  16,   0,   0,   0,
++      0,   0, 230,   4,  16,   0,
++      5,   0,   0,   0,  54,   0,
++      0,   5,  50,   0,  16,   0,
++      6,   0,   0,   0, 230,  10,
++     16,   0,   5,   0,   0,   0,
++     54,   0,   0,   8, 194,   0,
++     16,   0,   6,   0,   0,   0,
++      2,  64,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  45,   0,   0,   8,
++    242,   0,  16,   0,   6,   0,
++      0,   0,  70,  14,  16,   0,
++      6,   0,   0,   0,  70, 126,
++     32,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  54,   0,
++      0,   8, 194,   0,  16,   0,
++      5,   0,   0,   0,   2,  64,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     45,   0,   0,   8, 242,   0,
++     16,   0,   5,   0,   0,   0,
++     70,  14,  16,   0,   5,   0,
++      0,   0,  70, 126,  32,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  30,   0,   0,  10,
++     50,   0,  16,   0,   3,   0,
++      0,   0,  70,   0,  16,   0,
++      3,   0,   0,   0,   2,  64,
++      0,   0,   1,   0,   0,   0,
++      1,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     36,   0,   0,  10,  50,   0,
++     16,   0,   3,   0,   0,   0,
++     70,   0,  16,   0,   3,   0,
++      0,   0,   2,  64,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  37,   0,
++      0,   7,  50,   0,  16,   0,
++      3,   0,   0,   0, 230,  10,
++     16,   0,   0,   0,   0,   0,
++     70,   0,  16,   0,   3,   0,
++      0,   0,  54,   0,   0,   8,
++    194,   0,  16,   0,   3,   0,
++      0,   0,   2,  64,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  45,   0,
++      0,   8, 242,   0,  16,   0,
++      3,   0,   0,   0,  70,  14,
++     16,   0,   3,   0,   0,   0,
++     70, 126,  32,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   8, 242,   0,
++     16,   0,   6,   0,   0,   0,
++     70,  14,  16, 128,  65,   0,
++      0,   0,   4,   0,   0,   0,
++     70,  14,  16,   0,   6,   0,
++      0,   0,  50,   0,   0,   9,
++    242,   0,  16,   0,   4,   0,
++      0,   0,   6,   0,  16,   0,
++      0,   0,   0,   0,  70,  14,
++     16,   0,   6,   0,   0,   0,
++     70,  14,  16,   0,   4,   0,
++      0,   0,   0,   0,   0,   8,
++    242,   0,  16,   0,   3,   0,
++      0,   0,  70,  14,  16, 128,
++     65,   0,   0,   0,   5,   0,
++      0,   0,  70,  14,  16,   0,
++      3,   0,   0,   0,  50,   0,
++      0,   9, 242,   0,  16,   0,
++      3,   0,   0,   0,   6,   0,
++     16,   0,   0,   0,   0,   0,
++     70,  14,  16,   0,   3,   0,
++      0,   0,  70,  14,  16,   0,
++      5,   0,   0,   0,   0,   0,
++      0,   8, 242,   0,  16,   0,
++      3,   0,   0,   0,  70,  14,
++     16, 128,  65,   0,   0,   0,
++      4,   0,   0,   0,  70,  14,
++     16,   0,   3,   0,   0,   0,
++     50,   0,   0,   9, 242,   0,
++     16,   0,   0,   0,   0,   0,
++     86,   5,  16,   0,   0,   0,
++      0,   0,  70,  14,  16,   0,
++      3,   0,   0,   0,  70,  14,
++     16,   0,   4,   0,   0,   0,
++    164,   0,   0,   7, 242, 224,
++     33,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  70,   5,
++      2,   0,  70,  14,  16,   0,
++      0,   0,   0,   0,  54,   0,
++      0,   8, 194,   0,  16,   0,
++      2,   0,   0,   0,   2,  64,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     45,   0,   0,   8,  18,   0,
++     16,   0,   0,   0,   0,   0,
++     70,  15,  16,   0,   2,   0,
++      0,   0,  70, 126,  32,   0,
++      1,   0,   0,   0,   1,   0,
++      0,   0, 164,   0,   0,   7,
++    242, 224,  33,   0,   1,   0,
++      0,   0,   1,   0,   0,   0,
++     70,   5,   2,   0,   6,   0,
++     16,   0,   0,   0,   0,   0,
++     45,   0,   0,   8,  50,   0,
++     16,   0,   0,   0,   0,   0,
++     70,  14,  16,   0,   2,   0,
++      0,   0,  70, 126,  32,   0,
++      2,   0,   0,   0,   2,   0,
++      0,   0,  56,   0,   0,   7,
++    242,   0,  16,   0,   0,   0,
++      0,   0, 230,  10,  16,   0,
++      1,   0,   0,   0,  70,   0,
++     16,   0,   0,   0,   0,   0,
++     14,   0,   0,   7, 242,   0,
++     16,   0,   0,   0,   0,   0,
++     70,  14,  16,   0,   0,   0,
++      0,   0,  70,   0,  16,   0,
++      1,   0,   0,   0, 164,   0,
++      0,   7, 242, 224,  33,   0,
++      2,   0,   0,   0,   2,   0,
++      0,   0,  70,   5,   2,   0,
++     70,  14,  16,   0,   0,   0,
++      0,   0,  62,   0,   0,   1,
++     83,  84,  65,  84, 148,   0,
++      0,   0,  50,   0,   0,   0,
++      7,   0,   0,   0,   0,   0,
++      0,   0,   1,   0,   0,   0,
++     14,   0,   0,   0,  11,   0,
++      0,   0,   2,   0,   0,   0,
++      2,   0,   0,   0,   1,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   6,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      6,   0,   0,   0,   0,   0,
++      0,   0,   6,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   3,   0,   0,   0
++};
+diff --git a/src/ui/shaders/ssx_reconstruction_inputs.cs.hlsl b/src/ui/shaders/ssx_reconstruction_inputs.cs.hlsl
+new file mode 100644
+index 0000000..9eccb6c
+--- /dev/null
++++ b/src/ui/shaders/ssx_reconstruction_inputs.cs.hlsl
+@@ -0,0 +1,26 @@
++// Experimental integer-raster bridge to NVIDIA's optimal input dimensions.
++// Depth and motion use the same source pixel; motion remains in input pixels.
++cbuffer Parameters : register(b0) { uint2 source_size; uint2 target_size; };
++Texture2D<float4> color_in : register(t0);
++Texture2D<float> depth_in : register(t1);
++Texture2D<float2> motion_in : register(t2);
++RWTexture2D<float4> color_out : register(u0);
++RWTexture2D<float> depth_out : register(u1);
++RWTexture2D<float2> motion_out : register(u2);
++[numthreads(8,8,1)]
++void main(uint3 id : SV_DispatchThreadID) {
++  if (any(id.xy >= target_size)) return;
++  float2 uv = (float2(id.xy) + .5) * float2(source_size) / float2(target_size);
++  int2 hi = int2(source_size) - 1;
++  int2 nearest = clamp(int2(uv), int2(0,0), hi);
++  float2 pos = uv - .5;
++  int2 p = int2(floor(pos));
++  float2 f = frac(pos);
++  float4 a = color_in.Load(int3(clamp(p,int2(0,0),hi),0));
++  float4 b = color_in.Load(int3(clamp(p+int2(1,0),int2(0,0),hi),0));
++  float4 c = color_in.Load(int3(clamp(p+int2(0,1),int2(0,0),hi),0));
++  float4 d = color_in.Load(int3(clamp(p+int2(1,1),int2(0,0),hi),0));
++  color_out[id.xy] = lerp(lerp(a,b,f.x),lerp(c,d,f.x),f.y);
++  depth_out[id.xy] = depth_in.Load(int3(nearest,0));
++  motion_out[id.xy] = motion_in.Load(int3(nearest,0)) * float2(target_size) / float2(source_size);
++}

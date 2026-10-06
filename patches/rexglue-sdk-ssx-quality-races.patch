@@ -1,0 +1,2038 @@
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index a3f5ae3..95599b1 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -201,6 +201,7 @@ class D3D12CommandProcessor : public CommandProcessor {
+     kSwap,
+     kDrawMsaa2x,  // guest draws into 2x MSAA render targets
+     kDrawMsaa4x,  // guest draws into 4x MSAA render targets
++    kQualityScale,
+     kCount,
+   };
+   void GpuProfilePush(GpuProfileCategory category);
+@@ -606,6 +607,19 @@ class D3D12CommandProcessor : public CommandProcessor {
+   std::unique_ptr<D3D12PrimitiveProcessor> primitive_processor_;
+ 
+   std::unique_ptr<PipelineCache> pipeline_cache_;
++  // Active cache pointers swap only across submitted command lists. Their
++  // shader objects and ROV buffers never change scale or identity in flight.
++  std::unique_ptr<PipelineCache> ssx_other_pipeline_cache_;
++  std::unique_ptr<D3D12RenderTargetCache> ssx_other_render_target_cache_;
++  uint64_t ssx_quality_frame_ = UINT64_MAX;
++  bool ssx_quality_scene_started_ = false;
++  bool BeginSsxQualityFrame();
++  bool SwitchSsxQualityScale(uint32_t scale);
++  bool ResolveSsxQuality(uint32_t& address, uint32_t& length);
++  bool ExtractSsxQualityInput(ID3D12Resource* source, D3D12_RESOURCE_STATES state,
++                              ui::d3d12::GuestInputTexture& output, bool created);
++  Microsoft::WRL::ComPtr<ID3D12RootSignature> ssx_extract_root_;
++  Microsoft::WRL::ComPtr<ID3D12PipelineState> ssx_extract_pipeline_;
+ 
+   std::unique_ptr<D3D12TextureCache> texture_cache_;
+ 
+diff --git a/include/rex/graphics/d3d12/pipeline_cache.h b/include/rex/graphics/d3d12/pipeline_cache.h
+index 7a9d6a2..cabbfe3 100644
+--- a/include/rex/graphics/d3d12/pipeline_cache.h
++++ b/include/rex/graphics/d3d12/pipeline_cache.h
+@@ -68,6 +68,14 @@ class PipelineCache {
+ 
+   D3D12Shader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
+                           uint32_t dword_count);
++  D3D12Shader* FindShader(uint64_t hash) const {
++    auto i = shaders_.find(hash);
++    return i == shaders_.end() ? nullptr : i->second;
++  }
++  // Call before loading/translating shaders; secondary Quality cache has no disk storage.
++  void SetTextureResolutionScale(uint32_t x, uint32_t y) {
++    shader_translator_->SetTextureResolutionScale(x, y);
++  }
+   // Analyze shader microcode on the translator thread.
+   void AnalyzeShaderUcode(Shader& shader) { shader.AnalyzeUcode(ucode_disasm_buffer_); }
+ 
+diff --git a/include/rex/graphics/d3d12/render_target_cache.h b/include/rex/graphics/d3d12/render_target_cache.h
+index cd7693a..334a333 100644
+--- a/include/rex/graphics/d3d12/render_target_cache.h
++++ b/include/rex/graphics/d3d12/render_target_cache.h
+@@ -79,6 +79,11 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
+                D3D12TextureCache& texture_cache, uint32_t& written_address_out,
+                uint32_t& written_length_out);
+ 
++  // Bit-preserving nearest replication of emulated EDRAM samples. Both caches
++  // must use ROV; descriptors are transient and both resources outlive the queue.
++  bool RescaleEdramFrom(D3D12RenderTargetCache& source, uint32_t first_tile = 0,
++                        uint32_t tile_count = xenos::kEdramSizeBytes / 5120);
++
+   // For host render targets.
+ 
+   bool gamma_render_target_as_unorm16() const { return gamma_render_target_as_unorm16_; }
+@@ -150,6 +155,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
+   //  interaction with depth / stencil testing, host depth will need to be
+   //  copied to a different buffer - the same range may have ROV-owned color and
+   //  host float32 depth at the same time).
++  Microsoft::WRL::ComPtr<ID3D12RootSignature> ssx_rescale_root_;
++  Microsoft::WRL::ComPtr<ID3D12PipelineState> ssx_rescale_pipeline_;
+   ID3D12Resource* edram_buffer_ = nullptr;
+   D3D12_RESOURCE_STATES edram_buffer_state_;
+   EdramBufferModificationStatus edram_buffer_modification_status_ =
+diff --git a/include/rex/graphics/pipeline/render_target/cache.h b/include/rex/graphics/pipeline/render_target/cache.h
+index 3bbd52e..4f317a5 100644
+--- a/include/rex/graphics/pipeline/render_target/cache.h
++++ b/include/rex/graphics/pipeline/render_target/cache.h
+@@ -10,6 +10,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <array>
+ #include <cmath>
+ #include <cstdint>
+ #include <functional>
+@@ -160,6 +161,22 @@ class RenderTargetCache {
+   // to be discarded.
+   uint32_t draw_resolution_scale_x() const { return draw_resolution_scale_x_; }
+   uint32_t draw_resolution_scale_y() const { return draw_resolution_scale_y_; }
++  uint32_t EdramWordsPerPixel(uint32_t tile) const { return edram_64bpp_[tile] ? 2 : 1; }
++  uint32_t EdramSampleCountLog2(uint32_t tile) const { return edram_msaa_[tile]; }
++  void EnableEdramLayoutTracking() { edram_layout_tracking_enabled_ = true; }
++  bool IsEdramLayoutTrackingEnabled() const { return edram_layout_tracking_enabled_; }
++  void SetEdramSampleCountLog2(uint32_t tile, uint32_t count, uint32_t log2) {
++    if (!edram_layout_tracking_enabled_)
++      return;
++    for (uint32_t i = tile; i < std::min(tile + count, xenos::kEdramTileCount); ++i)
++      edram_msaa_[i] = uint8_t(log2);
++  }
++  void SetEdramWordsPerPixel(uint32_t tile, uint32_t count, uint32_t words) {
++    if (!edram_layout_tracking_enabled_)
++      return;
++    for (uint32_t i = tile; i < std::min(tile + count, xenos::kEdramTileCount); ++i)
++      edram_64bpp_[i] = words == 2;
++  }
+   bool IsDrawResolutionScaled() const {
+     return draw_resolution_scale_x() > 1 || draw_resolution_scale_y() > 1;
+   }
+@@ -552,6 +569,9 @@ class RenderTargetCache {
+   const RegisterFile& register_file_;
+   uint32_t draw_resolution_scale_x_;
+   uint32_t draw_resolution_scale_y_;
++  std::array<bool, xenos::kEdramTileCount> edram_64bpp_{};
++  bool edram_layout_tracking_enabled_ = false;
++  std::array<uint8_t, xenos::kEdramTileCount> edram_msaa_{};
+ 
+   DrawExtentEstimator draw_extent_estimator_;
+ 
+diff --git a/include/rex/graphics/pipeline/shader/dxbc_translator.h b/include/rex/graphics/pipeline/shader/dxbc_translator.h
+index 9f0f63f..c32d0d3 100644
+--- a/include/rex/graphics/pipeline/shader/dxbc_translator.h
++++ b/include/rex/graphics/pipeline/shader/dxbc_translator.h
+@@ -52,6 +52,10 @@ class DxbcShaderTranslator : public ShaderTranslator {
+                        bool msaa_2x_supported = true, uint32_t draw_resolution_scale_x = 1,
+                        uint32_t draw_resolution_scale_y = 1, bool force_emit_source_map = false);
+   ~DxbcShaderTranslator() override;
++  void SetTextureResolutionScale(uint32_t x, uint32_t y) {
++    texture_resolution_scale_x_ = x;
++    texture_resolution_scale_y_ = y;
++  }
+ 
+   // Stage linkage ordering and rules (must be respected not only within the
+   // DxbcShaderTranslator, but also by everything else between the VS and the
+@@ -942,6 +946,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
+   // Guest pixel host width / height.
+   uint32_t draw_resolution_scale_x_;
+   uint32_t draw_resolution_scale_y_;
++  uint32_t texture_resolution_scale_x_, texture_resolution_scale_y_;
+ 
+   // Is currently writing the empty depth-only pixel shader, for
+   // CompleteTranslation.
+diff --git a/include/rex/ui/d3d12/guest_frame_inputs.h b/include/rex/ui/d3d12/guest_frame_inputs.h
+index d7c3d61..5bd31ff 100644
+--- a/include/rex/ui/d3d12/guest_frame_inputs.h
++++ b/include/rex/ui/d3d12/guest_frame_inputs.h
+@@ -102,7 +102,7 @@ struct GuestInputTexture {
+   // completed. The pool caller establishes this lifetime guarantee; Prepare
+   // checks dimensions, format and allocation success, not fences or references.
+   bool Prepare(ID3D12Device* device, DXGI_FORMAT format, uint32_t new_width, uint32_t new_height,
+-               bool& newly_created);
++               bool& newly_created, bool unordered_access = false);
+   uint32_t GetCopyRestoreBarriers(ID3D12Resource* source, D3D12_RESOURCE_STATES source_state,
+                                   uint32_t mip, std::array<D3D12_RESOURCE_BARRIER, 3>& out) const;
+ };
+diff --git a/include/rex/ui/d3d12/ssx_reconstruction.h b/include/rex/ui/d3d12/ssx_reconstruction.h
+index f12473d..54a9719 100644
+--- a/include/rex/ui/d3d12/ssx_reconstruction.h
++++ b/include/rex/ui/d3d12/ssx_reconstruction.h
+@@ -13,7 +13,7 @@ bool BuildSsxSRCamera(const SsxFrameMetadata& frame, const SsxMotionPlan& motion
+ 
+ // Experimental reconstruction at the guest tone-map boundary. A Quality caller
+ // must own an output-sized destination and arrange its downstream consumption;
+-// the existing gameplay adapter still supplies a same-resolution DLAA target.
++// the gameplay adapter switches the guest tone map/post passes to that size.
+ // Single command-processor-thread owner. Uses separate command lists on the
+ // provider's direct queue; the caller first submits all input-producing work.
+ class SsxReconstruction {
+@@ -21,12 +21,15 @@ class SsxReconstruction {
+   struct Result {
+     bool submitted = false, applied = false, reset = false;
+     const char* reason = "unavailable";
++    uint64_t timed_frame = 0;
++    double inputs_ms = 0, dlss_ms = 0, encode_ms = 0;
+   };
+   SsxReconstruction();
+   ~SsxReconstruction();
+   Result Submit(const D3D12Provider& provider, const std::shared_ptr<const SsxFrameInputs>& frame,
+                 ID3D12Resource* destination, D3D12_RESOURCE_STATES destination_state,
+-                double seconds, Streamline::Quality quality = Streamline::Quality::kDLAA);
++                double seconds, Streamline::Quality quality = Streamline::Quality::kDLAA,
++                bool profile = false);
+ 
+  private:
+   struct Impl;
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 760c4b5..a54a89e 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -67,6 +67,8 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
+                     "Submit command list when PM4 primary buffer ends")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DECLARE(bool, d3d12_ssx_quality);
++
+ namespace rex::graphics::d3d12 {
+ 
+ // Generated with `xb buildshaders`.
+@@ -897,9 +899,9 @@ void D3D12CommandProcessor::GpuProfileCollect() {
+   double window_s = double(now - gpu_profile_window_start_) / double(freq);
+   if (window_s < 2.0)
+     return;
+-  static const char* const kNames[] = {"draw",          "transfer",      "resolve",
+-                                       "texload",       "texload_array", "texload_large",
+-                                       "swap",          "draw_msaa2x",   "draw_msaa4x"};
++  static const char* const kNames[] = {"draw",          "transfer",      "resolve", "texload",
++                                       "texload_array", "texload_large", "swap",    "draw_msaa2x",
++                                       "draw_msaa4x",   "quality_scale"};
+   double total = 0;
+   std::string text;
+   for (size_t i = 0; i < size_t(GpuProfileCategory::kCount); ++i) {
+@@ -1059,7 +1061,7 @@ bool D3D12CommandProcessor::SetupContext() {
+   // Optional - added in Creators Update (SDK 10.0.15063.0).
+   command_list_->QueryInterface(IID_PPV_ARGS(&command_list_1_));
+ 
+-  bindless_resources_used_ = REXCVAR_GET(d3d12_bindless) &&
++  bindless_resources_used_ = !REXCVAR_GET(d3d12_ssx_quality) && REXCVAR_GET(d3d12_bindless) &&
+                              provider.GetResourceBindingTier() >= D3D12_RESOURCE_BINDING_TIER_2;
+ 
+   // Get the draw resolution scale for the render target cache and the texture
+@@ -1378,6 +1380,27 @@ bool D3D12CommandProcessor::SetupContext() {
+     return false;
+   }
+ 
++  if (REXCVAR_GET(d3d12_ssx_quality)) {
++    if (draw_resolution_scale_x != 3 || draw_resolution_scale_y != 3 ||
++        render_target_cache_->GetPath() != RenderTargetCache::Path::kPixelShaderInterlock ||
++        !provider.GetStreamline() || !provider.GetStreamline()->support().sr) {
++      REXGPU_ERROR("SSX Quality requires 3x output, ROV and available DLSS");
++      return false;
++    }
++    ssx_other_render_target_cache_ =
++        std::make_unique<D3D12RenderTargetCache>(*register_file_, *memory_, 2, 2, *this, false);
++    if (!ssx_other_render_target_cache_->Initialize())
++      return false;
++    render_target_cache_->EnableEdramLayoutTracking();
++    ssx_other_render_target_cache_->EnableEdramLayoutTracking();
++    ssx_other_pipeline_cache_ = std::make_unique<PipelineCache>(
++        *this, *register_file_, *ssx_other_render_target_cache_, false);
++    if (!ssx_other_pipeline_cache_->Initialize())
++      return false;
++    ssx_other_pipeline_cache_->SetTextureResolutionScale(3, 3);
++    REXGPU_INFO("SSX_QUALITY configured raster=2x reconstruction=3x post=3x preset=L");
++  }
++
+   D3D12_HEAP_FLAGS heap_flag_create_not_zeroed = provider.GetHeapFlagCreateNotZeroed();
+ 
+   // Create gamma ramp resources.
+@@ -1894,6 +1917,10 @@ void D3D12CommandProcessor::ShutdownContext() {
+   texture_cache_.reset();
+ 
+   pipeline_cache_.reset();
++  ssx_other_pipeline_cache_.reset();
++  ssx_other_render_target_cache_.reset();
++  ssx_extract_pipeline_.Reset();
++  ssx_extract_root_.Reset();
+ 
+   primitive_processor_.reset();
+ 
+@@ -2496,7 +2523,10 @@ void D3D12CommandProcessor::OnPrimaryBufferEnd() {
+ 
+ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
+                                           const uint32_t* host_address, uint32_t dword_count) {
+-  return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
++  auto* shader = pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
++  if (ssx_other_pipeline_cache_)
++    ssx_other_pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
++  return shader;
+ }
+ 
+ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
+@@ -2515,6 +2545,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+     return IssueCopy();
+   }
+ 
++  if (!BeginSsxQualityFrame())
++    return false;
++
+   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
+ 
+   // Vertex shader analysis.
+@@ -2523,6 +2556,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+     // Always need a vertex shader.
+     return false;
+   }
++  if (ssx_other_pipeline_cache_) {
++    vertex_shader = pipeline_cache_->FindShader(vertex_shader->ucode_data_hash());
++    if (!vertex_shader)
++      return false;
++  }
+   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
+ 
+@@ -2541,6 +2579,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+     if (edram_mode == xenos::EdramMode::kColorDepth) {
+       pixel_shader = static_cast<D3D12Shader*>(active_pixel_shader());
+       if (pixel_shader) {
++        if (ssx_other_pipeline_cache_) {
++          pixel_shader = pipeline_cache_->FindShader(pixel_shader->ucode_data_hash());
++          if (!pixel_shader)
++            return false;
++        }
+         pipeline_cache_->AnalyzeShaderUcode(*pixel_shader);
+         if (!draw_util::IsPixelShaderNeededWithRasterization(*pixel_shader, regs)) {
+           pixel_shader = nullptr;
+@@ -2664,8 +2707,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   }
+ 
+   // Get dynamic rasterizer state.
+-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
+-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
++  uint32_t draw_resolution_scale_x = render_target_cache_->draw_resolution_scale_x();
++  uint32_t draw_resolution_scale_y = render_target_cache_->draw_resolution_scale_y();
+ 
+   bool convert_z_to_float24 =
+       host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader();
+@@ -2726,6 +2769,21 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   if (!ReconstructSsxScene(vertex_shader->ucode_data_hash(),
+                            pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+                            viewport_info, ssx_restarted)) return false;
++  if (ssx_other_render_target_cache_ && render_target_cache_->draw_resolution_scale_x() == 2 &&
++      ui::d3d12::IdentifySsxPass(ssx_title_id_, vertex_shader->ucode_data_hash(),
++                                 pixel_shader ? pixel_shader->ucode_data_hash() : 0,
++                                 viewport_info.xy_extent[0] / 2,
++                                 viewport_info.xy_extent[1] / 2) == ui::d3d12::SsxPass::kToneMap) {
++    // Missing/ambiguous inputs still get ordinary spatial fallback and 3x post.
++    ssx_reconstruction_frame_ = frame_current_;
++    if (!SwitchSsxQualityScale(3))
++      return false;
++    ssx_restarted = true;
++  }
++  if (ssx_restarted && ssx_other_pipeline_cache_) {
++    // The tone-map draw now uses the output-scale shader, viewport and EDRAM.
++    return IssueDraw(primitive_type, index_count, index_buffer_info, major_mode_explicit);
++  }
+   if (ssx_restarted) {
+     // BeginSubmission invalidates all command-list binding caches. Restore the
+     // tone-map draw on its fresh list; never inherit bindings from DLSS.
+@@ -2741,6 +2799,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+                                primitive_processing_result.host_shader_index_endian, viewport_info,
+                                used_texture_mask, normalized_depth_control, normalized_color_mask);
+   }
++  // Native-input extraction may have bound a compute pipeline after the first
++  // graphics bind. Restore this draw even when no DLSS submission was needed.
++  if (current_guest_pipeline_ != pipeline_handle) {
++    deferred_command_list_.SetPipelineStateHandle(pipeline_handle);
++    current_guest_pipeline_ = pipeline_handle;
++    current_external_pipeline_ = nullptr;
++  }
+   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
+     return false;
+   }
+@@ -3174,6 +3239,8 @@ bool D3D12CommandProcessor::IssueCopy() {
+   if (!BeginSubmission(true)) {
+     return false;
+   }
++  if (!BeginSsxQualityFrame())
++    return false;
+   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
+   if (debug_markers_enabled_) {
+     const RegisterFile& regs = *register_file_;
+@@ -3184,16 +3251,14 @@ bool D3D12CommandProcessor::IssueCopy() {
+   }
+   if (readback_mode == ReadbackResolveMode::kDisabled) {
+     uint32_t written_address, written_length;
+-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+-                                         written_address, written_length);
++    return ResolveSsxQuality(written_address, written_length);
+   }
+   return IssueCopy_ReadbackResolvePath();
+ }
+ 
+ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+   uint32_t written_address, written_length;
+-  if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
+-                                     written_length)) {
++  if (!ResolveSsxQuality(written_address, written_length)) {
+     return false;
+   }
+ 
+@@ -3493,6 +3558,8 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+   shared_memory_->CompletedSubmissionUpdated();
+ 
+   render_target_cache_->CompletedSubmissionUpdated();
++  if (ssx_other_render_target_cache_)
++    ssx_other_render_target_cache_->CompletedSubmissionUpdated();
+ 
+   primitive_processor_->CompletedSubmissionUpdated();
+ 
+@@ -3671,6 +3738,8 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+     primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+ 
+     render_target_cache_->BeginSubmission();
++    if (ssx_other_render_target_cache_)
++      ssx_other_render_target_cache_->BeginSubmission();
+ 
+     primitive_processor_->BeginSubmission();
+ 
+@@ -3757,6 +3826,8 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+     }
+ 
+     pipeline_cache_->EndSubmission();
++    if (ssx_other_pipeline_cache_)
++      ssx_other_pipeline_cache_->EndSubmission();
+ 
+     // Submit barriers now because resources with the queued barriers may be
+     // destroyed between frames.
+@@ -3856,7 +3927,9 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+ }
+ 
+ bool D3D12CommandProcessor::CanEndSubmissionImmediately() const {
+-  return !submission_open_ || !pipeline_cache_->IsCreatingPipelines();
++  return !submission_open_ ||
++         (!pipeline_cache_->IsCreatingPipelines() &&
++          (!ssx_other_pipeline_cache_ || !ssx_other_pipeline_cache_->IsCreatingPipelines()));
+ }
+ 
+ void D3D12CommandProcessor::ClearCommandAllocatorCache() {
+@@ -3969,8 +4042,8 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
+ 
+   bool edram_rov_used =
+       render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
+-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
++  uint32_t draw_resolution_scale_x = render_target_cache_->draw_resolution_scale_x();
++  uint32_t draw_resolution_scale_y = render_target_cache_->draw_resolution_scale_y();
+ 
+   // Get the color info register values for each render target. Also, for ROV,
+   // exclude components that don't exist in the format from the write mask.
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index 0a3ff22..73df559 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -960,6 +960,8 @@ bool D3D12RenderTargetCache::Initialize() {
+ }
+ 
+ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
++  ssx_rescale_pipeline_.Reset();
++  ssx_rescale_root_.Reset();
+   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_64bpp_pipeline_);
+   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_32bpp_pipeline_);
+   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_root_signature_);
+@@ -1159,6 +1161,77 @@ void D3D12RenderTargetCache::WriteEdramUintPow2UAVDescriptor(D3D12_CPU_DESCRIPTO
+                                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+ }
+ 
++bool D3D12RenderTargetCache::RescaleEdramFrom(D3D12RenderTargetCache& source, uint32_t first_tile,
++                                              uint32_t tile_count) {
++  command_processor_.GpuProfilePush(D3D12CommandProcessor::GpuProfileCategory::kQualityScale);
++  struct ProfilePop {
++    D3D12CommandProcessor& cp;
++    ~ProfilePop() { cp.GpuProfilePop(); }
++  } profile{command_processor_};
++  if (&source == this || GetPath() != Path::kPixelShaderInterlock ||
++      source.GetPath() != Path::kPixelShaderInterlock || bindless_resources_used_ ||
++      source.bindless_resources_used_ || first_tile >= xenos::kEdramSizeBytes / 5120 ||
++      !tile_count || tile_count > xenos::kEdramSizeBytes / 5120 - first_tile)
++    return false;
++  const auto& provider = command_processor_.GetD3D12Provider();
++  if (!ssx_rescale_root_) {
++#include "../shaders/bytecode/d3d12_5_1/ssx_edram_rescale_cs.h"
++    D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0},
++                                       {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0}};
++    D3D12_ROOT_PARAMETER params[3]{};
++    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++    params[0].Constants = {0, 0, 6};
++    for (uint32_t i = 0; i < 2; ++i) {
++      params[i + 1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++      params[i + 1].DescriptorTable = {1, &ranges[i]};
++    }
++    D3D12_ROOT_SIGNATURE_DESC desc{};
++    desc.NumParameters = 3;
++    desc.pParameters = params;
++    ssx_rescale_root_.Attach(ui::d3d12::util::CreateRootSignature(provider, desc));
++    if (!ssx_rescale_root_)
++      return false;
++    ssx_rescale_pipeline_.Attach(ui::d3d12::util::CreateComputePipeline(
++        provider.GetDevice(), ssx_edram_rescale_cs, sizeof(ssx_edram_rescale_cs),
++        ssx_rescale_root_.Get()));
++  }
++  if (!ssx_rescale_pipeline_)
++    return false;
++  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[2];
++  if (!command_processor_.RequestOneUseSingleViewDescriptors(2, descriptors))
++    return false;
++  source.WriteEdramUintPow2SRVDescriptor(descriptors[0].first, 2);
++  WriteEdramUintPow2UAVDescriptor(descriptors[1].first, 2);
++  source.TransitionEdramBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++  TransitionEdramBuffer(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++  CommitEdramBufferUAVWrites();
++  auto& list = command_processor_.GetDeferredCommandList();
++  list.D3DSetComputeRootSignature(ssx_rescale_root_.Get());
++
++  list.D3DSetComputeRootDescriptorTable(1, descriptors[0].second);
++  list.D3DSetComputeRootDescriptorTable(2, descriptors[1].second);
++  command_processor_.SetExternalPipeline(ssx_rescale_pipeline_.Get());
++  command_processor_.SubmitBarriers();
++  const uint32_t words = 1280 * draw_resolution_scale_x() * draw_resolution_scale_y();
++  for (uint32_t tile = first_tile; tile < first_tile + tile_count;) {
++    const uint32_t bpp = source.EdramWordsPerPixel(tile);
++    const uint32_t msaa = source.EdramSampleCountLog2(tile);
++    uint32_t end = tile + 1;
++    while (end < first_tile + tile_count && source.EdramWordsPerPixel(end) == bpp &&
++           source.EdramSampleCountLog2(end) == msaa)
++      ++end;
++    const uint32_t k[] = {
++        source.draw_resolution_scale_x(), draw_resolution_scale_x(), tile, end - tile, bpp, msaa};
++    list.D3DSetComputeRoot32BitConstants(0, 6, k, 0);
++    list.D3DDispatch((words + 255) / 256, end - tile, 1);
++    SetEdramWordsPerPixel(tile, end - tile, bpp);
++    SetEdramSampleCountLog2(tile, end - tile, msaa);
++    tile = end;
++  }
++  MarkEdramBufferModified();
++  return true;
++}
++
+ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMemory& shared_memory,
+                                      D3D12TextureCache& texture_cache,
+                                      uint32_t& written_address_out, uint32_t& written_length_out) {
+@@ -1404,6 +1477,24 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
+             command_list.D3DDispatch(clear_group_count.first, clear_group_count.second, 1);
+           }
+           MarkEdramBufferModified();
++          // Clears can change a tile's interpretation without a draw. Retain
++          // their sample layout for the next Quality scale transition.
++          if (IsEdramLayoutTrackingEnabled()) {
++            auto track_clear = [&](draw_util::ResolveEdramInfo edram) {
++              uint32_t base, width, rows;
++              draw_util::GetResolveEdramTileSpan(edram, resolve_info.coordinate_info,
++                                                 resolve_info.height_div_8, base, width, rows);
++              for (uint32_t row = 0; row < rows; ++row) {
++                const uint32_t tile = base + row * edram.pitch_tiles;
++                SetEdramWordsPerPixel(tile, width, edram.format_is_64bpp ? 2 : 1);
++                SetEdramSampleCountLog2(tile, width, uint32_t(edram.msaa_samples));
++              }
++            };
++            if (clear_depth)
++              track_clear(resolve_info.depth_edram_info);
++            if (clear_color)
++              track_clear(resolve_info.color_edram_info);
++          }
+           cleared = true;
+         }
+       } break;
+diff --git a/src/graphics/d3d12/ssx_frame_inputs.cpp b/src/graphics/d3d12/ssx_frame_inputs.cpp
+index 507d9a6..aa65f46 100644
+--- a/src/graphics/d3d12/ssx_frame_inputs.cpp
++++ b/src/graphics/d3d12/ssx_frame_inputs.cpp
+@@ -19,12 +19,17 @@ REXCVAR_DEFINE_BOOL(d3d12_ssx_jitter, false, "GPU/D3D12",
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ REXCVAR_DECLARE(bool, d3d12_ssx_dlaa);
++REXCVAR_DECLARE(bool, d3d12_ssx_quality);
++REXCVAR_DECLARE(bool, d3d12_gpu_profile);
+ 
+ namespace rex::graphics::d3d12 {
+ bool D3D12CommandProcessor::SsxJitterTranslationEnabled() const {
+-  if (REXCVAR_GET(d3d12_ssx_dlaa) &&
++  if (ssx_other_render_target_cache_ && render_target_cache_->draw_resolution_scale_x() == 3)
++    return false;  // Post-reconstruction passes must not reapply scene jitter.
++  if ((REXCVAR_GET(d3d12_ssx_dlaa) || REXCVAR_GET(d3d12_ssx_quality)) &&
+       (ssx_reconstruction_failed_ || !GetD3D12Provider().GetStreamline() ||
+-       !GetD3D12Provider().GetStreamline()->support().sr)) return false;
++       !GetD3D12Provider().GetStreamline()->support().sr))
++    return false;
+   return ssx_title_id_ == 0x4541096D && REXCVAR_GET(d3d12_ssx_frame_inputs) &&
+          REXCVAR_GET(d3d12_ssx_jitter);
+ }
+@@ -48,8 +53,8 @@ void D3D12CommandProcessor::ApplySsxJitter(const D3D12Shader& shader, uint64_t p
+       ssx_scene_msaa_samples_ = 1;
+     }
+     ++ssx_scene_draw_;
+-    const auto sx = texture_cache_->draw_resolution_scale_x();
+-    const auto sy = texture_cache_->draw_resolution_scale_y();
++    const auto sx = render_target_cache_->draw_resolution_scale_x();
++    const auto sy = render_target_cache_->draw_resolution_scale_y();
+     if (!sx || !sy || viewport.xy_offset[0] || viewport.xy_offset[1] ||
+         viewport.xy_extent[0] % sx || viewport.xy_extent[1] % sy ||
+         !IsKnownSsxScene(viewport.xy_extent[0] / sx, viewport.xy_extent[1] / sy))
+@@ -149,8 +154,10 @@ bool D3D12CommandProcessor::CopySsxInputTexture(SsxInput role, uint32_t fetch, D
+   auto desc = source.resource->GetDesc();
+   if (desc.Format != format || mip >= desc.MipLevels)
+     return false;
+-  const uint32_t sx = source.scaled ? metadata.scale_x : 1;
+-  const uint32_t sy = source.scaled ? metadata.scale_y : 1;
++  const bool extract = ssx_other_render_target_cache_ && metadata.scale_x == 2 && source.scaled &&
++                       role != SsxInput::kLogExposure;
++  const uint32_t sx = source.scaled ? texture_cache_->draw_resolution_scale_x() : 1;
++  const uint32_t sy = source.scaled ? texture_cache_->draw_resolution_scale_y() : 1;
+   const uint32_t width = std::max(1u, uint32_t(desc.Width) >> mip);
+   const uint32_t height = std::max(1u, desc.Height >> mip);
+   if (role == SsxInput::kLogExposure) {
+@@ -160,11 +167,13 @@ bool D3D12CommandProcessor::CopySsxInputTexture(SsxInput role, uint32_t fetch, D
+   } else if (source.guest_width != metadata.scene_width ||
+              source.guest_height != metadata.scene_height || mip != 0 ||
+              width != metadata.scene_width * sx || height != metadata.scene_height * sy ||
+-             sx != metadata.scale_x || sy != metadata.scale_y)
++             (!extract && (sx != metadata.scale_x || sy != metadata.scale_y)))
+     return false;
+   auto& snapshot = ssx_inputs_->textures[size_t(role)];
+   bool created;
+-  if (!snapshot.Prepare(GetD3D12Provider().GetDevice(), format, width, height, created))
++  if (!snapshot.Prepare(GetD3D12Provider().GetDevice(), format,
++                        extract ? metadata.scene_width * 2 : width,
++                        extract ? metadata.scene_height * 2 : height, created, extract))
+     return false;
+   if (created) {
+     static constexpr const wchar_t* names[] = {L"SSX encoded scene color snapshot",
+@@ -178,6 +187,14 @@ bool D3D12CommandProcessor::CopySsxInputTexture(SsxInput role, uint32_t fetch, D
+   snapshot.swizzled_signs = source.swizzled_signs;
+   snapshot.guest_fetch = source.guest_fetch;
+   snapshot.view_format = role == SsxInput::kLogExposure ? DXGI_FORMAT_R16_UNORM : format;
++  if (extract) {
++    if (!ExtractSsxQualityInput(source.resource, source.state, snapshot, created))
++      return false;
++    ssx_inputs_->last_copy_submission = submission_current_;
++    metadata.captured_mask |= bit;
++    metadata.failed_mask &= ~bit;
++    return true;
++  }
+   // Flush RequestTextures' transitions, copy, then restore the exact tracked
+   // source state before the guest draw. Copying doesn't change graphics bindings.
+   PushTransitionBarrier(source.resource, source.state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+@@ -205,10 +222,11 @@ bool D3D12CommandProcessor::CopySsxInputTexture(SsxInput role, uint32_t fetch, D
+ 
+ void D3D12CommandProcessor::CollectSsxFrameInputs(uint64_t vs, uint64_t ps,
+                                                   const draw_util::ViewportInfo& viewport) {
+-  if (!REXCVAR_GET(d3d12_ssx_frame_inputs) || ssx_title_id_ != 0x4541096D)
++  if (!REXCVAR_GET(d3d12_ssx_frame_inputs) || ssx_title_id_ != 0x4541096D ||
++      (ssx_other_render_target_cache_ && render_target_cache_->draw_resolution_scale_x() != 2))
+     return;
+-  const auto sx = texture_cache_->draw_resolution_scale_x();
+-  const auto sy = texture_cache_->draw_resolution_scale_y();
++  const auto sx = render_target_cache_->draw_resolution_scale_x();
++  const auto sy = render_target_cache_->draw_resolution_scale_y();
+   if (!sx || !sy || viewport.xy_offset[0] || viewport.xy_offset[1] || viewport.xy_extent[0] % sx ||
+       viewport.xy_extent[1] % sy)
+     return;
+@@ -318,9 +336,11 @@ bool D3D12CommandProcessor::ReconstructSsxScene(uint64_t vs, uint64_t ps,
+     const draw_util::ViewportInfo& viewport, bool& restarted) {
+   using namespace ui::d3d12;
+   restarted = false;
+-  if (!REXCVAR_GET(d3d12_ssx_dlaa) || ssx_reconstruction_failed_ || !ssx_inputs_ ||
++  if ((!REXCVAR_GET(d3d12_ssx_dlaa) && !REXCVAR_GET(d3d12_ssx_quality)) ||
++      ssx_reconstruction_failed_ || !ssx_inputs_ ||
+       ssx_inputs_->metadata.guest_frame != frame_current_ ||
+-      ssx_reconstruction_frame_ == frame_current_) return true;
++      ssx_reconstruction_frame_ == frame_current_)
++    return true;
+   const auto& f = ssx_inputs_->metadata;
+   if (!f.scale_x || !f.scale_y ||
+       IdentifySsxPass(ssx_title_id_,vs,ps,viewport.xy_extent[0]/f.scale_x,
+@@ -329,8 +349,8 @@ bool D3D12CommandProcessor::ReconstructSsxScene(uint64_t vs, uint64_t ps,
+   auto* sr = GetD3D12Provider().GetStreamline();
+   if (!sr || !sr->support().sr || render_target_cache_->GetPath() != RenderTargetCache::Path::kPixelShaderInterlock ||
+       !f.jitter_enabled || f.scene_msaa_samples != 1) {
+-    REXGPU_WARN("SSX_DLAA fallback frame={} reason=prerequisites scene_samples={} jitter={}",
+-                frame_current_,f.scene_msaa_samples,f.jitter_enabled);
++    REXGPU_WARN("SSX_RECONSTRUCT fallback frame={} reason=prerequisites scene_samples={} jitter={}",
++                frame_current_, f.scene_msaa_samples, f.jitter_enabled);
+     ssx_reconstruction_failed_ = true;
+     return true;
+   }
+@@ -340,7 +360,8 @@ bool D3D12CommandProcessor::ReconstructSsxScene(uint64_t vs, uint64_t ps,
+     // They don't consume a DLSS frame; the next complete packet resets history.
+     if (!ssx_reconstruction_log_frame_ || frame_current_-ssx_reconstruction_log_frame_ >= 120) {
+       ssx_reconstruction_log_frame_ = frame_current_;
+-      REXGPU_WARN("SSX_DLAA skipped frame={} reason={}",frame_current_,SsxAlignmentName(alignment));
++      REXGPU_WARN("SSX_RECONSTRUCT skipped frame={} reason={}", frame_current_,
++                  SsxAlignmentName(alignment));
+     }
+     if (alignment == SsxAlignmentStatus::kJitterCoverage ||
+         alignment == SsxAlignmentStatus::kDepthView || alignment == SsxAlignmentStatus::kExtent)
+@@ -351,24 +372,35 @@ bool D3D12CommandProcessor::ReconstructSsxScene(uint64_t vs, uint64_t ps,
+   if (!texture_cache_->GetActiveTextureSnapshotSource(0,source)) return true;
+   auto frozen = std::make_shared<SsxFrameInputs>(*ssx_inputs_);
+   frozen->producer_owner = ssx_inputs_;
+-  frozen->metadata.output_width = frozen->textures[0].width;
+-  frozen->metadata.output_height = frozen->textures[0].height;
++  frozen->metadata.output_width = uint32_t(source.resource->GetDesc().Width);
++  frozen->metadata.output_height = source.resource->GetDesc().Height;
+   if (!EndSubmission(false)) return false;
+   // The previous submission includes all scene draws, resolves and input copies.
+   // Separate lists isolate DLSS/native-motion binding changes from guest draws.
+   if (!ssx_reconstruction_) ssx_reconstruction_ = std::make_unique<SsxReconstruction>();
+   const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+-  const auto result = ssx_reconstruction_->Submit(GetD3D12Provider(),frozen,source.resource,source.state,seconds);
++  const auto result = ssx_reconstruction_->Submit(
++      GetD3D12Provider(), frozen, source.resource, source.state, seconds,
++      ssx_other_render_target_cache_ ? Streamline::Quality::kQuality : Streamline::Quality::kDLAA,
++      REXCVAR_GET(d3d12_gpu_profile));
+   if (result.submitted) NotifyQueueOperationsDoneDirectly();
+   if (!result.applied) ssx_reconstruction_failed_ = true;
+   if (!result.applied || !ssx_reconstruction_log_frame_ || frame_current_-ssx_reconstruction_log_frame_ >= 120) {
+     ssx_reconstruction_log_frame_ = frame_current_;
+-    REXGPU_INFO("SSX_DLAA frame={} scene={}x{} scene_samples={} applied={} reset={} reason={} insertion=before_tone_map",
+-                frame_current_,frozen->textures[0].width,frozen->textures[0].height,
+-                f.scene_msaa_samples,result.applied,result.reset,result.reason);
++    REXGPU_INFO(
++        "SSX_RECONSTRUCT mode={} frame={} scene={}x{} scene_samples={} applied={} reset={} "
++        "reason={} insertion=before_tone_map output={}x{} post_scale={} timed_frame={} "
++        "inputs_ms={:.3f} dlss_ms={:.3f} encode_ms={:.3f}",
++        ssx_other_render_target_cache_ ? "Quality" : "DLAA", frame_current_,
++        frozen->textures[0].width, frozen->textures[0].height, f.scene_msaa_samples, result.applied,
++        result.reset, result.reason, frozen->metadata.output_width, frozen->metadata.output_height,
++        ssx_other_render_target_cache_ ? 3 : f.scale_x, result.timed_frame, result.inputs_ms,
++        result.dlss_ms, result.encode_ms);
+   }
+   restarted = true;
+-  return BeginSubmission(true);
++  if (!BeginSubmission(true))
++    return false;
++  return !ssx_other_render_target_cache_ || SwitchSsxQualityScale(3);
+ }
+ 
+ std::shared_ptr<const ui::d3d12::SsxFrameInputs> D3D12CommandProcessor::SealSsxFrameInputs(
+@@ -442,4 +474,188 @@ std::shared_ptr<const ui::d3d12::SsxFrameInputs> D3D12CommandProcessor::SealSsxF
+   }
+   return ssx_inputs_;
+ }
++
++bool D3D12CommandProcessor::SwitchSsxQualityScale(uint32_t scale) {
++  if (render_target_cache_->draw_resolution_scale_x() == scale)
++    return true;
++  if (!ssx_other_render_target_cache_ ||
++      ssx_other_render_target_cache_->draw_resolution_scale_x() != scale)
++    return false;
++  if (!EndSubmission(false) || !BeginSubmission(false))
++    return false;
++  if (!ssx_other_render_target_cache_->RescaleEdramFrom(*render_target_cache_))
++    return false;
++  if (!EndSubmission(false))
++    return false;
++  render_target_cache_.swap(ssx_other_render_target_cache_);
++  pipeline_cache_.swap(ssx_other_pipeline_cache_);
++  // The two caches have independent layout UID namespaces, and the EDRAM UAV
++  // identity has changed. Force new immutable tables, including shared EDRAM.
++  draw_view_bindful_heap_index_ = ui::d3d12::D3D12DescriptorHeapPool::kHeapIndexInvalid;
++  draw_sampler_bindful_heap_index_ = ui::d3d12::D3D12DescriptorHeapPool::kHeapIndexInvalid;
++  bindful_textures_written_vertex_ = bindful_textures_written_pixel_ = false;
++  bindful_samplers_written_vertex_ = bindful_samplers_written_pixel_ = false;
++  current_texture_layout_uid_vertex_ = current_texture_layout_uid_pixel_ = SIZE_MAX;
++  current_sampler_layout_uid_vertex_ = current_sampler_layout_uid_pixel_ = SIZE_MAX;
++  cbuffer_binding_system_.up_to_date = false;
++  cbuffer_binding_float_vertex_.up_to_date = false;
++  cbuffer_binding_float_pixel_.up_to_date = false;
++  return BeginSubmission(true);
++}
++
++bool D3D12CommandProcessor::BeginSsxQualityFrame() {
++  if (!ssx_other_render_target_cache_)
++    return true;
++  if (ssx_title_id_ != 0x4541096D)
++    return false;
++  if (!BeginSubmission(true))
++    return false;
++  if (ssx_quality_frame_ != frame_current_) {
++    ssx_quality_frame_ = frame_current_;
++    ssx_quality_scene_started_ = false;
++    if (!SwitchSsxQualityScale(3))
++      return false;
++  }
++  const auto& regs = *register_file_;
++  if (ssx_quality_scene_started_ || ssx_reconstruction_failed_ ||
++      regs.Get<reg::RB_MODECONTROL>().edram_mode != xenos::EdramMode::kColorDepth ||
++      regs.Get<reg::RB_SURFACE_INFO>().msaa_samples != xenos::MsaaSamples::k1X)
++    return true;
++  const auto clip = regs.Get<reg::PA_CL_CLIP_CNTL>();
++  if ((regs.Get<reg::PA_CL_VTE_CNTL>().value & 0x73F) != 0x43F || clip.clip_disable ||
++      !clip.dx_clip_space_def)
++    return true;
++  const auto depth = regs.Get<reg::RB_DEPTH_INFO>();
++  if (depth.depth_base != 720 || depth.depth_base_bit_11 ||
++      depth.depth_format != xenos::DepthRenderTargetFormat::kD24FS8)
++    return true;
++  draw_util::ViewportInfo viewport;
++  draw_util::GetHostViewportInfo(
++      regs, 1, 1, true, D3D12_VIEWPORT_BOUNDS_MAX, D3D12_VIEWPORT_BOUNDS_MAX, false,
++      draw_util::GetNormalizedDepthControl(regs), false, false, false, viewport);
++  if (viewport.xy_offset[0] || viewport.xy_offset[1] ||
++      !ui::d3d12::IsKnownSsxScene(viewport.xy_extent[0], viewport.xy_extent[1]))
++    return true;
++  ssx_quality_scene_started_ = true;
++  return SwitchSsxQualityScale(2);
++}
++
++bool D3D12CommandProcessor::ResolveSsxQuality(uint32_t& address, uint32_t& length) {
++  if (!ssx_other_render_target_cache_ || render_target_cache_->draw_resolution_scale_x() == 3)
++    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, address,
++                                         length);
++  // Resolve storage stays at 3x, independent of native raster resolution.
++  // Copy and clear only touched EDRAM tile spans, including depth clears.
++  draw_util::ResolveInfo info;
++  if (!draw_util::GetResolveInfo(*register_file_, *memory_, 3, 3, false, false, info))
++    return false;
++  if (!info.coordinate_info.width_div_8 || !info.height_div_8) {
++    address = length = 0;
++    return true;
++  }
++  std::vector<std::pair<uint32_t, uint32_t>> spans;
++  auto add = [&](draw_util::ResolveEdramInfo edram) {
++    uint32_t base, width, rows;
++    draw_util::GetResolveEdramTileSpan(edram, info.coordinate_info, info.height_div_8, base, width,
++                                       rows);
++    const uint32_t tiles = xenos::kEdramSizeBytes / 5120;
++    for (uint32_t row = 0; row < rows; ++row) {
++      const uint32_t tile = base + row * edram.pitch_tiles;
++      if (!width || tile >= tiles)
++        continue;
++      const uint32_t count = std::min(width, tiles - tile);
++      render_target_cache_->SetEdramWordsPerPixel(tile, count, edram.format_is_64bpp ? 2 : 1);
++      render_target_cache_->SetEdramSampleCountLog2(tile, count, uint32_t(edram.msaa_samples));
++      spans.emplace_back(tile, count);
++    }
++  };
++  if (info.copy_dest_extent_length)
++    add(info.IsCopyingDepth() ? info.depth_edram_info : info.color_edram_info);
++  if (info.IsClearingDepth())
++    add(info.depth_edram_info);
++  if (info.IsClearingColor())
++    add(info.color_edram_info);
++  // Coalesce adjacent rows when the resolve rectangle fills its tile pitch.
++  std::vector<std::pair<uint32_t, uint32_t>> merged;
++  for (auto [base, count] : spans) {
++    if (!merged.empty() && merged.back().first + merged.back().second == base)
++      merged.back().second += count;
++    else
++      merged.emplace_back(base, count);
++  }
++  spans.swap(merged);
++  for (auto [base, count] : spans)
++    if (!ssx_other_render_target_cache_->RescaleEdramFrom(*render_target_cache_, base, count))
++      return false;
++  if (!ssx_other_render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, address,
++                                               length))
++    return false;
++  // Clear values propagate exactly back into the native samples. Overlapping
++  // spans are harmless; no filtering of packed words occurs in either direction.
++  if (info.IsClearingDepth() || info.IsClearingColor())
++    for (auto [base, count] : spans)
++      if (!render_target_cache_->RescaleEdramFrom(*ssx_other_render_target_cache_, base, count))
++        return false;
++  return true;
++}
++
++bool D3D12CommandProcessor::ExtractSsxQualityInput(ID3D12Resource* source,
++                                                   D3D12_RESOURCE_STATES state,
++                                                   GuestInputTexture& output, bool created) {
++  const auto& provider = GetD3D12Provider();
++  auto* device = provider.GetDevice();
++  if (!ssx_extract_root_) {
++#include "../shaders/bytecode/d3d12_5_1/ssx_quality_extract_cs.h"
++    D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0},
++                                       {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0}};
++    D3D12_ROOT_PARAMETER params[3]{};
++    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++    params[0].Constants = {0, 0, 2};
++    for (uint32_t i = 0; i < 2; ++i) {
++      params[i + 1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++      params[i + 1].DescriptorTable = {1, &ranges[i]};
++    }
++    D3D12_ROOT_SIGNATURE_DESC desc{};
++    desc.NumParameters = 3;
++    desc.pParameters = params;
++    ssx_extract_root_.Attach(ui::d3d12::util::CreateRootSignature(provider, desc));
++    if (!ssx_extract_root_)
++      return false;
++    ssx_extract_pipeline_.Attach(ui::d3d12::util::CreateComputePipeline(
++        device, ssx_quality_extract_cs, sizeof(ssx_quality_extract_cs), ssx_extract_root_.Get()));
++  }
++  if (!ssx_extract_pipeline_)
++    return false;
++  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[2];
++  if (!RequestOneUseSingleViewDescriptors(2, descriptors))
++    return false;
++  D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
++  srv.Format = output.view_format;
++  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++  srv.Texture2D.MipLevels = 1;
++  device->CreateShaderResourceView(source, &srv, descriptors[0].first);
++  D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
++  uav.Format = srv.Format;
++  uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
++  device->CreateUnorderedAccessView(output.resource.Get(), nullptr, &uav, descriptors[1].first);
++  PushTransitionBarrier(source, state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++  PushTransitionBarrier(output.resource.Get(),
++                        created ? D3D12_RESOURCE_STATE_COPY_DEST : GuestInputTexture::kReadState,
++                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++  SubmitBarriers();
++  deferred_command_list_.D3DSetComputeRootSignature(ssx_extract_root_.Get());
++  const uint32_t k[] = {output.width, output.height};
++  deferred_command_list_.D3DSetComputeRoot32BitConstants(0, 2, k, 0);
++  deferred_command_list_.D3DSetComputeRootDescriptorTable(1, descriptors[0].second);
++  deferred_command_list_.D3DSetComputeRootDescriptorTable(2, descriptors[1].second);
++  SetExternalPipeline(ssx_extract_pipeline_.Get());
++  deferred_command_list_.D3DDispatch((output.width + 7) / 8, (output.height + 7) / 8, 1);
++  PushTransitionBarrier(source, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, state);
++  PushTransitionBarrier(output.resource.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++                        GuestInputTexture::kReadState);
++  SubmitBarriers();
++  return true;
++}
++
+ }  // namespace rex::graphics::d3d12
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index 953c5fd..58b3824 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -686,6 +686,10 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
+     uint32_t rt_bit_index = rt_base_index.second;
++    SetEdramWordsPerPixel(rt_keys[rt_bit_index].base_tiles, rt_lengths_tiles[i],
++                          rt_keys[rt_bit_index].Is64bpp() ? 2 : 1);
++    SetEdramSampleCountLog2(rt_keys[rt_bit_index].base_tiles, rt_lengths_tiles[i],
++                            uint32_t(msaa_samples));
+     ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
+                     interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index]);
+   }
+diff --git a/src/graphics/pipeline/shader/dxbc_translator.cpp b/src/graphics/pipeline/shader/dxbc_translator.cpp
+index b117c76..f7ce3ba 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator.cpp
+@@ -72,6 +72,8 @@ DxbcShaderTranslator::DxbcShaderTranslator(ui::GraphicsProvider::GpuVendorID ven
+       msaa_2x_supported_(msaa_2x_supported),
+       draw_resolution_scale_x_(draw_resolution_scale_x),
+       draw_resolution_scale_y_(draw_resolution_scale_y),
++      texture_resolution_scale_x_(draw_resolution_scale_x),
++      texture_resolution_scale_y_(draw_resolution_scale_y),
+       emit_source_map_(force_emit_source_map || REXCVAR_GET(dxbc_source_map)) {
+   assert_not_zero(draw_resolution_scale_x);
+   assert_not_zero(draw_resolution_scale_y);
+diff --git a/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp b/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
+index 31de175..b691377 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
+@@ -881,10 +881,10 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
+                 dxbc::Src::R(size_and_is_3d_temp));
+     }
+   }
+-  uint32_t revert_resolution_scale_axes =
+-      REXCVAR_GET(draw_resolution_scaled_texture_offsets)
+-          ? uint32_t(draw_resolution_scale_x_ > 1) | (uint32_t(draw_resolution_scale_y_ > 1) << 1)
+-          : 0;
++  uint32_t revert_resolution_scale_axes = REXCVAR_GET(draw_resolution_scaled_texture_offsets)
++                                              ? uint32_t(texture_resolution_scale_x_ > 1) |
++                                                    (uint32_t(texture_resolution_scale_y_ > 1) << 1)
++                                              : 0;
+ 
+   if (instr.opcode == FetchOpcode::kGetTextureWeights) {
+     // FIXME(Triang3l): Mip lerp factor needs to be calculated, and the
+@@ -933,8 +933,8 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
+                dxbc::Src::LU(uint32_t(1) << tfetch_index));
+       a_.OpIf(true, dxbc::Src::R(system_temp_result_, dxbc::Src::kWWWW));
+       // The texture is resolution-scaled - scale the coordinates and the size.
+-      dxbc::Src resolution_scale_src(dxbc::Src::LF(float(draw_resolution_scale_x_),
+-                                                   float(draw_resolution_scale_y_), 1.0f, 1.0f));
++      dxbc::Src resolution_scale_src(dxbc::Src::LF(float(texture_resolution_scale_x_),
++                                                   float(texture_resolution_scale_y_), 1.0f, 1.0f));
+       if (resolution_scaled_coord_components) {
+         a_.OpMul(dxbc::Dest::R(system_temp_result_, resolution_scaled_coord_components), coord_src,
+                  resolution_scale_src);
+@@ -1043,8 +1043,8 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
+           a_.OpIf(true, dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kWWWW));
+           a_.OpAdd(dxbc::Dest::R(coord_and_sampler_temp, normalized_components_with_scaled_offsets),
+                    coord_operand,
+-                   dxbc::Src::LF(offsets[0] / draw_resolution_scale_x_,
+-                                 offsets[1] / draw_resolution_scale_y_, 0.0f, 0.0f));
++                   dxbc::Src::LF(offsets[0] / texture_resolution_scale_x_,
++                                 offsets[1] / texture_resolution_scale_y_, 0.0f, 0.0f));
+           a_.OpElse();
+           a_.OpAdd(dxbc::Dest::R(coord_and_sampler_temp, normalized_components_with_scaled_offsets),
+                    coord_operand, offsets_src);
+@@ -1103,8 +1103,8 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
+           a_.OpIf(true, dxbc::Src::R(coord_and_sampler_temp, dxbc::Src::kWWWW));
+           a_.OpMAd(dxbc::Dest::R(coord_and_sampler_temp, normalized_components_with_scaled_offsets),
+                    dxbc::Src::R(coord_and_sampler_temp),
+-                   dxbc::Src::LF(1.0f / draw_resolution_scale_x_, 1.0f / draw_resolution_scale_y_,
+-                                 1.0f, 1.0f),
++                   dxbc::Src::LF(1.0f / texture_resolution_scale_x_,
++                                 1.0f / texture_resolution_scale_y_, 1.0f, 1.0f),
+                    coord_operand);
+           a_.OpElse();
+           a_.OpAdd(dxbc::Dest::R(coord_and_sampler_temp, normalized_components_with_scaled_offsets),
+diff --git a/src/graphics/shaders/bytecode/d3d12_5_1/ssx_edram_rescale_cs.h b/src/graphics/shaders/bytecode/d3d12_5_1/ssx_edram_rescale_cs.h
+new file mode 100644
+index 0000000..ae3729a
+--- /dev/null
++++ b/src/graphics/shaders/bytecode/d3d12_5_1/ssx_edram_rescale_cs.h
+@@ -0,0 +1,552 @@
++#if 0
++//
++// Generated by Microsoft (R) HLSL Shader Compiler 10.1
++//
++//
++// Buffer Definitions:
++//
++// cbuffer Parameters
++// {
++//
++//   uint source_scale;                 // Offset:    0 Size:     4
++//   uint dest_scale;                   // Offset:    4 Size:     4
++//   uint first_tile;                   // Offset:    8 Size:     4
++//   uint tile_count;                   // Offset:   12 Size:     4
++//   uint words_per_pixel;              // Offset:   16 Size:     4
++//   uint msaa_log2;                    // Offset:   20 Size:     4
++//
++// }
++//
++//
++// Resource Bindings:
++//
++// Name                                 Type  Format         Dim      ID      HLSL Bind  Count
++// ------------------------------ ---------- ------- ----------- ------- -------------- ------
++// source                            texture    uint         buf      T0             t0      1
++// destination                           UAV    uint         buf      U0             u0      1
++// Parameters                        cbuffer      NA          NA     CB0            cb0      1
++//
++//
++//
++// Input signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Input
++//
++// Output signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Output
++cs_5_1
++dcl_globalFlags refactoringAllowed
++dcl_constantbuffer CB0[0:0][2], immediateIndexed, space=0
++dcl_resource_buffer (uint,uint,uint,uint) T0[0:0], space=0
++dcl_uav_typed_buffer (uint,uint,uint,uint) U0[0:0], space=0
++dcl_input vThreadID.xy
++dcl_temps 5
++dcl_thread_group 256, 1, 1
++imul null, r0.x, CB0[0][0].y, CB0[0][0].y
++imul null, r0.x, r0.x, l(1280)
++uge r0.y, vThreadID.x, r0.x
++uge r0.z, vThreadID.y, CB0[0][0].w
++or r0.y, r0.z, r0.y
++if_nz r0.y
++  ret
++endif
++imul null, r0.y, CB0[0][0].y, l(80)
++udiv r1.x, r2.x, vThreadID.x, r0.y
++uge r0.yz, CB0[0][1].yyyy, l(0, 2, 1, 0)
++movc r0.yz, r0.yyzy, l(0,2,2,0), l(0,1,1,0)
++ieq r0.w, CB0[0][1].x, l(2)
++if_nz r0.w
++  ushr r0.w, r2.x, l(1)
++  udiv r3.x, r4.x, r0.w, r0.y
++  imad r0.w, r3.x, l(2), l(1)
++  imul null, r0.w, r0.w, CB0[0][0].x
++  ishl r1.y, CB0[0][0].y, l(1)
++  udiv r0.w, null, r0.w, r1.y
++  imad r0.w, r0.w, r0.y, r4.x
++  bfi r0.w, l(31), l(1), r0.w, r2.x
++else
++  imul null, r1.y, CB0[0][0].y, l(40)
++  udiv r2.x, r3.x, r2.x, r1.y
++  imul null, r1.y, r2.x, CB0[0][0].x
++  udiv r2.x, r3.x, r3.x, r0.y
++  bfi r1.z, l(31), l(1), r2.x, l(1)
++  imul null, r1.z, r1.z, CB0[0][0].x
++  ishl r1.w, CB0[0][0].y, l(1)
++  udiv r1.z, null, r1.z, r1.w
++  imad r0.y, r1.z, r0.y, r3.x
++  imad r0.w, r1.y, l(40), r0.y
++endif
++udiv r1.x, r2.x, r1.x, r0.z
++bfi r0.y, l(31), l(1), r1.x, l(1)
++imul null, r0.y, r0.y, CB0[0][0].x
++ishl r1.x, CB0[0][0].y, l(1)
++udiv r0.y, null, r0.y, r1.x
++imad r0.y, r0.y, r0.z, r2.x
++iadd r0.z, vThreadID.y, CB0[0][0].z
++imul null, r1.x, CB0[0][0].x, CB0[0][0].x
++imul null, r1.x, r0.z, r1.x
++imul null, r0.y, r0.y, CB0[0][0].x
++imul null, r0.y, r0.y, l(80)
++imad r0.y, r1.x, l(1280), r0.y
++iadd r0.y, r0.w, r0.y
++imad r0.x, r0.z, r0.x, vThreadID.x
++ld r0.y, r0.yyyy, T0[0].yxzw
++store_uav_typed U0[0].xyzw, r0.xxxx, r0.yyyy
++ret
++// Approximately 51 instruction slots used
++#endif
++
++const BYTE ssx_edram_rescale_cs[] =
++{
++     68,  88,  66,  67, 136, 108,
++    200,  96, 114, 212, 161, 185,
++    121, 123, 163,  65, 207, 162,
++     71,  10,   1,   0,   0,   0,
++    112,  10,   0,   0,   5,   0,
++      0,   0,  52,   0,   0,   0,
++    180,   2,   0,   0, 196,   2,
++      0,   0, 212,   2,   0,   0,
++    212,   9,   0,   0,  82,  68,
++     69,  70, 120,   2,   0,   0,
++      1,   0,   0,   0, 212,   0,
++      0,   0,   3,   0,   0,   0,
++     60,   0,   0,   0,   1,   5,
++     83,  67,   0, 133,   0,   0,
++     79,   2,   0,   0,  19,  19,
++     68,  37,  60,   0,   0,   0,
++     24,   0,   0,   0,  40,   0,
++      0,   0,  40,   0,   0,   0,
++     36,   0,   0,   0,  12,   0,
++      0,   0,   0,   0,   0,   0,
++    180,   0,   0,   0,   2,   0,
++      0,   0,   4,   0,   0,   0,
++      1,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++      1,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0, 187,   0,
++      0,   0,   4,   0,   0,   0,
++      4,   0,   0,   0,   1,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0,   1,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0, 199,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   1,   0,   0,   0,
++      1,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++    115, 111, 117, 114,  99, 101,
++      0, 100, 101, 115, 116, 105,
++    110,  97, 116, 105, 111, 110,
++      0,  80,  97, 114,  97, 109,
++    101, 116, 101, 114, 115,   0,
++    171, 171, 199,   0,   0,   0,
++      6,   0,   0,   0, 236,   0,
++      0,   0,  32,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0, 220,   1,   0,   0,
++      0,   0,   0,   0,   4,   0,
++      0,   0,   2,   0,   0,   0,
++    240,   1,   0,   0,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++     20,   2,   0,   0,   4,   0,
++      0,   0,   4,   0,   0,   0,
++      2,   0,   0,   0, 240,   1,
++      0,   0,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0,  31,   2,
++      0,   0,   8,   0,   0,   0,
++      4,   0,   0,   0,   2,   0,
++      0,   0, 240,   1,   0,   0,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0,  42,   2,   0,   0,
++     12,   0,   0,   0,   4,   0,
++      0,   0,   2,   0,   0,   0,
++    240,   1,   0,   0,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++     53,   2,   0,   0,  16,   0,
++      0,   0,   4,   0,   0,   0,
++      2,   0,   0,   0, 240,   1,
++      0,   0,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0,  69,   2,
++      0,   0,  20,   0,   0,   0,
++      4,   0,   0,   0,   2,   0,
++      0,   0, 240,   1,   0,   0,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0, 115, 111, 117, 114,
++     99, 101,  95, 115,  99,  97,
++    108, 101,   0, 100, 119, 111,
++    114, 100,   0, 171,   0,   0,
++     19,   0,   1,   0,   1,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++    233,   1,   0,   0, 100, 101,
++    115, 116,  95, 115,  99,  97,
++    108, 101,   0, 102, 105, 114,
++    115, 116,  95, 116, 105, 108,
++    101,   0, 116, 105, 108, 101,
++     95,  99, 111, 117, 110, 116,
++      0, 119, 111, 114, 100, 115,
++     95, 112, 101, 114,  95, 112,
++    105, 120, 101, 108,   0, 109,
++    115,  97,  97,  95, 108, 111,
++    103,  50,   0,  77, 105,  99,
++    114, 111, 115, 111, 102, 116,
++     32,  40,  82,  41,  32,  72,
++     76,  83,  76,  32,  83, 104,
++     97, 100, 101, 114,  32,  67,
++    111, 109, 112, 105, 108, 101,
++    114,  32,  49,  48,  46,  49,
++      0, 171,  73,  83,  71,  78,
++      8,   0,   0,   0,   0,   0,
++      0,   0,   8,   0,   0,   0,
++     79,  83,  71,  78,   8,   0,
++      0,   0,   0,   0,   0,   0,
++      8,   0,   0,   0,  83,  72,
++     69,  88, 248,   6,   0,   0,
++     81,   0,   5,   0, 190,   1,
++      0,   0, 106,   8,   0,   1,
++     89,   0,   0,   7,  70, 142,
++     48,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   2,   0,   0,   0,
++      0,   0,   0,   0,  88,   8,
++      0,   7,  70, 126,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     68,  68,   0,   0,   0,   0,
++      0,   0, 156,   8,   0,   7,
++     70, 238,  49,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  68,  68,
++      0,   0,   0,   0,   0,   0,
++     95,   0,   0,   2,  50,   0,
++      2,   0, 104,   0,   0,   2,
++      5,   0,   0,   0, 155,   0,
++      0,   4,   0,   1,   0,   0,
++      1,   0,   0,   0,   1,   0,
++      0,   0,  38,   0,   0,  12,
++      0, 208,   0,   0,  18,   0,
++     16,   0,   0,   0,   0,   0,
++     26, 128,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  26, 128,
++     48,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  38,   0,   0,   8,
++      0, 208,   0,   0,  18,   0,
++     16,   0,   0,   0,   0,   0,
++     10,   0,  16,   0,   0,   0,
++      0,   0,   1,  64,   0,   0,
++      0,   5,   0,   0,  80,   0,
++      0,   6,  34,   0,  16,   0,
++      0,   0,   0,   0,  10,   0,
++      2,   0,  10,   0,  16,   0,
++      0,   0,   0,   0,  80,   0,
++      0,   8,  66,   0,  16,   0,
++      0,   0,   0,   0,  26,   0,
++      2,   0,  58, 128,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     60,   0,   0,   7,  34,   0,
++     16,   0,   0,   0,   0,   0,
++     42,   0,  16,   0,   0,   0,
++      0,   0,  26,   0,  16,   0,
++      0,   0,   0,   0,  31,   0,
++      4,   3,  26,   0,  16,   0,
++      0,   0,   0,   0,  62,   0,
++      0,   1,  21,   0,   0,   1,
++     38,   0,   0,  10,   0, 208,
++      0,   0,  34,   0,  16,   0,
++      0,   0,   0,   0,  26, 128,
++     48,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   1,  64,   0,   0,
++     80,   0,   0,   0,  78,   0,
++      0,   8,  18,   0,  16,   0,
++      1,   0,   0,   0,  18,   0,
++     16,   0,   2,   0,   0,   0,
++     10,   0,   2,   0,  26,   0,
++     16,   0,   0,   0,   0,   0,
++     80,   0,   0,  12,  98,   0,
++     16,   0,   0,   0,   0,   0,
++     86, 133,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,   2,  64,
++      0,   0,   0,   0,   0,   0,
++      2,   0,   0,   0,   1,   0,
++      0,   0,   0,   0,   0,   0,
++     55,   0,   0,  15,  98,   0,
++     16,   0,   0,   0,   0,   0,
++     86,   6,  16,   0,   0,   0,
++      0,   0,   2,  64,   0,   0,
++      0,   0,   0,   0,   2,   0,
++      0,   0,   2,   0,   0,   0,
++      0,   0,   0,   0,   2,  64,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,   1,   0,
++      0,   0,   0,   0,   0,   0,
++     32,   0,   0,   9, 130,   0,
++     16,   0,   0,   0,   0,   0,
++     10, 128,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,   1,  64,
++      0,   0,   2,   0,   0,   0,
++     31,   0,   4,   3,  58,   0,
++     16,   0,   0,   0,   0,   0,
++     85,   0,   0,   7, 130,   0,
++     16,   0,   0,   0,   0,   0,
++     10,   0,  16,   0,   2,   0,
++      0,   0,   1,  64,   0,   0,
++      1,   0,   0,   0,  78,   0,
++      0,   9,  18,   0,  16,   0,
++      3,   0,   0,   0,  18,   0,
++     16,   0,   4,   0,   0,   0,
++     58,   0,  16,   0,   0,   0,
++      0,   0,  26,   0,  16,   0,
++      0,   0,   0,   0,  35,   0,
++      0,   9, 130,   0,  16,   0,
++      0,   0,   0,   0,  10,   0,
++     16,   0,   3,   0,   0,   0,
++      1,  64,   0,   0,   2,   0,
++      0,   0,   1,  64,   0,   0,
++      1,   0,   0,   0,  38,   0,
++      0,  10,   0, 208,   0,   0,
++    130,   0,  16,   0,   0,   0,
++      0,   0,  58,   0,  16,   0,
++      0,   0,   0,   0,  10, 128,
++     48,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  41,   0,   0,   9,
++     34,   0,  16,   0,   1,   0,
++      0,   0,  26, 128,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,  64,   0,   0,   1,   0,
++      0,   0,  78,   0,   0,   8,
++    130,   0,  16,   0,   0,   0,
++      0,   0,   0, 208,   0,   0,
++     58,   0,  16,   0,   0,   0,
++      0,   0,  26,   0,  16,   0,
++      1,   0,   0,   0,  35,   0,
++      0,   9, 130,   0,  16,   0,
++      0,   0,   0,   0,  58,   0,
++     16,   0,   0,   0,   0,   0,
++     26,   0,  16,   0,   0,   0,
++      0,   0,  10,   0,  16,   0,
++      4,   0,   0,   0, 140,   0,
++      0,  11, 130,   0,  16,   0,
++      0,   0,   0,   0,   1,  64,
++      0,   0,  31,   0,   0,   0,
++      1,  64,   0,   0,   1,   0,
++      0,   0,  58,   0,  16,   0,
++      0,   0,   0,   0,  10,   0,
++     16,   0,   2,   0,   0,   0,
++     18,   0,   0,   1,  38,   0,
++      0,  10,   0, 208,   0,   0,
++     34,   0,  16,   0,   1,   0,
++      0,   0,  26, 128,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,  64,   0,   0,  40,   0,
++      0,   0,  78,   0,   0,   9,
++     18,   0,  16,   0,   2,   0,
++      0,   0,  18,   0,  16,   0,
++      3,   0,   0,   0,  10,   0,
++     16,   0,   2,   0,   0,   0,
++     26,   0,  16,   0,   1,   0,
++      0,   0,  38,   0,   0,  10,
++      0, 208,   0,   0,  34,   0,
++     16,   0,   1,   0,   0,   0,
++     10,   0,  16,   0,   2,   0,
++      0,   0,  10, 128,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     78,   0,   0,   9,  18,   0,
++     16,   0,   2,   0,   0,   0,
++     18,   0,  16,   0,   3,   0,
++      0,   0,  10,   0,  16,   0,
++      3,   0,   0,   0,  26,   0,
++     16,   0,   0,   0,   0,   0,
++    140,   0,   0,  11,  66,   0,
++     16,   0,   1,   0,   0,   0,
++      1,  64,   0,   0,  31,   0,
++      0,   0,   1,  64,   0,   0,
++      1,   0,   0,   0,  10,   0,
++     16,   0,   2,   0,   0,   0,
++      1,  64,   0,   0,   1,   0,
++      0,   0,  38,   0,   0,  10,
++      0, 208,   0,   0,  66,   0,
++     16,   0,   1,   0,   0,   0,
++     42,   0,  16,   0,   1,   0,
++      0,   0,  10, 128,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     41,   0,   0,   9, 130,   0,
++     16,   0,   1,   0,   0,   0,
++     26, 128,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   1,  64,
++      0,   0,   1,   0,   0,   0,
++     78,   0,   0,   8,  66,   0,
++     16,   0,   1,   0,   0,   0,
++      0, 208,   0,   0,  42,   0,
++     16,   0,   1,   0,   0,   0,
++     58,   0,  16,   0,   1,   0,
++      0,   0,  35,   0,   0,   9,
++     34,   0,  16,   0,   0,   0,
++      0,   0,  42,   0,  16,   0,
++      1,   0,   0,   0,  26,   0,
++     16,   0,   0,   0,   0,   0,
++     10,   0,  16,   0,   3,   0,
++      0,   0,  35,   0,   0,   9,
++    130,   0,  16,   0,   0,   0,
++      0,   0,  26,   0,  16,   0,
++      1,   0,   0,   0,   1,  64,
++      0,   0,  40,   0,   0,   0,
++     26,   0,  16,   0,   0,   0,
++      0,   0,  21,   0,   0,   1,
++     78,   0,   0,   9,  18,   0,
++     16,   0,   1,   0,   0,   0,
++     18,   0,  16,   0,   2,   0,
++      0,   0,  10,   0,  16,   0,
++      1,   0,   0,   0,  42,   0,
++     16,   0,   0,   0,   0,   0,
++    140,   0,   0,  11,  34,   0,
++     16,   0,   0,   0,   0,   0,
++      1,  64,   0,   0,  31,   0,
++      0,   0,   1,  64,   0,   0,
++      1,   0,   0,   0,  10,   0,
++     16,   0,   1,   0,   0,   0,
++      1,  64,   0,   0,   1,   0,
++      0,   0,  38,   0,   0,  10,
++      0, 208,   0,   0,  34,   0,
++     16,   0,   0,   0,   0,   0,
++     26,   0,  16,   0,   0,   0,
++      0,   0,  10, 128,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     41,   0,   0,   9,  18,   0,
++     16,   0,   1,   0,   0,   0,
++     26, 128,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   1,  64,
++      0,   0,   1,   0,   0,   0,
++     78,   0,   0,   8,  34,   0,
++     16,   0,   0,   0,   0,   0,
++      0, 208,   0,   0,  26,   0,
++     16,   0,   0,   0,   0,   0,
++     10,   0,  16,   0,   1,   0,
++      0,   0,  35,   0,   0,   9,
++     34,   0,  16,   0,   0,   0,
++      0,   0,  26,   0,  16,   0,
++      0,   0,   0,   0,  42,   0,
++     16,   0,   0,   0,   0,   0,
++     10,   0,  16,   0,   2,   0,
++      0,   0,  30,   0,   0,   8,
++     66,   0,  16,   0,   0,   0,
++      0,   0,  26,   0,   2,   0,
++     42, 128,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  38,   0,
++      0,  12,   0, 208,   0,   0,
++     18,   0,  16,   0,   1,   0,
++      0,   0,  10, 128,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     10, 128,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  38,   0,
++      0,   8,   0, 208,   0,   0,
++     18,   0,  16,   0,   1,   0,
++      0,   0,  42,   0,  16,   0,
++      0,   0,   0,   0,  10,   0,
++     16,   0,   1,   0,   0,   0,
++     38,   0,   0,  10,   0, 208,
++      0,   0,  34,   0,  16,   0,
++      0,   0,   0,   0,  26,   0,
++     16,   0,   0,   0,   0,   0,
++     10, 128,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  38,   0,
++      0,   8,   0, 208,   0,   0,
++     34,   0,  16,   0,   0,   0,
++      0,   0,  26,   0,  16,   0,
++      0,   0,   0,   0,   1,  64,
++      0,   0,  80,   0,   0,   0,
++     35,   0,   0,   9,  34,   0,
++     16,   0,   0,   0,   0,   0,
++     10,   0,  16,   0,   1,   0,
++      0,   0,   1,  64,   0,   0,
++      0,   5,   0,   0,  26,   0,
++     16,   0,   0,   0,   0,   0,
++     30,   0,   0,   7,  34,   0,
++     16,   0,   0,   0,   0,   0,
++     58,   0,  16,   0,   0,   0,
++      0,   0,  26,   0,  16,   0,
++      0,   0,   0,   0,  35,   0,
++      0,   8,  18,   0,  16,   0,
++      0,   0,   0,   0,  42,   0,
++     16,   0,   0,   0,   0,   0,
++     10,   0,  16,   0,   0,   0,
++      0,   0,  10,   0,   2,   0,
++     45,   0,   0,   8,  34,   0,
++     16,   0,   0,   0,   0,   0,
++     86,   5,  16,   0,   0,   0,
++      0,   0,  22, 126,  32,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0, 164,   0,   0,   8,
++    242, 224,  33,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      6,   0,  16,   0,   0,   0,
++      0,   0,  86,   5,  16,   0,
++      0,   0,   0,   0,  62,   0,
++      0,   1,  83,  84,  65,  84,
++    148,   0,   0,   0,  51,   0,
++      0,   0,   5,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
++      0,   0,   0,   0,   0,   0,
++     25,   0,   0,   0,   8,   0,
++      0,   0,   3,   0,   0,   0,
++      2,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
++      0,   0
++};
+diff --git a/src/graphics/shaders/bytecode/d3d12_5_1/ssx_quality_extract_cs.h b/src/graphics/shaders/bytecode/d3d12_5_1/ssx_quality_extract_cs.h
+new file mode 100644
+index 0000000..80440d7
+--- /dev/null
++++ b/src/graphics/shaders/bytecode/d3d12_5_1/ssx_quality_extract_cs.h
+@@ -0,0 +1,240 @@
++#if 0
++//
++// Generated by Microsoft (R) HLSL Shader Compiler 10.1
++//
++//
++// Buffer Definitions:
++//
++// cbuffer Parameters
++// {
++//
++//   uint width;                        // Offset:    0 Size:     4
++//   uint height;                       // Offset:    4 Size:     4
++//
++// }
++//
++//
++// Resource Bindings:
++//
++// Name                                 Type  Format         Dim      ID      HLSL Bind  Count
++// ------------------------------ ---------- ------- ----------- ------- -------------- ------
++// source                            texture  float4          2d      T0             t0      1
++// destination                           UAV  float4          2d      U0             u0      1
++// Parameters                        cbuffer      NA          NA     CB0            cb0      1
++//
++//
++//
++// Input signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Input
++//
++// Output signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Output
++cs_5_1
++dcl_globalFlags refactoringAllowed
++dcl_constantbuffer CB0[0:0][1], immediateIndexed, space=0
++dcl_resource_texture2d (float,float,float,float) T0[0:0], space=0
++dcl_uav_typed_texture2d (float,float,float,float) U0[0:0], space=0
++dcl_input vThreadID.xy
++dcl_temps 1
++dcl_thread_group 8, 8, 1
++uge r0.xy, vThreadID.xyxx, CB0[0][0].xyxx
++or r0.x, r0.y, r0.x
++if_nz r0.x
++  ret
++endif
++imad r0.xy, vThreadID.xyxx, l(6, 6, 0, 0), l(3, 3, 0, 0)
++ushr r0.xy, r0.xyxx, l(2, 2, 0, 0)
++mov r0.zw, l(0,0,0,0)
++ld r0.xyzw, r0.xyzw, T0[0].xyzw
++store_uav_typed U0[0].xyzw, vThreadID.xyyy, r0.xyzw
++ret
++// Approximately 11 instruction slots used
++#endif
++
++const BYTE ssx_quality_extract_cs[] =
++{
++     68,  88,  66,  67,  77, 175,
++    168, 103, 201, 197, 189, 114,
++     96, 194, 211,  31, 247, 106,
++     70, 210,   1,   0,   0,   0,
++     44,   4,   0,   0,   5,   0,
++      0,   0,  52,   0,   0,   0,
++    216,   1,   0,   0, 232,   1,
++      0,   0, 248,   1,   0,   0,
++    144,   3,   0,   0,  82,  68,
++     69,  70, 156,   1,   0,   0,
++      1,   0,   0,   0, 212,   0,
++      0,   0,   3,   0,   0,   0,
++     60,   0,   0,   0,   1,   5,
++     83,  67,   0, 133,   0,   0,
++    115,   1,   0,   0,  19,  19,
++     68,  37,  60,   0,   0,   0,
++     24,   0,   0,   0,  40,   0,
++      0,   0,  40,   0,   0,   0,
++     36,   0,   0,   0,  12,   0,
++      0,   0,   0,   0,   0,   0,
++    180,   0,   0,   0,   2,   0,
++      0,   0,   5,   0,   0,   0,
++      4,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++      1,   0,   0,   0,  12,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0, 187,   0,
++      0,   0,   4,   0,   0,   0,
++      5,   0,   0,   0,   4,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0,   1,   0,
++      0,   0,  12,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0, 199,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   1,   0,   0,   0,
++      1,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++    115, 111, 117, 114,  99, 101,
++      0, 100, 101, 115, 116, 105,
++    110,  97, 116, 105, 111, 110,
++      0,  80,  97, 114,  97, 109,
++    101, 116, 101, 114, 115,   0,
++    171, 171, 199,   0,   0,   0,
++      2,   0,   0,   0, 236,   0,
++      0,   0,  16,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  60,   1,   0,   0,
++      0,   0,   0,   0,   4,   0,
++      0,   0,   2,   0,   0,   0,
++     72,   1,   0,   0,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++    108,   1,   0,   0,   4,   0,
++      0,   0,   4,   0,   0,   0,
++      2,   0,   0,   0,  72,   1,
++      0,   0,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0, 119, 105,
++    100, 116, 104,   0, 100, 119,
++    111, 114, 100,   0,   0,   0,
++     19,   0,   1,   0,   1,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     66,   1,   0,   0, 104, 101,
++    105, 103, 104, 116,   0,  77,
++    105,  99, 114, 111, 115, 111,
++    102, 116,  32,  40,  82,  41,
++     32,  72,  76,  83,  76,  32,
++     83, 104,  97, 100, 101, 114,
++     32,  67, 111, 109, 112, 105,
++    108, 101, 114,  32,  49,  48,
++     46,  49,   0, 171,  73,  83,
++     71,  78,   8,   0,   0,   0,
++      0,   0,   0,   0,   8,   0,
++      0,   0,  79,  83,  71,  78,
++      8,   0,   0,   0,   0,   0,
++      0,   0,   8,   0,   0,   0,
++     83,  72,  69,  88, 144,   1,
++      0,   0,  81,   0,   5,   0,
++    100,   0,   0,   0, 106,   8,
++      0,   1,  89,   0,   0,   7,
++     70, 142,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
++      0,   0,   0,   0,   0,   0,
++     88,  24,   0,   7,  70, 126,
++     48,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  85,  85,   0,   0,
++      0,   0,   0,   0, 156,  24,
++      0,   7,  70, 238,  49,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     85,  85,   0,   0,   0,   0,
++      0,   0,  95,   0,   0,   2,
++     50,   0,   2,   0, 104,   0,
++      0,   2,   1,   0,   0,   0,
++    155,   0,   0,   4,   8,   0,
++      0,   0,   8,   0,   0,   0,
++      1,   0,   0,   0,  80,   0,
++      0,   8,  50,   0,  16,   0,
++      0,   0,   0,   0,  70,   0,
++      2,   0,  70, 128,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     60,   0,   0,   7,  18,   0,
++     16,   0,   0,   0,   0,   0,
++     26,   0,  16,   0,   0,   0,
++      0,   0,  10,   0,  16,   0,
++      0,   0,   0,   0,  31,   0,
++      4,   3,  10,   0,  16,   0,
++      0,   0,   0,   0,  62,   0,
++      0,   1,  21,   0,   0,   1,
++     35,   0,   0,  14,  50,   0,
++     16,   0,   0,   0,   0,   0,
++     70,   0,   2,   0,   2,  64,
++      0,   0,   6,   0,   0,   0,
++      6,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      2,  64,   0,   0,   3,   0,
++      0,   0,   3,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  85,   0,   0,  10,
++     50,   0,  16,   0,   0,   0,
++      0,   0,  70,   0,  16,   0,
++      0,   0,   0,   0,   2,  64,
++      0,   0,   2,   0,   0,   0,
++      2,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     54,   0,   0,   8, 194,   0,
++     16,   0,   0,   0,   0,   0,
++      2,  64,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  45,   0,   0,   8,
++    242,   0,  16,   0,   0,   0,
++      0,   0,  70,  14,  16,   0,
++      0,   0,   0,   0,  70, 126,
++     32,   0,   0,   0,   0,   0,
++      0,   0,   0,   0, 164,   0,
++      0,   7, 242, 224,  33,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  70,   5,   2,   0,
++     70,  14,  16,   0,   0,   0,
++      0,   0,  62,   0,   0,   1,
++     83,  84,  65,  84, 148,   0,
++      0,   0,  11,   0,   0,   0,
++      1,   0,   0,   0,   0,   0,
++      0,   0,   1,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
++      0,   0,   3,   0,   0,   0,
++      2,   0,   0,   0,   1,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   1,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   1,   0,   0,   0
++};
+diff --git a/src/graphics/shaders/ssx_edram_rescale.cs.hlsl b/src/graphics/shaders/ssx_edram_rescale.cs.hlsl
+new file mode 100644
+index 0000000..f478751
+--- /dev/null
++++ b/src/graphics/shaders/ssx_edram_rescale.cs.hlsl
+@@ -0,0 +1,31 @@
++// Bitwise nearest replication. Color64 has interleaved low/high words;
++// color32 and depth have 40-word half tiles (depth swaps the halves).
++Buffer<uint> source : register(t0);
++RWBuffer<uint> destination : register(u0);
++cbuffer Parameters : register(b0) {
++  uint source_scale, dest_scale, first_tile, tile_count, words_per_pixel, msaa_log2;
++};
++uint resample(uint value, uint samples) {
++  return ((2 * (value / samples) + 1) * source_scale / (2 * dest_scale)) * samples + value % samples;
++}
++[numthreads(256,1,1)]
++void main(uint3 id : SV_DispatchThreadID) {
++  uint words = 1280 * dest_scale * dest_scale;
++  if (id.x >= words || id.y >= tile_count) return;
++  uint y = id.x / (80 * dest_scale);
++  uint x = id.x % (80 * dest_scale);
++  uint sx;
++  uint samples_x = msaa_log2 >= 2 ? 2 : 1;
++  uint samples_y = msaa_log2 >= 1 ? 2 : 1;
++  if (words_per_pixel == 2) {
++    sx = resample(x / 2, samples_x) * 2 + (x & 1);
++  } else {
++    uint half = x / (40 * dest_scale);
++    uint local_x = x % (40 * dest_scale);
++    sx = half * 40 * source_scale + resample(local_x, samples_x);
++  }
++  uint sy = resample(y, samples_y);
++  uint tile = first_tile + id.y;
++  uint offset = tile * 1280 * source_scale * source_scale + sy * 80 * source_scale + sx;
++  destination[tile * words + id.x] = source[offset];
++}
+diff --git a/src/graphics/shaders/ssx_quality_extract.cs.hlsl b/src/graphics/shaders/ssx_quality_extract.cs.hlsl
+new file mode 100644
+index 0000000..43cd746
+--- /dev/null
++++ b/src/graphics/shaders/ssx_quality_extract.cs.hlsl
+@@ -0,0 +1,9 @@
++// Recover the exact original 2x sample from canonical 3x resolve storage.
++Texture2D<float4> source : register(t0);
++RWTexture2D<float4> destination : register(u0);
++cbuffer Parameters : register(b0) { uint width, height; };
++[numthreads(8,8,1)]
++void main(uint3 id : SV_DispatchThreadID) {
++  if (id.x >= width || id.y >= height) return;
++  destination[id.xy] = source.Load(int3(((2 * id.xy + 1) * 3) / 4, 0));
++}
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 803c261..b7e4cd5 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -45,6 +45,7 @@ REXCVAR_DEFINE_BOOL(d3d12_ssx_native_motion, false, "UI/D3D12",
+                     "Experimental captured rider geometry motion; requires SSX camera motion. No DLSS/FG.")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ REXCVAR_DECLARE(bool, d3d12_ssx_dlaa);
++REXCVAR_DECLARE(bool, d3d12_ssx_quality);
+ 
+ namespace rex::ui::d3d12 {
+ 
+@@ -643,11 +644,13 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+     }
+   }
+ 
+-  if (REXCVAR_GET(d3d12_ssx_scene_color) && !REXCVAR_GET(d3d12_ssx_dlaa))
++  if (REXCVAR_GET(d3d12_ssx_scene_color) && !REXCVAR_GET(d3d12_ssx_dlaa) &&
++      !REXCVAR_GET(d3d12_ssx_quality))
+     paint_context_.scene_color.Record(provider_, command_list, frame_inputs,
+                                       current_paint_submission, inputs_completed);
+ 
+-  if (REXCVAR_GET(d3d12_ssx_camera_motion) && !REXCVAR_GET(d3d12_ssx_dlaa)) {
++  if (REXCVAR_GET(d3d12_ssx_camera_motion) && !REXCVAR_GET(d3d12_ssx_dlaa) &&
++      !REXCVAR_GET(d3d12_ssx_quality)) {
+     const double seconds = std::chrono::duration<double>(
+         std::chrono::steady_clock::now().time_since_epoch()).count();
+     const auto motion = paint_context_.camera_motion.Record(provider_, command_list, frame_inputs,
+diff --git a/src/ui/d3d12/guest_frame_inputs.cpp b/src/ui/d3d12/guest_frame_inputs.cpp
+index f595679..9d23c45 100644
+--- a/src/ui/d3d12/guest_frame_inputs.cpp
++++ b/src/ui/d3d12/guest_frame_inputs.cpp
+@@ -2,13 +2,15 @@
+ 
+ namespace rex::ui::d3d12 {
+ bool GuestInputTexture::Prepare(ID3D12Device* device, DXGI_FORMAT format, uint32_t new_width,
+-                                uint32_t new_height, bool& newly_created) {
++                                uint32_t new_height, bool& newly_created, bool unordered_access) {
+   newly_created = false;
+   if (!device || !new_width || !new_height || new_width > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
+       new_height > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION)
+     return false;
+   if (resource && width == new_width && height == new_height &&
+-      resource->GetDesc().Format == format)
++      resource->GetDesc().Format == format &&
++      bool(resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ==
++          unordered_access)
+     return true;
+   // These are the three observed SSX input storage formats. Do not silently
+   // reinterpret a different resource as depth/color/exposure.
+@@ -23,6 +25,8 @@ bool GuestInputTexture::Prepare(ID3D12Device* device, DXGI_FORMAT format, uint32
+   desc.MipLevels = 1;
+   desc.Format = format;
+   desc.SampleDesc.Count = 1;
++  desc.Flags =
++      unordered_access ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+   D3D12_HEAP_PROPERTIES heap{};
+   heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+   Microsoft::WRL::ComPtr<ID3D12Resource> replacement;
+diff --git a/src/ui/d3d12/ssx_reconstruction.cpp b/src/ui/d3d12/ssx_reconstruction.cpp
+index 6baa2cc..5ff1e06 100644
+--- a/src/ui/d3d12/ssx_reconstruction.cpp
++++ b/src/ui/d3d12/ssx_reconstruction.cpp
+@@ -13,6 +13,11 @@ REXCVAR_DEFINE_BOOL(
+     "Requires Streamline, SSX inputs, native motion and jitter; no upscaling or FG.")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++REXCVAR_DEFINE_BOOL(d3d12_ssx_quality, false, "GPU/D3D12",
++                    "Experimental SSX Quality: 2x native scene, DLSS L to 3x before tone map, 3x "
++                    "post/HUD. ROV only.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ namespace rex::ui::d3d12 {
+ namespace {
+ #include "ui/shaders/bytecode/d3d12_5_1/ssx_reconstruction_encode_cs.h"
+@@ -35,6 +40,7 @@ struct SsxReconstruction::Impl {
+     ComPtr<ID3D12DescriptorHeap> heap;
+     std::shared_ptr<const SsxFrameInputs> input;
+     uint64_t submission = 0;
++    uint64_t timed_frame = 0;
+     uint32_t width = 0, height = 0;
+   };
+   std::array<Slot, 3> slots;
+@@ -45,6 +51,9 @@ struct SsxReconstruction::Impl {
+   Streamline* sr = nullptr;
+   ComPtr<ID3D12RootSignature> root;
+   ComPtr<ID3D12PipelineState> pipeline;
++  ComPtr<ID3D12QueryHeap> queries;
++  ComPtr<ID3D12Resource> timings;
++  uint64_t timestamp_frequency = 0;
+   uint32_t width = 0, height = 0;
+   Streamline::Quality quality = Streamline::Quality::kDLAA;
+   Streamline::OptimalSettings optimal{};
+@@ -137,7 +146,7 @@ SsxReconstruction::~SsxReconstruction() = default;
+ SsxReconstruction::Result SsxReconstruction::Submit(
+     const D3D12Provider& provider, const std::shared_ptr<const SsxFrameInputs>& frame,
+     ID3D12Resource* destination, D3D12_RESOURCE_STATES destination_state, double seconds,
+-    Streamline::Quality quality) {
++    Streamline::Quality quality, bool profile) {
+   auto& p = *impl_;
+   Result result;
+   if (!frame || !destination) {
+@@ -171,6 +180,21 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+   }
+   if (!p.Initialize(provider))
+     return result;
++  if (profile && !p.queries) {
++    D3D12_QUERY_HEAP_DESC q{};
++    q.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
++    q.Count = 12;
++    D3D12_RESOURCE_DESC buffer{};
++    util::FillBufferResourceDesc(buffer, 12 * sizeof(uint64_t), D3D12_RESOURCE_FLAG_NONE);
++    if (FAILED(provider.GetDevice()->CreateQueryHeap(&q, IID_PPV_ARGS(&p.queries))) ||
++        FAILED(provider.GetDevice()->CreateCommittedResource(
++            &util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &buffer,
++            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&p.timings))) ||
++        FAILED(provider.GetDirectQueue()->GetTimestampFrequency(&p.timestamp_frequency))) {
++      p.queries.Reset();
++      p.timings.Reset();
++    }
++  }
+   // Do not let a caller label a same-size dispatch "Quality" or accept a target
+   // that would silently crop/downsample reconstruction back to the input size.
+   const bool reconfigure = p.width != dest.Width || p.height != dest.Height || p.quality != quality;
+@@ -200,6 +224,27 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+     result.reason = "slot_fence";
+     return result;
+   }
++  const uint32_t query_base = uint32_t(submission % p.slots.size()) * 4;
++  if (p.queries && slot.timed_frame) {
++    void* mapped = nullptr;
++    D3D12_RANGE range{query_base * sizeof(uint64_t), (query_base + 4) * sizeof(uint64_t)};
++    if (SUCCEEDED(p.timings->Map(0, &range, &mapped))) {
++      const auto* ticks = static_cast<const uint64_t*>(mapped);
++      if (ticks[query_base + 1] >= ticks[query_base] &&
++          ticks[query_base + 2] >= ticks[query_base + 1] &&
++          ticks[query_base + 3] >= ticks[query_base + 2] && p.timestamp_frequency) {
++        result.timed_frame = slot.timed_frame;
++        result.inputs_ms =
++            1000.0 * double(ticks[query_base + 1] - ticks[query_base]) / p.timestamp_frequency;
++        result.dlss_ms =
++            1000.0 * double(ticks[query_base + 2] - ticks[query_base + 1]) / p.timestamp_frequency;
++        result.encode_ms =
++            1000.0 * double(ticks[query_base + 3] - ticks[query_base + 2]) / p.timestamp_frequency;
++      }
++      D3D12_RANGE none{0, 0};
++      p.timings->Unmap(0, &none);
++    }
++  }
+   const auto completed = p.tracker.GetCompletedSubmission();
+   if (!p.Prepare(provider, slot, p.width, p.height) || FAILED(slot.allocator->Reset()) ||
+       FAILED(slot.list->Reset(slot.allocator.Get(), nullptr))) {
+@@ -212,10 +257,17 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+   }
+   p.previous_frame = f.guest_frame;
+   auto* list = slot.list.Get();
++  auto stamp = [&](uint32_t index) {
++    if (p.queries)
++      list->EndQuery(p.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query_base + index);
++  };
++  stamp(0);
+   list->BeginEvent(1, "SSX DLSS before tone map", sizeof("SSX DLSS before tone map"));
+   const auto linear = p.color.Record(provider, list, frame, submission, completed);
+   const auto motion = p.camera.Record(provider, list, frame, submission, completed, seconds);
+   const auto native = p.native.Record(provider, list, frame, motion, submission, completed);
++  stamp(1);
++  bool evaluated = false;
+   Streamline::SRFrame sr_frame;
+   sr_frame.id = f.guest_frame;
+   sr_frame.jitter_pixels = f.jitter_pixels;
+@@ -233,6 +285,8 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+       Transition(list, resource, GuestInputTexture::kReadState,
+                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+     const auto evaluation = p.sr->EvaluateSR(list, sr_frame);
++    stamp(2);
++    evaluated = true;
+     for (auto* resource : {sr_frame.color, sr_frame.depth, sr_frame.motion})
+       Transition(list, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                  GuestInputTexture::kReadState);
+@@ -289,6 +343,14 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+       result.reason = "applied";
+     }
+   }
++  if (!evaluated)
++    stamp(2);
++  stamp(3);
++  if (p.queries) {
++    list->ResolveQueryData(p.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query_base, 4,
++                           p.timings.Get(), query_base * sizeof(uint64_t));
++    slot.timed_frame = f.guest_frame;
++  }
+   list->EndEvent();
+   slot.input = frame;
+   slot.destination = destination;

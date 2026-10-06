@@ -1,0 +1,2595 @@
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index da8e432..79e77a6 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -130,6 +130,8 @@ class CommandProcessor {
+   bool Restore(::rex::stream::ByteStream* stream);
+ 
+  protected:
++  // Valid only while processing this exact PM4_XE_SWAP, zero for ordinary packets.
++  uint64_t swap_timing_id_ = 0;
+   struct IndexBufferInfo {
+     xenos::IndexFormat format = xenos::IndexFormat::kInt16;
+     xenos::Endian endianness = xenos::Endian::kNone;
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 95599b1..b5b6d06 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -854,11 +854,14 @@ class D3D12CommandProcessor : public CommandProcessor {
+   ui::d3d12::SsxFrameInputPool ssx_input_pool_;
+   std::shared_ptr<ui::d3d12::SsxFrameInputs> ssx_inputs_;
+   void CollectSsxFrameInputs(uint64_t vs, uint64_t ps, const draw_util::ViewportInfo& viewport);
++  void CollectSsxHudless(uint64_t vs, uint64_t ps, const draw_util::ViewportInfo& viewport);
+   void CollectSsxGeometry(uint64_t vs, uint64_t ps,
+                           const PrimitiveProcessor::ProcessingResult& primitive, bool memexport);
+   bool CopySsxInputTexture(ui::d3d12::SsxInput role, uint32_t fetch, DXGI_FORMAT format,
+                            uint32_t mip = 0);
+-  std::shared_ptr<const ui::d3d12::SsxFrameInputs> SealSsxFrameInputs(uint32_t width, uint32_t height);
++  std::shared_ptr<const ui::d3d12::SsxFrameInputs> SealSsxFrameInputs(uint32_t width,
++                                                                      uint32_t height,
++                                                                      bool gamma_pwl);
+ };
+ 
+ }  // namespace rex::graphics::d3d12
+diff --git a/include/rex/ui/d3d12/d3d12_presenter.h b/include/rex/ui/d3d12/d3d12_presenter.h
+index 5148a87..954336e 100644
+--- a/include/rex/ui/d3d12/d3d12_presenter.h
++++ b/include/rex/ui/d3d12/d3d12_presenter.h
+@@ -23,6 +23,7 @@
+ #include <rex/ui/d3d12/ssx_camera_motion.h>
+ #include <rex/ui/d3d12/ssx_native_motion.h>
+ #include <rex/ui/d3d12/ssx_scene_color.h>
++#include <rex/ui/d3d12/ssx_fg_capture.h>
+ #include <rex/ui/surface.h>
+ 
+ namespace rex::ui::d3d12 {
+@@ -68,12 +69,15 @@ class D3D12Presenter final : public Presenter {
+     // kGuestOutputInternalState, and the callback must also transition it back
+     // to kGuestOutputInternalState before finishing.
+     ID3D12Resource* resource_uav_capable() const { return resource_.Get(); }
++    void SetTimingId(uint64_t id) { timing_id_ = id; }
++    uint64_t timing_id() const { return timing_id_; }
+     void SetFrameInputs(std::shared_ptr<const SsxFrameInputs> inputs) { inputs_ = std::move(inputs); }
+     const std::shared_ptr<const SsxFrameInputs>& frame_inputs() const { return inputs_; }
+ 
+    private:
+     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
+     std::shared_ptr<const SsxFrameInputs> inputs_;
++    uint64_t timing_id_ = 0;
+   };
+ 
+   static std::unique_ptr<D3D12Presenter> Create(HostGpuLossCallback host_gpu_loss_callback,
+@@ -251,6 +255,7 @@ class D3D12Presenter final : public Presenter {
+     SsxCameraMotion camera_motion;
+     SsxNativeMotion native_motion;
+     SsxSceneColor scene_color;
++    SsxFGCapture fg_capture;
+     uint64_t last_motion_frame_logged = 0;
+     SsxMotionReset last_motion_reason = SsxMotionReset::kFirstFrame;
+ 
+@@ -311,6 +316,7 @@ class D3D12Presenter final : public Presenter {
+   std::array<std::pair<UINT64, Microsoft::WRL::ComPtr<ID3D12Resource>>, kGuestOutputMailboxSize>
+       guest_output_resources_;
+   std::array<std::shared_ptr<const SsxFrameInputs>, kGuestOutputMailboxSize> guest_frame_inputs_;
++  std::array<uint64_t, kGuestOutputMailboxSize> guest_timing_ids_{};
+   // The guest output resources are protected by two submission trackers - the
+   // refresher ones (for writing to them via the guest_output_resources_
+   // references) and the paint one (for presenting it via the
+diff --git a/include/rex/ui/d3d12/guest_frame_inputs.h b/include/rex/ui/d3d12/guest_frame_inputs.h
+index 5bd31ff..e009075 100644
+--- a/include/rex/ui/d3d12/guest_frame_inputs.h
++++ b/include/rex/ui/d3d12/guest_frame_inputs.h
+@@ -8,6 +8,7 @@
+ 
+ #include <rex/ui/d3d12/d3d12_api.h>
+ #include <rex/ui/d3d12/ssx_geometry.h>
++#include <rex/ui/d3d12/streamline.h>
+ 
+ namespace rex::ui::d3d12 {
+ 
+@@ -74,6 +75,14 @@ struct SsxFrameMetadata {
+   uint32_t jitter_unknown_before_color = 0;
+   uint32_t jitter_fixed_screen_draws = 0, jitter_inverse_draws = 0;
+   uint32_t scene_msaa_samples = 1;  // Peak guest sample count before tone mapping.
++  // Post-effects source of the final full-screen copy, before guest HUD draws.
++  // Candidate only: its full-screen UV mapping and display gamma need validation.
++  bool fg_hudless_captured = false, fg_hudless_failed = false, fg_hudless_duplicate = false;
++  uint32_t fg_hudless_draw = 0;
++  bool fg_gamma_pwl = false;
++  // Exact display ramp used by this frame's IssueSwap. PWL has 384 words;
++  // the table path has 256. These are display codes, not scene exposure.
++  std::array<uint32_t, 384> fg_gamma_ramp{};
+   std::array<uint64_t,8> jitter_unknown_shaders{};
+ 
+   bool Has(SsxInput role) const { return (captured_mask & (1u << size_t(role))) != 0; }
+@@ -107,6 +116,40 @@ struct GuestInputTexture {
+                                   uint32_t mip, std::array<D3D12_RESOURCE_BARRIER, 3>& out) const;
+ };
+ 
++// Immutable copy of the actual DLAA motion and camera, retained through the
++// guest mailbox/presenter. The original reconstruction buffers are transient.
++// Depth remains owned by the matching SsxFrameInputs packet. No owner back-link:
++// that would form a cycle through the reconstruction's frozen producer packet.
++struct SsxFGTemporal {
++  GuestInputTexture motion;
++  Streamline::SRCamera camera;
++  std::array<float, 2> jitter_pixels{};
++  uint64_t guest_frame = 0, submission = 0;
++  bool reset = true, depth_inverted = true;
++};
++
++class SsxFGTemporalPool {
++ public:
++  static constexpr size_t kSlotCount = 6;
++  std::shared_ptr<SsxFGTemporal> Acquire(uint64_t frame, uint64_t completed) {
++    for (auto& slot : slots_) {
++      if (!slot)
++        slot = std::make_shared<SsxFGTemporal>();
++      if (slot.use_count() != 1 || slot->submission > completed)
++        continue;
++      slot->guest_frame = frame;
++      slot->camera = {};
++      slot->jitter_pixels = {};
++      slot->reset = true;
++      return slot;
++    }
++    return nullptr;
++  }
++
++ private:
++  std::array<std::shared_ptr<SsxFGTemporal>, kSlotCount> slots_;
++};
++
+ struct SsxFrameInputs {
+   // A frozen boundary packet retains its producer's pool slot as well as COM
+   // resources, preventing pool reuse while reconstruction still references it.
+@@ -114,6 +157,8 @@ struct SsxFrameInputs {
+   SsxFrameMetadata metadata;
+   SsxGeometry geometry;
+   std::array<GuestInputTexture, size_t(SsxInput::kCount)> textures;
++  GuestInputTexture fg_hudless;
++  std::shared_ptr<const SsxFGTemporal> fg_temporal;
+   uint64_t last_copy_submission = 0;
+ };
+ 
+@@ -129,6 +174,7 @@ class SsxFrameInputPool {
+       if (slot.use_count() != 1 || slot->last_copy_submission > completed_submission)
+         continue;
+       slot->metadata = {};
++      slot->fg_temporal.reset();
+       slot->geometry.Reset();
+       slot->metadata.guest_frame = frame;
+       return slot;
+diff --git a/include/rex/ui/d3d12/ssx_fg_capture.h b/include/rex/ui/d3d12/ssx_fg_capture.h
+new file mode 100644
+index 0000000..a32f520
+--- /dev/null
++++ b/include/rex/ui/d3d12/ssx_fg_capture.h
+@@ -0,0 +1,23 @@
++#pragma once
++#include <rex/ui/d3d12/guest_frame_inputs.h>
++#include <filesystem>
++
++namespace rex::ui::d3d12 {
++// One requested, fenced readback of the pre-HUD source and the matching final
++// guest image. Diagnostic only: no output replacement or NVIDIA resource tags.
++// The presenter drains its queue before this object's resources are destroyed.
++class SsxFGCapture {
++ public:
++  void Record(ID3D12Device* device, ID3D12GraphicsCommandList* list,
++              const std::shared_ptr<const SsxFrameInputs>& frame, ID3D12Resource* final_color,
++              uint64_t submission, uint64_t completed);
++
++ private:
++  void Complete(uint64_t completed);
++  Microsoft::WRL::ComPtr<ID3D12Resource> readback_, final_;
++  std::shared_ptr<const SsxFrameInputs> frame_;
++  std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 2> footprints_{};
++  uint64_t submission_ = 0, bytes_ = 0;
++  std::filesystem::path directory_;
++};
++}  // namespace rex::ui::d3d12
+diff --git a/include/rex/ui/d3d12/ssx_fg_color.h b/include/rex/ui/d3d12/ssx_fg_color.h
+new file mode 100644
+index 0000000..6cb6a85
+--- /dev/null
++++ b/include/rex/ui/d3d12/ssx_fg_color.h
+@@ -0,0 +1,35 @@
++#pragma once
++#include <rex/ui/d3d12/guest_frame_inputs.h>
++
++namespace rex::ui::d3d12 {
++class D3D12Provider;
++
++// Display-sized, SDR HUD-free color. This reproduces the observed final guest
++// full-screen copy and its display LUT. It does not adjust scene exposure.
++struct SsxFGColorFrame {
++  Microsoft::WRL::ComPtr<ID3D12Resource> color;
++  std::shared_ptr<const SsxFrameInputs> input;
++  uint64_t submission = 0;
++  // Set after FG Present, before releasing the caller's reference. The pool
++  // must wait for NVIDIA's input-consumption fence as well as its own writes.
++  Microsoft::WRL::ComPtr<ID3D12Fence> fg_fence;
++  uint64_t fg_fence_value = 0;
++};
++
++bool CanBuildSsxFGColor(const SsxFrameInputs& input, uint32_t width, uint32_t height);
++
++class SsxFGColor {
++ public:
++  SsxFGColor();
++  ~SsxFGColor();  // Caller drains presentation and FG input work first.
++  std::shared_ptr<SsxFGColorFrame> Record(const D3D12Provider& provider,
++                                          ID3D12GraphicsCommandList* list,
++                                          const std::shared_ptr<const SsxFrameInputs>& frame,
++                                          uint32_t width, uint32_t height, uint64_t submission,
++                                          uint64_t completed);
++
++ private:
++  struct Impl;
++  std::unique_ptr<Impl> impl_;
++};
++}  // namespace rex::ui::d3d12
+diff --git a/include/rex/ui/d3d12/ssx_reconstruction.h b/include/rex/ui/d3d12/ssx_reconstruction.h
+index 54a9719..83a2ad5 100644
+--- a/include/rex/ui/d3d12/ssx_reconstruction.h
++++ b/include/rex/ui/d3d12/ssx_reconstruction.h
+@@ -23,13 +23,14 @@ class SsxReconstruction {
+     const char* reason = "unavailable";
+     uint64_t timed_frame = 0;
+     double inputs_ms = 0, dlss_ms = 0, encode_ms = 0;
++    std::shared_ptr<const SsxFGTemporal> fg_temporal;
+   };
+   SsxReconstruction();
+   ~SsxReconstruction();
+   Result Submit(const D3D12Provider& provider, const std::shared_ptr<const SsxFrameInputs>& frame,
+                 ID3D12Resource* destination, D3D12_RESOURCE_STATES destination_state,
+                 double seconds, Streamline::Quality quality = Streamline::Quality::kDLAA,
+-                bool profile = false);
++                bool profile = false, bool retain_fg_inputs = false);
+ 
+  private:
+   struct Impl;
+diff --git a/include/rex/ui/d3d12/streamline.h b/include/rex/ui/d3d12/streamline.h
+index c702e6f..02f22ba 100644
+--- a/include/rex/ui/d3d12/streamline.h
++++ b/include/rex/ui/d3d12/streamline.h
+@@ -61,8 +61,51 @@ class Streamline {
+     std::array<float, 3> position{}, up{}, right{}, forward{};
+     float near_plane = 0, far_plane = 0, vertical_fov = 0, aspect = 0;
+   };
++  // One token follows a real frame from input/simulation to its actual Present.
++  // Callers retain at most three frames in flight. Methods on a given frame
++  // must be serialized; configuration, SR evaluation and FG tagging also require
++  // external serialization across threads. FG state queries use the present thread.
++  struct Frame;
++  enum class ReflexMode { kOff, kOn, kOnWithBoost };
++  enum class Marker {
++    kSimulationEnd,
++    kRenderSubmitStart,
++    kRenderSubmitEnd,
++    kPresentStart,
++    kPresentEnd,
++    kInputFlash,
++    kLatencyPing
++  };
++  bool ConfigureReflex(ReflexMode mode, uint32_t frame_limit_us = 0);
++  // Sleeps before SimulationStart, even with Reflex Off. Invoke immediately
++  // before input sampling and simulation, not from a presentation-only callback.
++  std::shared_ptr<Frame> BeginFrame();
++  bool MarkFrame(const std::shared_ptr<Frame>& frame, Marker marker);
++  uint32_t LatencyPingMessage() const;
++  // The token ID is diagnostic identity, not a timestamp or a guest frame index.
++  bool GetFrameId(const std::shared_ptr<Frame>& frame, uint32_t& id) const;
++  struct ReflexReport {
++    uint64_t frame_id = 0;
++    uint64_t simulation_start_us = 0, simulation_end_us = 0;
++    uint64_t render_start_us = 0, render_end_us = 0;
++    uint64_t present_start_us = 0, present_end_us = 0;
++    uint64_t driver_start_us = 0, driver_end_us = 0;
++    uint64_t queue_start_us = 0, queue_end_us = 0;
++    uint64_t gpu_start_us = 0, gpu_end_us = 0;
++    uint32_t gpu_active_us = 0, gpu_frame_us = 0;
++  };
++  struct ReflexState {
++    bool low_latency_available = false, reports_available = false;
++    bool flash_driver_controlled = false;
++    std::array<ReflexReport, 64> reports{};
++  };
++  // Serialize with ConfigureReflex and other state queries. Missing timestamps
++  // stay zero: they must not be interpreted as a zero-latency measurement.
++  bool GetReflexState(ReflexState& state);
++
+   struct SRFrame {
+     uint64_t id = 0;  // Strictly increasing, per rendered frame, not per Present.
++    std::shared_ptr<Frame> timeline;  // Required when sharing this frame with FG.
+     SRCamera camera;
+     std::array<float, 2> jitter_pixels{};
+     // All are single-mip, single-sample textures, retained by the caller until
+@@ -89,6 +132,41 @@ class Streamline {
+   // or output dimensions. Does not release the caller's input/output textures.
+   bool ReleaseSR();
+ 
++  // Drain queues and destroy the swap chain BEFORE changing Loaded; recreate
++  // it afterwards. This removes the proxy/copy overhead when users turn FG off.
++  bool SetFrameGenerationLoaded(bool loaded);
++  // Short-lived pause/menu/loading suspension retains allocations. Clear tags
++  // for the invalid frame as well. Resume requires valid inputs and a reset.
++  bool SetFrameGenerationActive(bool active);
++  struct FGFrame {
++    SRCamera camera;
++    std::array<float, 2> jitter_pixels{};
++    ID3D12Resource* depth = nullptr;
++    ID3D12Resource* motion = nullptr;
++    // SDR, post-tone-map and post-effects, same extent/color space as backbuffer.
++    // Caller retains all resources unchanged until Present and GPU completion.
++    ID3D12Resource* hudless = nullptr;
++    ID3D12Resource* ui_alpha = nullptr;  // Optional R8_UNORM/R16_FLOAT/R32_FLOAT.
++    bool reset = false, depth_inverted = false;
++  };
++  // Depth/MV use NON_PIXEL_SHADER_RESOURCE, HUD/UI use the combined pixel and
++  // non-pixel shader read state. All are eValidUntilPresent, viewport zero.
++  // The initial integration generates exactly one frame per rendered frame.
++  bool TagFrameGeneration(ID3D12GraphicsCommandList* list, const std::shared_ptr<Frame>& timeline,
++                          const FGFrame& frame, uint32_t backbuffer_width,
++                          uint32_t backbuffer_height);
++  bool ClearFrameGenerationTags(ID3D12GraphicsCommandList* list,
++                                const std::shared_ptr<Frame>& timeline);
++  struct FGState {
++    uint32_t status = 0, frames_presented = 0;
++    uint32_t minimum_dimension = 0, max_generated_frames = 0;
++    Microsoft::WRL::ComPtr<ID3D12Fence> inputs_fence;
++    uint64_t inputs_fence_value = 0;
++  };
++  // Call after Present, on that same thread. Counts are since the previous query.
++  // Other queues must wait for this fence before reusing the tagged inputs.
++  bool GetFrameGenerationState(FGState& state);
++
+   // Caller must first drain GPU work. Shut down before releasing the device and
+   // factory; destroy this object only AFTER releasing every Streamline COM proxy.
+   void Shutdown();
+diff --git a/include/rex/ui/guest_frame_timing.h b/include/rex/ui/guest_frame_timing.h
+new file mode 100644
+index 0000000..7fb5473
+--- /dev/null
++++ b/include/rex/ui/guest_frame_timing.h
+@@ -0,0 +1,74 @@
++// Bounded CPU timing diagnostics. These events are NOT NVIDIA Reflex markers.
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++#include <filesystem>
++#include <mutex>
++#include <vector>
++
++namespace rex::ui {
++
++class GuestFrameTiming {
++ public:
++  enum class Event : uint32_t {
++    kInputBegin,
++    kInputEnd,
++    kWorkerDispatchBegin,
++    kWorkerDispatchEnd,
++    kWorkerBegin,
++    kWorkerEnd,
++    kRenderDispatchBegin,
++    kRenderDispatchEnd,
++    kRenderBegin,
++    kRenderEnd,
++    kSynchronizedRenderBegin,
++    kSynchronizedRenderEnd,
++    kGuestSwap,
++    kCommandProcessorSwap,
++    kReconstructionBegin,
++    kReconstructionEnd,
++    kHostSubmit,
++    kPresentBegin,
++    kPresentEnd
++  };
++  struct Record {
++    uint64_t time_ns, id, related, detail;
++    uint32_t thread;
++    Event event;
++  };
++  static constexpr size_t kMaxRecords = 32768;
++  static GuestFrameTiming& Get();
++  // Single control thread, normally SSX's independent input polling thread.
++  // A capture.request file starts a five-second capture. No per-frame disk IO
++  // on the renderer; this thread writes the bounded buffer on completion.
++  void PollCapture(const std::filesystem::path& directory);
++  void BeginCapture(uint64_t duration_ns = 5000000000ull);
++  std::vector<Record> FinishCapture();
++  bool capturing() const { return capturing_.load(std::memory_order_relaxed); }
++  uint64_t NewId() { return next_id_.fetch_add(1, std::memory_order_relaxed); }
++  void Add(Event event, uint64_t id, uint64_t related = 0, uint64_t detail = 0);
++  // TLS scope identity is carried in the actual VdSwap packet. A global
++  // "latest render" value would silently attribute cross-thread work wrongly.
++  static uint64_t CurrentRender();
++  static uint64_t ExchangeRender(uint64_t id);
++
++ private:
++  std::atomic<bool> capturing_{false};
++  std::atomic<uint64_t> next_id_{1};
++  std::mutex mutex_;
++  std::vector<Record> records_;
++  uint64_t deadline_ns_ = 0;
++  // PollCapture control-thread-only fields.
++  uint64_t next_poll_ns_ = 0;
++  bool writing_capture_ = false;
++};
++
++// The private extension of PM4_XE_SWAP is explicitly versioned. Old four-word
++// swap packets retain their existing meaning. No guest addresses are replaced.
++constexpr uint32_t kGuestTimingSwapSignature = 0x52465431;  // RFT1
++inline uint64_t DecodeGuestTimingSwap(uint32_t signature, uint32_t lo, uint32_t hi) {
++  return signature == kGuestTimingSwapSignature ? uint64_t(lo) | (uint64_t(hi) << 32) : 0;
++}
++
++}  // namespace rex::ui
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index a744375..a839116 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -1,3 +1,4 @@
++#include <rex/ui/guest_frame_timing.h>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -956,9 +957,19 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+   uint32_t frontbuffer_ptr = reader->ReadAndSwap<uint32_t>();
+   uint32_t frontbuffer_width = reader->ReadAndSwap<uint32_t>();
+   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
+-  reader->AdvanceRead((count - 4) * sizeof(uint32_t));
++  swap_timing_id_ = 0;
++  uint32_t consumed = 4;
++  if (count >= 7) {
++    const auto signature = reader->ReadAndSwap<uint32_t>();
++    const auto lo = reader->ReadAndSwap<uint32_t>();
++    const auto hi = reader->ReadAndSwap<uint32_t>();
++    swap_timing_id_ = ui::DecodeGuestTimingSwap(signature, lo, hi);
++    consumed = 7;
++  }
++  reader->AdvanceRead((count - consumed) * sizeof(uint32_t));
+ 
+   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
++  swap_timing_id_ = 0;
+ 
+   ++counter_;
+   return true;
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index a54a89e..942ade4 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -1,3 +1,4 @@
++#include <rex/ui/guest_frame_timing.h>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -2240,11 +2241,17 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
+   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
+ 
+-  auto ssx_frame_inputs = SealSsxFrameInputs(guest_output_width, guest_output_height);
++  ui::GuestFrameTiming::Get().Add(ui::GuestFrameTiming::Event::kCommandProcessorSwap,
++                                  swap_timing_id_, frame_current_);
++  auto ssx_frame_inputs = SealSsxFrameInputs(
++      guest_output_width, guest_output_height,
++      frontbuffer_format == xenos::TextureFormat::k_2_10_10_10 ||
++          frontbuffer_format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16);
+   presenter->RefreshGuestOutput(
+       guest_output_width, guest_output_height, display_width, display_height,
+       [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource, guest_output_width,
+-       guest_output_height, ssx_frame_inputs](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
++       guest_output_height, ssx_frame_inputs,
++       timing_id = swap_timing_id_](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+         const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+         ID3D12Device* device = provider.GetDevice();
+ 
+@@ -2503,9 +2510,12 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+         // presenter so it can submit its own commands for displaying it to the
+         // queue.
+         SubmitBarriers();
+-        if (!EndSubmission(true)) return false;
++        if (!EndSubmission(true))
++          return false;
+         static_cast<ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(context)
+             .SetFrameInputs(ssx_frame_inputs);
++        static_cast<ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(context)
++            .SetTimingId(timing_id);
+         return true;
+       });
+ 
+diff --git a/src/graphics/d3d12/ssx_frame_inputs.cpp b/src/graphics/d3d12/ssx_frame_inputs.cpp
+index aa65f46..a2e788c 100644
+--- a/src/graphics/d3d12/ssx_frame_inputs.cpp
++++ b/src/graphics/d3d12/ssx_frame_inputs.cpp
+@@ -1,3 +1,4 @@
++#include <rex/ui/guest_frame_timing.h>
+ #include <rex/graphics/d3d12/command_processor.h>
+ 
+ #include <rex/ui/d3d12/ssx_jitter.h>
+@@ -21,6 +22,10 @@ REXCVAR_DEFINE_BOOL(d3d12_ssx_jitter, false, "GPU/D3D12",
+ REXCVAR_DECLARE(bool, d3d12_ssx_dlaa);
+ REXCVAR_DECLARE(bool, d3d12_ssx_quality);
+ REXCVAR_DECLARE(bool, d3d12_gpu_profile);
++REXCVAR_DEFINE_BOOL(d3d12_ssx_fg_inputs, false, "GPU/D3D12",
++                    "Collect the SSX post-effects, pre-HUD color candidate for FG integration. "
++                    "Diagnostics only; does not enable Frame Generation.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ namespace rex::graphics::d3d12 {
+ bool D3D12CommandProcessor::SsxJitterTranslationEnabled() const {
+@@ -222,6 +227,7 @@ bool D3D12CommandProcessor::CopySsxInputTexture(SsxInput role, uint32_t fetch, D
+ 
+ void D3D12CommandProcessor::CollectSsxFrameInputs(uint64_t vs, uint64_t ps,
+                                                   const draw_util::ViewportInfo& viewport) {
++  CollectSsxHudless(vs, ps, viewport);
+   if (!REXCVAR_GET(d3d12_ssx_frame_inputs) || ssx_title_id_ != 0x4541096D ||
+       (ssx_other_render_target_cache_ && render_target_cache_->draw_resolution_scale_x() != 2))
+     return;
+@@ -332,6 +338,67 @@ void D3D12CommandProcessor::CollectSsxFrameInputs(uint64_t vs, uint64_t ps,
+   }
+ }
+ 
++void D3D12CommandProcessor::CollectSsxHudless(uint64_t vs, uint64_t ps,
++                                              const draw_util::ViewportInfo& viewport) {
++  // race-f8 event 9754: a pure tf0 copy after final post-effects (9727),
++  // followed by the game's 1280x720 HUD draws. Restrict this initial adapter
++  // to DLAA's single-scale path; Quality is no longer the user's priority.
++  if (!REXCVAR_GET(d3d12_ssx_fg_inputs) || !REXCVAR_GET(d3d12_ssx_frame_inputs) ||
++      ssx_title_id_ != 0x4541096D || ssx_other_render_target_cache_ || !ssx_inputs_ ||
++      ssx_inputs_->metadata.guest_frame != frame_current_ || vs != 0xE930F82AAE4ACF59ull ||
++      ps != 0xE7D07D83F716C69Dull)
++    return;
++  const auto sx = render_target_cache_->draw_resolution_scale_x();
++  const auto sy = render_target_cache_->draw_resolution_scale_y();
++  if (viewport.xy_offset[0] || viewport.xy_offset[1] || viewport.xy_extent[0] != 1280 * sx ||
++      viewport.xy_extent[1] != 720 * sy)
++    return;
++  auto& f = ssx_inputs_->metadata;
++  if (f.fg_hudless_captured || f.fg_hudless_failed) {
++    f.fg_hudless_duplicate = true;
++    return;
++  }
++  f.fg_hudless_failed = true;
++  f.fg_hudless_draw = ssx_scene_draw_;
++  D3D12TextureCache::ActiveTextureSnapshotSource source;
++  if (!texture_cache_->GetActiveTextureSnapshotSource(0, source))
++    return;
++  const auto desc = source.resource->GetDesc();
++  if (!source.scaled || desc.Format != DXGI_FORMAT_R8G8B8A8_TYPELESS || desc.MipLevels != 1 ||
++      source.guest_width != f.scene_width || source.guest_height != f.scene_height ||
++      desc.Width != f.scene_width * sx || desc.Height != f.scene_height * sy)
++    return;
++  auto& snapshot = ssx_inputs_->fg_hudless;
++  bool created = false;
++  if (!snapshot.Prepare(GetD3D12Provider().GetDevice(), desc.Format, uint32_t(desc.Width),
++                        desc.Height, created))
++    return;
++  snapshot.resource->SetName(L"SSX post-effects pre-HUD candidate");
++  snapshot.view_format = DXGI_FORMAT_R8G8B8A8_UNORM;
++  snapshot.source_mip = 0;
++  snapshot.guest_address = source.guest_address;
++  snapshot.host_swizzle = source.host_swizzle;
++  snapshot.swizzled_signs = source.swizzled_signs;
++  snapshot.guest_fetch = source.guest_fetch;
++  PushTransitionBarrier(source.resource, source.state, D3D12_RESOURCE_STATE_COPY_SOURCE);
++  if (!created)
++    PushTransitionBarrier(snapshot.resource.Get(), GuestInputTexture::kReadState,
++                          D3D12_RESOURCE_STATE_COPY_DEST);
++  SubmitBarriers();
++  D3D12_TEXTURE_COPY_LOCATION from{}, to{};
++  from.pResource = source.resource;
++  from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++  to.pResource = snapshot.resource.Get();
++  to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++  deferred_command_list_.D3DCopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
++  std::array<D3D12_RESOURCE_BARRIER, 3> restore;
++  const auto count = snapshot.GetCopyRestoreBarriers(source.resource, source.state, 0, restore);
++  deferred_command_list_.D3DResourceBarrier(count, restore.data());
++  ssx_inputs_->last_copy_submission = submission_current_;
++  f.fg_hudless_captured = true;
++  f.fg_hudless_failed = false;
++}
++
+ bool D3D12CommandProcessor::ReconstructSsxScene(uint64_t vs, uint64_t ps,
+     const draw_util::ViewportInfo& viewport, bool& restarted) {
+   using namespace ui::d3d12;
+@@ -379,10 +446,15 @@ bool D3D12CommandProcessor::ReconstructSsxScene(uint64_t vs, uint64_t ps,
+   // Separate lists isolate DLSS/native-motion binding changes from guest draws.
+   if (!ssx_reconstruction_) ssx_reconstruction_ = std::make_unique<SsxReconstruction>();
+   const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
++  ui::GuestFrameTiming::Get().Add(ui::GuestFrameTiming::Event::kReconstructionBegin,
++                                  frame_current_);
+   const auto result = ssx_reconstruction_->Submit(
+       GetD3D12Provider(), frozen, source.resource, source.state, seconds,
+       ssx_other_render_target_cache_ ? Streamline::Quality::kQuality : Streamline::Quality::kDLAA,
+-      REXCVAR_GET(d3d12_gpu_profile));
++      REXCVAR_GET(d3d12_gpu_profile), REXCVAR_GET(d3d12_ssx_fg_inputs));
++  ui::GuestFrameTiming::Get().Add(ui::GuestFrameTiming::Event::kReconstructionEnd, frame_current_,
++                                  0, result.applied);
++  ssx_inputs_->fg_temporal = result.fg_temporal;
+   if (result.submitted) NotifyQueueOperationsDoneDirectly();
+   if (!result.applied) ssx_reconstruction_failed_ = true;
+   if (!result.applied || !ssx_reconstruction_log_frame_ || frame_current_-ssx_reconstruction_log_frame_ >= 120) {
+@@ -404,12 +476,24 @@ bool D3D12CommandProcessor::ReconstructSsxScene(uint64_t vs, uint64_t ps,
+ }
+ 
+ std::shared_ptr<const ui::d3d12::SsxFrameInputs> D3D12CommandProcessor::SealSsxFrameInputs(
+-    uint32_t width, uint32_t height) {
++    uint32_t width, uint32_t height, bool gamma_pwl) {
+   if (!REXCVAR_GET(d3d12_ssx_frame_inputs))
+     return nullptr;
+   bool log = !ssx_last_input_log_frame_ || frame_current_ - ssx_last_input_log_frame_ >= 120;
+   if (log)
+     ssx_last_input_log_frame_ = frame_current_;
++  if (log && REXCVAR_GET(d3d12_ssx_fg_inputs) && ssx_inputs_ &&
++      ssx_inputs_->metadata.guest_frame == frame_current_) {
++    const auto& f = ssx_inputs_->metadata;
++    const auto& t = ssx_inputs_->fg_hudless;
++    REXGPU_INFO(
++        "SSX_FG_INPUT frame={} captured={} failed={} duplicate={} draw={} extent={}x{} "
++        "view_format={} swizzle={:X} signs={:X} retained_motion={} fg_active=false",
++        frame_current_, f.fg_hudless_captured, f.fg_hudless_failed, f.fg_hudless_duplicate,
++        f.fg_hudless_draw, f.fg_hudless_captured ? t.width : 0,
++        f.fg_hudless_captured ? t.height : 0, uint32_t(t.view_format), t.host_swizzle,
++        t.swizzled_signs, bool(ssx_inputs_->fg_temporal));
++  }
+   if (!ssx_inputs_ || ssx_inputs_->metadata.guest_frame != frame_current_) {
+     if (log)
+       REXGPU_INFO("SSX_INPUTS frame={} title={:08X} packet=missing reason={} dlss_ready=false",
+@@ -418,6 +502,13 @@ std::shared_ptr<const ui::d3d12::SsxFrameInputs> D3D12CommandProcessor::SealSsxF
+     return nullptr;
+   }
+   auto& data = ssx_inputs_->metadata;
++  if (REXCVAR_GET(d3d12_ssx_fg_inputs)) {
++    data.fg_gamma_pwl = gamma_pwl;
++    std::memcpy(data.fg_gamma_ramp.data(),
++                gamma_pwl ? static_cast<const void*>(gamma_ramp_pwl_rgb())
++                          : static_cast<const void*>(gamma_ramp_256_entry_table()),
++                (gamma_pwl ? 384 : 256) * sizeof(uint32_t));
++  }
+   data.jittered_draws = ssx_jitter_frame_ == frame_current_ ? ssx_jittered_draws_ : 0;
+   data.jitter_skipped_draws = ssx_jitter_frame_ == frame_current_ ? ssx_jitter_skipped_draws_ : 0;
+   if (log && data.jitter_enabled)
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+index 1254710..9ce1441 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+@@ -1,3 +1,4 @@
++#include <rex/ui/guest_frame_timing.h>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -507,12 +508,22 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+   dwords[offset++] = gpu_fetch.dword_4;
+   dwords[offset++] = gpu_fetch.dword_5;
+ 
+-  dwords[offset++] = xenos::MakePacketType3(xenos::PM4_XE_SWAP, 4);
++  auto& timing = ui::GuestFrameTiming::Get();
++  const uint64_t timing_id = timing.capturing() ? timing.NewId() : 0;
++  if (timing_id)
++    timing.Add(ui::GuestFrameTiming::Event::kGuestSwap, timing_id,
++               ui::GuestFrameTiming::CurrentRender(), frontbuffer_physical_address);
++  dwords[offset++] = xenos::MakePacketType3(xenos::PM4_XE_SWAP, timing_id ? 7 : 4);
+   dwords[offset++] = rex::graphics::xenos::kSwapSignature;
+   dwords[offset++] = frontbuffer_physical_address;
+ 
+   dwords[offset++] = *width;
+   dwords[offset++] = *height;
++  if (timing_id) {
++    dwords[offset++] = ui::kGuestTimingSwapSignature;
++    dwords[offset++] = uint32_t(timing_id);
++    dwords[offset++] = uint32_t(timing_id >> 32);
++  }
+ 
+   // Fill the rest of the buffer with NOP packets.
+   for (uint32_t i = offset; i < 64; i++) {
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index ae25e87..649bc54 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -2,6 +2,7 @@
+ 
+ # Core UI sources
+ set(REXUI_CORE_SOURCES
++    guest_frame_timing.cpp
+     graphics_upload_buffer_pool.cpp
+     graphics_util.cpp
+     image_decode.cpp
+@@ -68,6 +69,8 @@ if(REXGLUE_USE_D3D12)
+         d3d12/ssx_scene_color.cpp
+         d3d12/ssx_reconstruction.cpp
+         d3d12/ssx_reconstruction_camera.cpp
++        d3d12/ssx_fg_capture.cpp
++        d3d12/ssx_fg_color.cpp
+     )
+ endif()
+ 
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index b7e4cd5..3d4fd76 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -1,3 +1,4 @@
++#include <rex/ui/guest_frame_timing.h>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -553,6 +554,7 @@ bool D3D12Presenter::RefreshGuestOutputImpl(
+   // The base presenter publishes this mailbox only on success, under its normal
+   // producer/consumer synchronization. Missing inputs explicitly replace old ones.
+   guest_frame_inputs_[mailbox_index] = refresher_succeeded ? context.frame_inputs() : nullptr;
++  guest_timing_ids_[mailbox_index] = refresher_succeeded ? context.timing_id() : 0;
+   // Even if the refresher has returned false, it still might have submitted
+   // some commands referencing the resource. It's better to put an excessive
+   // signal and wait slightly longer, for nothing important, while shutting down
+@@ -614,6 +616,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   GuestOutputPaintConfig guest_output_paint_config;
+   Microsoft::WRL::ComPtr<ID3D12Resource> guest_output_resource;
+   std::shared_ptr<const SsxFrameInputs> frame_inputs;
++  uint64_t timing_id = 0;
+   {
+     uint32_t guest_output_mailbox_index;
+     std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
+@@ -621,6 +624,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+     if (guest_output_mailbox_index != UINT32_MAX) {
+       guest_output_resource = guest_output_resources_[guest_output_mailbox_index].second;
+       frame_inputs = guest_frame_inputs_[guest_output_mailbox_index];
++      timing_id = guest_timing_ids_[guest_output_mailbox_index];
+     }
+     // Incremented the reference count of the guest output resource - safe to
+     // leave the consumer critical section now as everything here either will be
+@@ -629,6 +633,8 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   }
+ 
+   const auto inputs_completed = paint_context_.paint_submission_tracker.GetCompletedSubmission();
++  paint_context_.fg_capture.Record(device, command_list, frame_inputs, guest_output_resource.Get(),
++                                   current_paint_submission, inputs_completed);
+   std::erase_if(paint_context_.frame_input_paint_refs,
+                 [inputs_completed](const auto& ref) { return ref.first <= inputs_completed; });
+   if (frame_inputs) {
+@@ -1216,7 +1222,10 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   barrier_rtv_to_present.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+   command_list->ResourceBarrier(1, &barrier_rtv_to_present);
+ 
+-  // Execute and present.
++  // Execute and present. IDs identify the guest image, so repeated UI paints
++  // retain the same ID and cannot be mistaken for new simulation frames.
++  GuestFrameTiming::Get().Add(GuestFrameTiming::Event::kHostSubmit, timing_id,
++                              current_paint_submission);
+   command_list->Close();
+   ID3D12CommandList* execute_command_list = command_list;
+   provider_.GetDirectQueue()->ExecuteCommandLists(1, &execute_command_list);
+@@ -1232,9 +1241,13 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   // fullscreen is ever used in, the allow tearing flag must not be passed in
+   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
+   // presentation model used in Direct3D 12).
++  GuestFrameTiming::Get().Add(GuestFrameTiming::Event::kPresentBegin, timing_id,
++                              current_paint_submission);
+   HRESULT present_result = paint_context_.swap_chain->Present(
+       0, DXGI_PRESENT_RESTART |
+              (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
++  GuestFrameTiming::Get().Add(GuestFrameTiming::Event::kPresentEnd, timing_id,
++                              current_paint_submission, uint32_t(present_result));
+   // Even if presentation has failed, work might have been enqueued anyway
+   // internally before the failure according to Jesse Natalie from the DirectX
+   // Discord server.
+diff --git a/src/ui/d3d12/guest_frame_inputs.cpp b/src/ui/d3d12/guest_frame_inputs.cpp
+index 9d23c45..46ab423 100644
+--- a/src/ui/d3d12/guest_frame_inputs.cpp
++++ b/src/ui/d3d12/guest_frame_inputs.cpp
+@@ -12,10 +12,11 @@ bool GuestInputTexture::Prepare(ID3D12Device* device, DXGI_FORMAT format, uint32
+       bool(resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) ==
+           unordered_access)
+     return true;
+-  // These are the three observed SSX input storage formats. Do not silently
+-  // reinterpret a different resource as depth/color/exposure.
++  // Observed SSX input storage formats, including the post-effects FG candidate.
++  // Include the native-motion output format, without reinterpreting storage.
+   if (format != DXGI_FORMAT_R16G16B16A16_FLOAT && format != DXGI_FORMAT_R32_FLOAT &&
+-      format != DXGI_FORMAT_R16_TYPELESS)
++      format != DXGI_FORMAT_R16_TYPELESS && format != DXGI_FORMAT_R8G8B8A8_TYPELESS &&
++      format != DXGI_FORMAT_R32G32_FLOAT)
+     return false;
+   D3D12_RESOURCE_DESC desc{};
+   desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+diff --git a/src/ui/d3d12/ssx_fg_capture.cpp b/src/ui/d3d12/ssx_fg_capture.cpp
+new file mode 100644
+index 0000000..533f71b
+--- /dev/null
++++ b/src/ui/d3d12/ssx_fg_capture.cpp
+@@ -0,0 +1,138 @@
++#include <rex/ui/d3d12/ssx_fg_capture.h>
++#include <rex/cvar.h>
++#include <rex/logging.h>
++#include <fstream>
++#include <chrono>
++
++REXCVAR_DEFINE_STRING(d3d12_ssx_fg_capture_path, "", "UI/D3D12",
++                      "Local FG-input diagnostics. Create capture.request here for one paired "
++                      "post-effects source and final guest-image readback. FG stays disabled.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++namespace rex::ui::d3d12 {
++void SsxFGCapture::Complete(uint64_t completed) {
++  if (!readback_ || completed < submission_)
++    return;
++  void* data = nullptr;
++  D3D12_RANGE range{0, size_t(bytes_)};
++  if (SUCCEEDED(readback_->Map(0, &range, &data))) {
++    try {
++      if (!std::filesystem::create_directories(directory_))
++        throw std::runtime_error("capture directory exists");
++      const char* names[] = {"post-effects.bin", "final-guest.bin"};
++      for (size_t i = 0; i < 2; ++i) {
++        std::ofstream file;
++        file.exceptions(std::ios::failbit | std::ios::badbit);
++        file.open(directory_ / names[i], std::ios::binary);
++        const auto& fp = footprints_[i];
++        for (uint32_t y = 0; y < fp.Footprint.Height; ++y)
++          file.write(
++              static_cast<const char*>(data) + fp.Offset + uint64_t(y) * fp.Footprint.RowPitch,
++              uint64_t(fp.Footprint.Width) * 4);
++        file.close();
++      }
++      std::ofstream json;
++      json.exceptions(std::ios::failbit | std::ios::badbit);
++      json.open(directory_ / "metadata.partial");
++      const auto& m = frame_->metadata;
++      const auto& t = frame_->fg_hudless;
++      json << "{\n\"guest_frame\":" << m.guest_frame << ",\n\"source_width\":" << t.width
++           << ",\n\"source_height\":" << t.height << ",\n\"source_format\":\"RGBA8_TYPELESS\","
++           << "\n\"final_width\":" << footprints_[1].Footprint.Width
++           << ",\n\"final_height\":" << footprints_[1].Footprint.Height
++           << ",\n\"final_format\":\"R10G10B10A2_UNORM\",\n\"source_swizzle\":" << t.host_swizzle
++           << ",\n\"source_signs\":" << t.swizzled_signs << ",\n\"source_fetch\":[";
++      for (unsigned i = 0; i < 6; ++i)
++        json << (i ? "," : "") << t.guest_fetch[i];
++      json << "],\n\"candidate_draw\":" << m.fg_hudless_draw
++           << ",\n\"gamma_pwl\":" << (m.fg_gamma_pwl ? "true" : "false") << ",\n\"gamma_ramp\":[";
++      for (unsigned i = 0; i < (m.fg_gamma_pwl ? 384u : 256u); ++i)
++        json << (i ? "," : "") << m.fg_gamma_ramp[i];
++      json << "],\n\"retained_motion\":" << (frame_->fg_temporal ? "true" : "false")
++           << ",\n\"fg_enabled\":false\n}\n";
++      json.close();
++      std::filesystem::rename(directory_ / "metadata.partial", directory_ / "metadata.json");
++      REXGPU_INFO("SSX_FG_CAPTURE saved frame={} path={}", m.guest_frame, directory_.string());
++    } catch (const std::exception& e) {
++      REXGPU_WARN("SSX_FG_CAPTURE write failed: {}", e.what());
++    }
++    D3D12_RANGE empty{};
++    readback_->Unmap(0, &empty);
++  } else
++    REXGPU_WARN("SSX_FG_CAPTURE Map failed");
++  readback_.Reset();
++  final_.Reset();
++  frame_.reset();
++  directory_.clear();
++}
++
++void SsxFGCapture::Record(ID3D12Device* device, ID3D12GraphicsCommandList* list,
++                          const std::shared_ptr<const SsxFrameInputs>& frame,
++                          ID3D12Resource* final_color, uint64_t submission, uint64_t completed) {
++  Complete(completed);
++  if (readback_ || !frame || !final_color || !frame->fg_hudless.resource ||
++      !frame->metadata.fg_hudless_captured || frame->metadata.fg_hudless_failed ||
++      frame->metadata.fg_hudless_duplicate || !frame->metadata.camera_samples ||
++      !frame->metadata.depth_before_lighting)
++    return;
++  const auto path = REXCVAR_GET(d3d12_ssx_fg_capture_path);
++  if (path.empty())
++    return;
++  const auto request = std::filesystem::path(path) / "capture.request";
++  std::error_code ec;
++  if (!std::filesystem::is_regular_file(request, ec))
++    return;
++  ID3D12Resource* sources[] = {frame->fg_hudless.resource.Get(), final_color};
++  if (sources[0]->GetDesc().Format != DXGI_FORMAT_R8G8B8A8_TYPELESS ||
++      sources[1]->GetDesc().Format != DXGI_FORMAT_R10G10B10A2_UNORM)
++    return;
++  bytes_ = 0;
++  for (unsigned i = 0; i < 2; ++i) {
++    const auto desc = sources[i]->GetDesc();
++    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
++        desc.MipLevels != 1 || desc.DepthOrArraySize != 1)
++      return;
++    device->GetCopyableFootprints(&desc, 0, 1, (bytes_ + 511) & ~uint64_t(511), &footprints_[i],
++                                  nullptr, nullptr, nullptr);
++    bytes_ = footprints_[i].Offset + uint64_t(footprints_[i].Footprint.RowPitch) * desc.Height;
++  }
++  D3D12_HEAP_PROPERTIES heap{};
++  heap.Type = D3D12_HEAP_TYPE_READBACK;
++  D3D12_RESOURCE_DESC buffer{};
++  buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++  buffer.Width = bytes_;
++  buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = buffer.SampleDesc.Count = 1;
++  buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++  if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer,
++                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
++                                             IID_PPV_ARGS(&readback_))))
++    return;
++  for (unsigned i = 0; i < 2; ++i) {
++    D3D12_RESOURCE_BARRIER barrier{};
++    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    barrier.Transition = {
++        sources[i], D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
++        i ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : GuestInputTexture::kReadState,
++        D3D12_RESOURCE_STATE_COPY_SOURCE};
++    list->ResourceBarrier(1, &barrier);
++    D3D12_TEXTURE_COPY_LOCATION from{}, to{};
++    from.pResource = sources[i];
++    from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++    to.pResource = readback_.Get();
++    to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++    to.PlacedFootprint = footprints_[i];
++    list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
++    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
++    list->ResourceBarrier(1, &barrier);
++  }
++  frame_ = frame;
++  final_ = final_color;
++  submission_ = submission;
++  const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
++  directory_ =
++      std::filesystem::path(path) /
++      ("frame-" + std::to_string(frame->metadata.guest_frame) + "-" + std::to_string(unique));
++  std::filesystem::remove(request, ec);
++  REXGPU_INFO("SSX_FG_CAPTURE queued frame={} bytes={}", frame->metadata.guest_frame, bytes_);
++}
++}  // namespace rex::ui::d3d12
+diff --git a/src/ui/d3d12/ssx_fg_color.cpp b/src/ui/d3d12/ssx_fg_color.cpp
+new file mode 100644
+index 0000000..b615099
+--- /dev/null
++++ b/src/ui/d3d12/ssx_fg_color.cpp
+@@ -0,0 +1,166 @@
++#include <rex/ui/d3d12/ssx_fg_color.h>
++#include <rex/ui/d3d12/d3d12_provider.h>
++#include <rex/ui/d3d12/d3d12_util.h>
++#include <cstring>
++#include <algorithm>
++
++namespace rex::ui::d3d12 {
++namespace {
++#include "ui/shaders/bytecode/d3d12_5_1/ssx_fg_color_cs.h"
++using Microsoft::WRL::ComPtr;
++struct Constants {
++  uint32_t width, height, reserved[2];
++  std::array<uint32_t, 256> gamma;
++};
++void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
++                D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
++  D3D12_RESOURCE_BARRIER b{};
++  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++  b.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
++  list->ResourceBarrier(1, &b);
++}
++}  // namespace
++bool CanBuildSsxFGColor(const SsxFrameInputs& input, uint32_t width, uint32_t height) {
++  const auto& m = input.metadata;
++  const auto& t = input.fg_hudless;
++  // Deliberately limited to the measured DLAA full-screen composition. Window
++  // scaling, PWL ramps and arbitrary/cropped guest UVs need their own validation.
++  if (!m.fg_hudless_captured || m.fg_hudless_failed || m.fg_hudless_duplicate || m.fg_gamma_pwl ||
++      !m.depth_before_lighting || !m.camera_samples || m.camera_conflict || m.scale_x != 3 ||
++      m.scale_y != 3 || !IsKnownSsxScene(m.scene_width, m.scene_height) || width != 3840 ||
++      height != 2160 || m.output_width != width || m.output_height != height ||
++      t.width != m.scene_width * 3 || t.height != m.scene_height * 3 ||
++      t.view_format != DXGI_FORMAT_R8G8B8A8_UNORM || t.host_swizzle != 0x60A || t.swizzled_signs ||
++      !t.resource)
++    return false;
++  const auto d = t.resource->GetDesc();
++  return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.MipLevels == 1 &&
++         d.DepthOrArraySize == 1 && d.SampleDesc.Count == 1 &&
++         d.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS && d.Width == t.width && d.Height == t.height;
++}
++
++struct SsxFGColor::Impl {
++  struct Slot {
++    std::shared_ptr<SsxFGColorFrame> output = std::make_shared<SsxFGColorFrame>();
++    ComPtr<ID3D12DescriptorHeap> heap;
++    ComPtr<ID3D12Resource> constants;
++  };
++  std::array<Slot, 6> slots;
++  ComPtr<ID3D12RootSignature> root;
++  ComPtr<ID3D12PipelineState> pipeline;
++  bool Initialize(const D3D12Provider& provider) {
++    if (pipeline)
++      return true;
++    D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0},
++                                       {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 1}};
++    D3D12_ROOT_PARAMETER params[2]{};
++    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
++    params[0].Descriptor = {0, 0};
++    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    params[1].DescriptorTable = {2, ranges};
++    D3D12_STATIC_SAMPLER_DESC sampler{};
++    sampler.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
++    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++    sampler.MaxLOD = D3D12_FLOAT32_MAX;
++    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
++    D3D12_ROOT_SIGNATURE_DESC desc{};
++    desc.NumParameters = 2;
++    desc.pParameters = params;
++    desc.NumStaticSamplers = 1;
++    desc.pStaticSamplers = &sampler;
++    root.Attach(util::CreateRootSignature(provider, desc));
++    if (!root)
++      return false;
++    pipeline.Attach(util::CreateComputePipeline(provider.GetDevice(), ssx_fg_color_cs,
++                                                sizeof(ssx_fg_color_cs), root.Get()));
++    return bool(pipeline);
++  }
++  bool Prepare(ID3D12Device* device, Slot& slot, uint32_t width, uint32_t height) {
++    if (slot.output->color && slot.heap && slot.constants)
++      return true;
++    D3D12_DESCRIPTOR_HEAP_DESC heap{};
++    heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
++    heap.NumDescriptors = 2;
++    heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
++    if (!slot.heap && FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&slot.heap))))
++      return false;
++    D3D12_RESOURCE_DESC buffer{};
++    util::FillBufferResourceDesc(buffer, (sizeof(Constants) + 255) & ~size_t(255),
++                                 D3D12_RESOURCE_FLAG_NONE);
++    if (!slot.constants &&
++        FAILED(device->CreateCommittedResource(&util::kHeapPropertiesUpload, D3D12_HEAP_FLAG_NONE,
++                                               &buffer, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
++                                               IID_PPV_ARGS(&slot.constants))))
++      return false;
++    D3D12_RESOURCE_DESC texture{};
++    texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++    texture.Width = width;
++    texture.Height = height;
++    texture.DepthOrArraySize = texture.MipLevels = texture.SampleDesc.Count = 1;
++    texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++    if (!slot.output->color &&
++        FAILED(device->CreateCommittedResource(&util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE,
++                                               &texture, GuestInputTexture::kReadState, nullptr,
++                                               IID_PPV_ARGS(&slot.output->color))))
++      return false;
++    slot.output->color->SetName(L"SSX display gamma matched HUDless color");
++    return true;
++  }
++};
++SsxFGColor::SsxFGColor() : impl_(std::make_unique<Impl>()) {}
++SsxFGColor::~SsxFGColor() = default;
++std::shared_ptr<SsxFGColorFrame> SsxFGColor::Record(
++    const D3D12Provider& provider, ID3D12GraphicsCommandList* list,
++    const std::shared_ptr<const SsxFrameInputs>& frame, uint32_t width, uint32_t height,
++    uint64_t submission, uint64_t completed) {
++  if (!list || !frame || !CanBuildSsxFGColor(*frame, width, height) || !impl_->Initialize(provider))
++    return {};
++  auto* device = provider.GetDevice();
++  for (auto& slot : impl_->slots) {
++    auto& out = slot.output;
++    if (out.use_count() != 1 || out->submission > completed ||
++        (out->fg_fence && out->fg_fence->GetCompletedValue() < out->fg_fence_value))
++      continue;
++    if (!impl_->Prepare(device, slot, width, height))
++      return {};
++    Constants k{width, height, {0, 0}, {}};
++    std::copy_n(frame->metadata.fg_gamma_ramp.begin(), 256, k.gamma.begin());
++    void* mapped = nullptr;
++    D3D12_RANGE none{};
++    if (FAILED(slot.constants->Map(0, &none, &mapped)))
++      return {};
++    std::memcpy(mapped, &k, sizeof(k));
++    slot.constants->Unmap(0, nullptr);
++    auto handle = slot.heap->GetCPUDescriptorHandleForHeapStart();
++    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
++    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++    srv.Texture2D.MipLevels = 1;
++    srv.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(2, 1, 0, 3);
++    device->CreateShaderResourceView(frame->fg_hudless.resource.Get(), &srv, handle);
++    handle.ptr += provider.GetViewDescriptorSize();
++    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
++    uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
++    device->CreateUnorderedAccessView(out->color.Get(), nullptr, &uav, handle);
++    Transition(list, out->color.Get(), GuestInputTexture::kReadState,
++               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++    auto* heap = slot.heap.Get();
++    list->SetDescriptorHeaps(1, &heap);
++    list->SetComputeRootSignature(impl_->root.Get());
++    list->SetPipelineState(impl_->pipeline.Get());
++    list->SetComputeRootConstantBufferView(0, slot.constants->GetGPUVirtualAddress());
++    list->SetComputeRootDescriptorTable(1, heap->GetGPUDescriptorHandleForHeapStart());
++    list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
++    Transition(list, out->color.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++               GuestInputTexture::kReadState);
++    out->input = frame;
++    out->submission = submission;
++    out->fg_fence.Reset();
++    out->fg_fence_value = 0;
++    return out;
++  }
++  return {};
++}
++}  // namespace rex::ui::d3d12
+diff --git a/src/ui/d3d12/ssx_reconstruction.cpp b/src/ui/d3d12/ssx_reconstruction.cpp
+index 5ff1e06..00a6159 100644
+--- a/src/ui/d3d12/ssx_reconstruction.cpp
++++ b/src/ui/d3d12/ssx_reconstruction.cpp
+@@ -48,6 +48,7 @@ struct SsxReconstruction::Impl {
+   SsxCameraMotion camera;
+   SsxNativeMotion native;
+   SsxSceneColor color;
++  SsxFGTemporalPool fg_temporal_pool;
+   Streamline* sr = nullptr;
+   ComPtr<ID3D12RootSignature> root;
+   ComPtr<ID3D12PipelineState> pipeline;
+@@ -146,7 +147,7 @@ SsxReconstruction::~SsxReconstruction() = default;
+ SsxReconstruction::Result SsxReconstruction::Submit(
+     const D3D12Provider& provider, const std::shared_ptr<const SsxFrameInputs>& frame,
+     ID3D12Resource* destination, D3D12_RESOURCE_STATES destination_state, double seconds,
+-    Streamline::Quality quality, bool profile) {
++    Streamline::Quality quality, bool profile, bool retain_fg_inputs) {
+   auto& p = *impl_;
+   Result result;
+   if (!frame || !destination) {
+@@ -268,6 +269,7 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+   const auto native = p.native.Record(provider, list, frame, motion, submission, completed);
+   stamp(1);
+   bool evaluated = false;
++  std::shared_ptr<SsxFGTemporal> fg_temporal;
+   Streamline::SRFrame sr_frame;
+   sr_frame.id = f.guest_frame;
+   sr_frame.jitter_pixels = f.jitter_pixels;
+@@ -293,6 +295,31 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+     result.reset = evaluation.history_reset;
+     result.reason = "evaluate";
+     if (evaluation.recorded) {
++      if (retain_fg_inputs && quality == Streamline::Quality::kDLAA) {
++        fg_temporal = p.fg_temporal_pool.Acquire(f.guest_frame, completed);
++        bool created = false;
++        if (fg_temporal &&
++            fg_temporal->motion.Prepare(provider.GetDevice(), DXGI_FORMAT_R32G32_FLOAT,
++                                        decode.width, decode.height, created)) {
++          auto* retained = fg_temporal->motion.resource.Get();
++          retained->SetName(L"SSX retained DLAA camera and object motion for FG");
++          if (!created)
++            Transition(list, retained, GuestInputTexture::kReadState,
++                       D3D12_RESOURCE_STATE_COPY_DEST);
++          Transition(list, sr_frame.motion, GuestInputTexture::kReadState,
++                     D3D12_RESOURCE_STATE_COPY_SOURCE);
++          list->CopyResource(retained, sr_frame.motion);
++          Transition(list, sr_frame.motion, D3D12_RESOURCE_STATE_COPY_SOURCE,
++                     GuestInputTexture::kReadState);
++          Transition(list, retained, D3D12_RESOURCE_STATE_COPY_DEST, GuestInputTexture::kReadState);
++          fg_temporal->motion.view_format = DXGI_FORMAT_R32G32_FLOAT;
++          fg_temporal->camera = sr_frame.camera;
++          fg_temporal->jitter_pixels = sr_frame.jitter_pixels;
++          fg_temporal->reset = evaluation.history_reset;
++          fg_temporal->depth_inverted = sr_frame.depth_inverted;
++        } else
++          fg_temporal.reset();
++      }
+       auto* device = provider.GetDevice();
+       auto handle = slot.heap->GetCPUDescriptorHandleForHeapStart();
+       const auto step =
+@@ -362,11 +389,15 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+   ID3D12CommandList* lists[] = {list};
+   provider.GetDirectQueue()->ExecuteCommandLists(1, lists);
+   slot.submission = submission;
++  if (fg_temporal)
++    fg_temporal->submission = submission;
+   result.submitted = true;
+   if (!p.tracker.NextSubmission()) {
+     result.applied = false;
+     result.reason = "signal";
+   }
++  if (result.applied)
++    result.fg_temporal = std::move(fg_temporal);
+   return result;
+ }
+ }  // namespace rex::ui::d3d12
+diff --git a/src/ui/d3d12/streamline.cpp b/src/ui/d3d12/streamline.cpp
+index 232e1eb..2bd309e 100644
+--- a/src/ui/d3d12/streamline.cpp
++++ b/src/ui/d3d12/streamline.cpp
+@@ -41,6 +41,72 @@ bool Check(sl::Result result, const char* operation) {
+   REXGPU_WARN("Streamline {} failed: {}", operation, sl::getResultAsStr(result));
+   return false;
+ }
++bool ValidCamera(const Streamline::SRCamera& c, const std::array<float, 2>& jitter) {
++  auto finite = [](const auto& values) {
++    return std::all_of(values.begin(), values.end(), [](float x) { return std::isfinite(x); });
++  };
++  if (!finite(c.view_to_clip) || !finite(c.clip_to_view) || !finite(c.clip_to_previous) ||
++      !finite(c.previous_to_clip) || !finite(c.position) || !finite(c.up) || !finite(c.right) ||
++      !finite(c.forward) || !finite(jitter) || !std::isfinite(c.far_plane) ||
++      !std::isfinite(c.vertical_fov) || !std::isfinite(c.aspect) ||
++      !(c.near_plane > 0 && c.far_plane > c.near_plane && c.vertical_fov > 0 &&
++        c.vertical_fov < 3.141593f && c.aspect > 0) ||
++      std::abs(jitter[0]) > 0.5f || std::abs(jitter[1]) > 0.5f)
++    return false;
++  auto inverse_pair = [](const auto& a, const auto& b) {
++    for (unsigned row = 0; row < 4; ++row) {
++      for (unsigned col = 0; col < 4; ++col) {
++        double value = 0;
++        for (unsigned k = 0; k < 4; ++k)
++          value += double(a[row * 4 + k]) * b[k * 4 + col];
++        if (std::abs(value - (row == col ? 1.0 : 0.0)) > 0.01)
++          return false;
++      }
++    }
++    return true;
++  };
++  if (!inverse_pair(c.view_to_clip, c.clip_to_view) ||
++      !inverse_pair(c.clip_to_previous, c.previous_to_clip))
++    return false;
++  auto dot = [](const auto& a, const auto& b) {
++    return double(a[0]) * b[0] + double(a[1]) * b[1] + double(a[2]) * b[2];
++  };
++  if (std::abs(dot(c.up, c.up) - 1) > 0.01 || std::abs(dot(c.right, c.right) - 1) > 0.01 ||
++      std::abs(dot(c.forward, c.forward) - 1) > 0.01 || std::abs(dot(c.up, c.right)) > 0.01 ||
++      std::abs(dot(c.up, c.forward)) > 0.01 || std::abs(dot(c.right, c.forward)) > 0.01)
++    return false;
++  return true;
++}
++sl::Constants FrameConstants(const Streamline::SRCamera& c, const std::array<float, 2>& jitter,
++                             uint32_t width, uint32_t height, bool depth_inverted, bool reset) {
++  sl::Constants constants{};
++  auto matrix = [](sl::float4x4& out, const std::array<float, 16>& in) {
++    for (unsigned i = 0; i < 4; ++i)
++      out[i] = {in[i * 4], in[i * 4 + 1], in[i * 4 + 2], in[i * 4 + 3]};
++  };
++  matrix(constants.cameraViewToClip, c.view_to_clip);
++  matrix(constants.clipToCameraView, c.clip_to_view);
++  matrix(constants.clipToPrevClip, c.clip_to_previous);
++  matrix(constants.prevClipToClip, c.previous_to_clip);
++  constants.jitterOffset = {jitter[0], jitter[1]};
++  constants.mvecScale = {1.0f / width, 1.0f / height};
++  constants.cameraPinholeOffset = {0, 0};
++  constants.cameraPos = {c.position[0], c.position[1], c.position[2]};
++  constants.cameraUp = {c.up[0], c.up[1], c.up[2]};
++  constants.cameraRight = {c.right[0], c.right[1], c.right[2]};
++  constants.cameraFwd = {c.forward[0], c.forward[1], c.forward[2]};
++  constants.cameraNear = c.near_plane;
++  constants.cameraFar = c.far_plane;
++  constants.cameraFOV = c.vertical_fov;
++  constants.cameraAspectRatio = c.aspect;
++  constants.depthInverted = depth_inverted ? sl::Boolean::eTrue : sl::Boolean::eFalse;
++  constants.cameraMotionIncluded = sl::Boolean::eTrue;
++  constants.motionVectors3D = sl::Boolean::eFalse;
++  constants.motionVectorsJittered = sl::Boolean::eFalse;
++  constants.motionVectorsDilated = sl::Boolean::eFalse;
++  constants.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
++  return constants;
++}
+ sl::DLSSOptions SsxOptions(Streamline::Quality quality, uint32_t width, uint32_t height) {
+   sl::DLSSOptions options{};
+   switch (quality) {
+@@ -101,6 +167,14 @@ struct Streamline::Impl {
+   PFun_slDLSSGSetOptions* fg_options = nullptr;
+   PFun_slReflexGetState* reflex_state = nullptr;
+   PFun_slReflexSetOptions* reflex_options = nullptr;
++  PFun_slReflexSleep* reflex_sleep = nullptr;
++  PFun_slPCLSetMarker* pcl_marker = nullptr;
++  PFun_slPCLSetOptions* pcl_options = nullptr;
++  PFun_slPCLGetState* pcl_state = nullptr;
++  PFun_slSetFeatureLoaded* feature_loaded = nullptr;
++  ReflexMode reflex_mode = ReflexMode::kOff;
++  bool reflex_configured = false, fg_loaded = true, fg_active = false, fg_reset = true;
++  uint32_t ping_message = 0;
+   bool sr_configured = false, sr_attempted = false, sr_have_frame = false;
+   bool sr_reset = true;
+   Quality sr_quality = Quality::kQuality;
+@@ -131,7 +205,19 @@ struct Streamline::Impl {
+     return function != nullptr;
+   }
+ };
++struct Streamline::Frame {
++  Streamline* owner = nullptr;
++  sl::FrameToken* token = nullptr;
++  uint32_t token_id = 0;
++  unsigned phase = 0;
++  bool fg_tagged = false, sr_evaluated = false, reset = false;
++  SRCamera camera;
++  std::array<float, 2> jitter{};
++  uint32_t width = 0, height = 0;
++  bool depth_inverted = false;
++};
+ #else
++struct Streamline::Frame {};
+ struct Streamline::Impl {};
+ #endif
+ 
+@@ -179,7 +265,8 @@ bool Streamline::Initialize(const std::filesystem::path& directory) {
+       !impl_->Import(impl_->constants, "slSetConstants") ||
+       !impl_->Import(impl_->tag_frame, "slSetTagForFrame") ||
+       !impl_->Import(impl_->evaluate, "slEvaluateFeature") ||
+-      !impl_->Import(impl_->free_resources, "slFreeResources"))
++      !impl_->Import(impl_->free_resources, "slFreeResources") ||
++      !impl_->Import(impl_->feature_loaded, "slSetFeatureLoaded"))
+     return false;
+ 
+   const wchar_t* plugin_paths[] = {absolute_directory.c_str()};
+@@ -254,7 +341,8 @@ bool Streamline::Attach(ID3D12Device*& device, IDXGIFactory2*& factory) {
+   }
+   if (support_.reflex) {
+     if (!impl_->ImportFeature(impl_->reflex_options, sl::kFeatureReflex, "slReflexSetOptions") ||
+-        !impl_->ImportFeature(impl_->reflex_state, sl::kFeatureReflex, "slReflexGetState")) {
++        !impl_->ImportFeature(impl_->reflex_state, sl::kFeatureReflex, "slReflexGetState") ||
++        !impl_->ImportFeature(impl_->reflex_sleep, sl::kFeatureReflex, "slReflexSleep")) {
+       return false;
+     }
+     const sl::ReflexOptions options{};  // Must initialize even while disabled.
+@@ -265,6 +353,11 @@ bool Streamline::Attach(ID3D12Device*& device, IDXGIFactory2*& factory) {
+       support_.low_latency_available = state.lowLatencyAvailable;
+     }
+   }
++  if (support_.pcl &&
++      (!impl_->ImportFeature(impl_->pcl_marker, sl::kFeaturePCL, "slPCLSetMarker") ||
++       !impl_->ImportFeature(impl_->pcl_options, sl::kFeaturePCL, "slPCLSetOptions") ||
++       !impl_->ImportFeature(impl_->pcl_state, sl::kFeaturePCL, "slPCLGetState")))
++    return false;
+   // Retain originals so a partially failed upgrade can restore both references.
+   Microsoft::WRL::ComPtr<ID3D12Device> original_device(device);
+   Microsoft::WRL::ComPtr<IDXGIFactory2> original_factory(factory);
+@@ -359,39 +452,8 @@ Streamline::SREvaluation Streamline::EvaluateSR(ID3D12GraphicsCommandList* list,
+       frame.depth == frame.output || frame.motion == frame.output ||
+       (impl_->sr_have_frame && frame.id <= impl_->sr_frame))
+     return {};
+-  auto finite = [](const auto& values) {
+-    return std::all_of(values.begin(), values.end(), [](float x) { return std::isfinite(x); });
+-  };
+   const auto& c = frame.camera;
+-  if (!finite(c.view_to_clip) || !finite(c.clip_to_view) || !finite(c.clip_to_previous) ||
+-      !finite(c.previous_to_clip) || !finite(c.position) || !finite(c.up) || !finite(c.right) ||
+-      !finite(c.forward) || !finite(frame.jitter_pixels) || !std::isfinite(c.far_plane) ||
+-      !std::isfinite(c.vertical_fov) || !std::isfinite(c.aspect) ||
+-      !(c.near_plane > 0 && c.far_plane > c.near_plane && c.vertical_fov > 0 &&
+-        c.vertical_fov < 3.141593f && c.aspect > 0) ||
+-      std::abs(frame.jitter_pixels[0]) > 0.5f || std::abs(frame.jitter_pixels[1]) > 0.5f)
+-    return {};
+-  auto inverse_pair = [](const auto& a, const auto& b) {
+-    for (unsigned row = 0; row < 4; ++row) {
+-      for (unsigned col = 0; col < 4; ++col) {
+-        double value = 0;
+-        for (unsigned k = 0; k < 4; ++k)
+-          value += double(a[row * 4 + k]) * b[k * 4 + col];
+-        if (std::abs(value - (row == col ? 1.0 : 0.0)) > 0.01)
+-          return false;
+-      }
+-    }
+-    return true;
+-  };
+-  if (!inverse_pair(c.view_to_clip, c.clip_to_view) ||
+-      !inverse_pair(c.clip_to_previous, c.previous_to_clip))
+-    return {};
+-  auto dot = [](const auto& a, const auto& b) {
+-    return double(a[0]) * b[0] + double(a[1]) * b[1] + double(a[2]) * b[2];
+-  };
+-  if (std::abs(dot(c.up, c.up) - 1) > 0.01 || std::abs(dot(c.right, c.right) - 1) > 0.01 ||
+-      std::abs(dot(c.forward, c.forward) - 1) > 0.01 || std::abs(dot(c.up, c.right)) > 0.01 ||
+-      std::abs(dot(c.up, c.forward)) > 0.01 || std::abs(dot(c.right, c.forward)) > 0.01)
++  if (!ValidCamera(c, frame.jitter_pixels))
+     return {};
+   const auto color = frame.color->GetDesc(), depth = frame.depth->GetDesc();
+   const auto motion = frame.motion->GetDesc(), output = frame.output->GetDesc();
+@@ -413,39 +475,24 @@ Streamline::SREvaluation Streamline::EvaluateSR(ID3D12GraphicsCommandList* list,
+       color.Height > bounds.max_height)
+     return {};
+   const uint32_t width = uint32_t(color.Width), height = color.Height;
+-  const bool reset = pending_reset || frame.reset || !impl_->sr_have_frame ||
+-                     frame.id - impl_->sr_frame != 1 || width != impl_->sr_input_width ||
+-                     height != impl_->sr_input_height;
+-  sl::Constants constants{};
+-  auto matrix = [](sl::float4x4& out, const std::array<float, 16>& in) {
+-    for (unsigned i = 0; i < 4; ++i)
+-      out[i] = {in[i * 4], in[i * 4 + 1], in[i * 4 + 2], in[i * 4 + 3]};
+-  };
+-  matrix(constants.cameraViewToClip, c.view_to_clip);
+-  matrix(constants.clipToCameraView, c.clip_to_view);
+-  matrix(constants.clipToPrevClip, c.clip_to_previous);
+-  matrix(constants.prevClipToClip, c.previous_to_clip);
+-  constants.jitterOffset = {frame.jitter_pixels[0], frame.jitter_pixels[1]};
+-  constants.mvecScale = {1.0f / width, 1.0f / height};
+-  constants.cameraPinholeOffset = {0, 0};
+-  constants.cameraPos = {c.position[0], c.position[1], c.position[2]};
+-  constants.cameraUp = {c.up[0], c.up[1], c.up[2]};
+-  constants.cameraRight = {c.right[0], c.right[1], c.right[2]};
+-  constants.cameraFwd = {c.forward[0], c.forward[1], c.forward[2]};
+-  constants.cameraNear = c.near_plane;
+-  constants.cameraFar = c.far_plane;
+-  constants.cameraFOV = c.vertical_fov;
+-  constants.cameraAspectRatio = c.aspect;
+-  constants.depthInverted = frame.depth_inverted ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+-  constants.cameraMotionIncluded = sl::Boolean::eTrue;
+-  constants.motionVectors3D = sl::Boolean::eFalse;
+-  constants.motionVectorsJittered = sl::Boolean::eFalse;
+-  constants.motionVectorsDilated = sl::Boolean::eFalse;
+-  constants.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
++  const bool reset = pending_reset || frame.reset ||
++                     (frame.timeline && impl_->fg_active && impl_->fg_reset) ||
++                     !impl_->sr_have_frame || frame.id - impl_->sr_frame != 1 ||
++                     width != impl_->sr_input_width || height != impl_->sr_input_height;
++  const auto constants =
++      FrameConstants(c, frame.jitter_pixels, width, height, frame.depth_inverted, reset);
+   sl::FrameToken* token = nullptr;
+   const sl::ViewportHandle viewport(0);
+-  if (!Check(impl_->frame_token(token, nullptr), "SR frame token") || !token ||
+-      !Check(impl_->constants(constants, *token, viewport), "SR constants"))
++  if (frame.timeline) {
++    const auto& t = *frame.timeline;
++    if (t.owner != this || t.phase != 3 || t.sr_evaluated || !t.token ||
++        uint32_t(*t.token) != t.token_id)
++      return {};
++    token = t.token;
++  } else if (!Check(impl_->frame_token(token, nullptr), "SR frame token") || !token) {
++    return {};
++  }
++  if (!Check(impl_->constants(constants, *token, viewport), "SR constants"))
+     return {};
+   sl::Resource resources[] = {
+       {sl::ResourceType::eTex2d, frame.color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE},
+@@ -454,10 +501,12 @@ Streamline::SREvaluation Streamline::EvaluateSR(ID3D12GraphicsCommandList* list,
+       {sl::ResourceType::eTex2d, frame.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS}};
+   const sl::Extent input_extent{0, 0, width, height};
+   const sl::Extent output_extent{0, 0, impl_->sr_width, impl_->sr_height};
++  const auto input_lifetime =
++      frame.timeline && impl_->fg_active ? sl::eValidUntilPresent : sl::eValidUntilEvaluate;
+   sl::ResourceTag tags[] = {
+       {&resources[0], sl::kBufferTypeScalingInputColor, sl::eValidUntilEvaluate, &input_extent},
+-      {&resources[1], sl::kBufferTypeDepth, sl::eValidUntilEvaluate, &input_extent},
+-      {&resources[2], sl::kBufferTypeMotionVectors, sl::eValidUntilEvaluate, &input_extent},
++      {&resources[1], sl::kBufferTypeDepth, input_lifetime, &input_extent},
++      {&resources[2], sl::kBufferTypeMotionVectors, input_lifetime, &input_extent},
+       {&resources[3], sl::kBufferTypeScalingOutputColor, sl::eValidUntilEvaluate, &output_extent}};
+   // No exposure tag: the SSX policy is decoded linear color with NGX auto-exposure.
+   if (!Check(impl_->tag_frame(*token, viewport, tags, uint32_t(std::size(tags)), list), "SR tags"))
+@@ -466,6 +515,16 @@ Streamline::SREvaluation Streamline::EvaluateSR(ID3D12GraphicsCommandList* list,
+   const sl::BaseStructure* inputs[] = {&viewport};
+   if (!Check(impl_->evaluate(sl::kFeatureDLSS, *token, inputs, 1, list), "SR evaluation"))
+     return {};
++  if (frame.timeline) {
++    auto& t = *frame.timeline;
++    t.sr_evaluated = true;
++    t.camera = c;
++    t.jitter = frame.jitter_pixels;
++    t.width = width;
++    t.height = height;
++    t.depth_inverted = frame.depth_inverted;
++    t.reset = reset;
++  }
+   impl_->sr_reset = false;
+   impl_->sr_have_frame = true;
+   impl_->sr_frame = frame.id;
+@@ -492,6 +551,354 @@ bool Streamline::ReleaseSR() {
+   return true;
+ }
+ 
++bool Streamline::ConfigureReflex(ReflexMode mode, uint32_t frame_limit_us) {
++#if REX_HAS_STREAMLINE
++  if (!impl_->attached || !support_.reflex || !support_.pcl ||
++      (mode == ReflexMode::kOff && impl_->fg_active))
++    return false;
++  sl::ReflexOptions options{};
++  switch (mode) {
++    case ReflexMode::kOff:
++      options.mode = sl::ReflexMode::eOff;
++      break;
++    case ReflexMode::kOn:
++      options.mode = sl::ReflexMode::eLowLatency;
++      break;
++    case ReflexMode::kOnWithBoost:
++      options.mode = sl::ReflexMode::eLowLatencyWithBoost;
++      break;
++    default:
++      return false;
++  }
++  options.frameLimitUs = frame_limit_us;
++  sl::PCLOptions pcl{};
++  pcl.idThread = GetCurrentThreadId();
++  sl::PCLState state{};
++  if (!Check(impl_->pcl_options(pcl), "PCL options") ||
++      !Check(impl_->pcl_state(state), "PCL state") ||
++      !Check(impl_->reflex_options(options), "Reflex options"))
++    return false;
++  impl_->ping_message = state.statsWindowMessage;
++  impl_->reflex_mode = mode;
++  impl_->reflex_configured = true;
++  return true;
++#else
++  (void)mode;
++  (void)frame_limit_us;
++  return false;
++#endif
++}
++
++std::shared_ptr<Streamline::Frame> Streamline::BeginFrame() {
++#if REX_HAS_STREAMLINE
++  if (!impl_->attached || !impl_->reflex_configured)
++    return nullptr;
++  auto frame = std::make_shared<Frame>();
++  if (!Check(impl_->frame_token(frame->token, nullptr), "frame token") || !frame->token ||
++      !Check(impl_->reflex_sleep(*frame->token), "Reflex sleep") ||
++      !Check(impl_->pcl_marker(sl::PCLMarker::eSimulationStart, *frame->token), "simulation start"))
++    return nullptr;
++  frame->owner = this;
++  frame->token_id = uint32_t(*frame->token);
++  frame->phase = 1;
++  return frame;
++#else
++  return nullptr;
++#endif
++}
++
++bool Streamline::MarkFrame(const std::shared_ptr<Frame>& frame, Marker marker) {
++#if REX_HAS_STREAMLINE
++  if (!impl_->attached || !frame || frame->owner != this || !frame->token ||
++      uint32_t(*frame->token) != frame->token_id)
++    return false;
++  sl::PCLMarker pcl;
++  unsigned expected = 0;
++  switch (marker) {
++    case Marker::kSimulationEnd:
++      pcl = sl::PCLMarker::eSimulationEnd;
++      expected = 1;
++      break;
++    case Marker::kRenderSubmitStart:
++      pcl = sl::PCLMarker::eRenderSubmitStart;
++      expected = 2;
++      break;
++    case Marker::kRenderSubmitEnd:
++      pcl = sl::PCLMarker::eRenderSubmitEnd;
++      expected = 3;
++      break;
++    case Marker::kPresentStart:
++      pcl = sl::PCLMarker::ePresentStart;
++      expected = 4;
++      break;
++    case Marker::kPresentEnd:
++      pcl = sl::PCLMarker::ePresentEnd;
++      expected = 5;
++      break;
++    case Marker::kInputFlash:
++      pcl = sl::PCLMarker::eTriggerFlash;
++      break;
++    case Marker::kLatencyPing:
++      pcl = sl::PCLMarker::ePCLatencyPing;
++      break;
++    default:
++      return false;
++  }
++  if ((expected && frame->phase != expected) || (!expected && frame->phase != 1))
++    return false;
++  // Never present an active FG frame without explicitly tagging or clearing it.
++  if (marker == Marker::kPresentStart && impl_->fg_active && !frame->fg_tagged)
++    return false;
++  if (!Check(impl_->pcl_marker(pcl, *frame->token), "PCL marker"))
++    return false;
++  if (expected)
++    ++frame->phase;
++  return true;
++#else
++  (void)frame;
++  (void)marker;
++  return false;
++#endif
++}
++
++uint32_t Streamline::LatencyPingMessage() const {
++#if REX_HAS_STREAMLINE
++  return impl_->ping_message;
++#else
++  return 0;
++#endif
++}
++
++bool Streamline::GetFrameId(const std::shared_ptr<Frame>& frame, uint32_t& id) const {
++  id = 0;
++#if REX_HAS_STREAMLINE
++  if (!impl_->attached || !frame || frame->owner != this || !frame->token ||
++      uint32_t(*frame->token) != frame->token_id)
++    return false;
++  id = frame->token_id;
++  return true;
++#else
++  (void)frame;
++  return false;
++#endif
++}
++
++bool Streamline::GetReflexState(ReflexState& state) {
++  state = {};
++#if REX_HAS_STREAMLINE
++  if (!impl_->attached || !impl_->reflex_state)
++    return false;
++  sl::ReflexState value{};
++  if (!Check(impl_->reflex_state(value), "Reflex latency reports"))
++    return false;
++  state.low_latency_available = value.lowLatencyAvailable;
++  state.reports_available = value.latencyReportAvailable;
++  state.flash_driver_controlled = value.flashIndicatorDriverControlled;
++  if (!state.reports_available)
++    return true;
++  for (size_t i = 0; i < state.reports.size(); ++i) {
++    const auto& s = value.frameReport[i];
++    auto& d = state.reports[i];
++    d.frame_id = s.frameID;
++    d.simulation_start_us = s.simStartTime;
++    d.simulation_end_us = s.simEndTime;
++    d.render_start_us = s.renderSubmitStartTime;
++    d.render_end_us = s.renderSubmitEndTime;
++    d.present_start_us = s.presentStartTime;
++    d.present_end_us = s.presentEndTime;
++    d.driver_start_us = s.driverStartTime;
++    d.driver_end_us = s.driverEndTime;
++    d.queue_start_us = s.osRenderQueueStartTime;
++    d.queue_end_us = s.osRenderQueueEndTime;
++    d.gpu_start_us = s.gpuRenderStartTime;
++    d.gpu_end_us = s.gpuRenderEndTime;
++    d.gpu_active_us = s.gpuActiveRenderTimeUs;
++    d.gpu_frame_us = s.gpuFrameTimeUs;
++  }
++  return true;
++#else
++  return false;
++#endif
++}
++
++bool Streamline::SetFrameGenerationLoaded(bool loaded) {
++#if REX_HAS_STREAMLINE
++  if (!impl_->attached || !support_.fg)
++    return false;
++  if (loaded == impl_->fg_loaded)
++    return true;
++  if (!loaded && !SetFrameGenerationActive(false))
++    return false;
++  if (!Check(impl_->feature_loaded(sl::kFeatureDLSS_G, loaded), "FG load/unload"))
++    return false;
++  impl_->fg_loaded = loaded;
++  impl_->fg_reset = true;
++  if (loaded &&
++      (!impl_->ImportFeature(impl_->fg_options, sl::kFeatureDLSS_G, "slDLSSGSetOptions") ||
++       !impl_->ImportFeature(impl_->fg_state, sl::kFeatureDLSS_G, "slDLSSGGetState")))
++    return false;
++  return true;
++#else
++  (void)loaded;
++  return false;
++#endif
++}
++
++bool Streamline::SetFrameGenerationActive(bool active) {
++#if REX_HAS_STREAMLINE
++  if (!impl_->attached || !support_.fg ||
++      (active && (!impl_->fg_loaded || !impl_->reflex_configured ||
++                  impl_->reflex_mode == ReflexMode::kOff || !support_.low_latency_available)))
++    return false;
++  if (!impl_->fg_loaded)
++    return !active;
++  if (active == impl_->fg_active)
++    return true;
++  sl::DLSSGOptions options{};
++  options.mode = active ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
++  options.numFramesToGenerate = 1;
++  options.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
++  if (!Check(impl_->fg_options(sl::ViewportHandle(0), options), "FG activation"))
++    return false;
++  impl_->fg_reset |= active != impl_->fg_active;
++  impl_->fg_active = active;
++  return true;
++#else
++  (void)active;
++  return false;
++#endif
++}
++
++bool Streamline::ClearFrameGenerationTags(ID3D12GraphicsCommandList* list,
++                                          const std::shared_ptr<Frame>& frame) {
++#if REX_HAS_STREAMLINE
++  impl_->fg_reset = true;
++  if (!impl_->attached || !list || !frame || frame->owner != this || frame->phase != 3 ||
++      !frame->token || uint32_t(*frame->token) != frame->token_id)
++    return false;
++  sl::ResourceTag tags[] = {
++      {nullptr, sl::kBufferTypeDepth, sl::eValidUntilPresent},
++      {nullptr, sl::kBufferTypeMotionVectors, sl::eValidUntilPresent},
++      {nullptr, sl::kBufferTypeHUDLessColor, sl::eValidUntilPresent},
++      {nullptr, sl::kBufferTypeUIAlpha, sl::eValidUntilPresent},
++      {nullptr, sl::kBufferTypeUIColorAndAlpha, sl::eValidUntilPresent},
++      {nullptr, sl::kBufferTypeBackbuffer, sl::eValidUntilPresent},
++      {nullptr, sl::kBufferTypeBidirectionalDistortionField, sl::eValidUntilPresent}};
++  const bool ok = Check(
++      impl_->tag_frame(*frame->token, sl::ViewportHandle(0), tags, uint32_t(std::size(tags)), list),
++      "FG clear tags");
++  frame->fg_tagged = ok;
++  return ok;
++#else
++  (void)list;
++  (void)frame;
++  return false;
++#endif
++}
++
++bool Streamline::TagFrameGeneration(ID3D12GraphicsCommandList* list,
++                                    const std::shared_ptr<Frame>& timeline, const FGFrame& frame,
++                                    uint32_t backbuffer_width, uint32_t backbuffer_height) {
++#if REX_HAS_STREAMLINE
++  // A rejected frame clears the old tags and resets history. The caller suspends
++  // FG before presenting that frame; rejection is never a successful dispatch.
++  const bool pending_reset = impl_->fg_reset;
++  if (!ClearFrameGenerationTags(list, timeline) || !impl_->fg_active || !frame.depth ||
++      !frame.motion || !frame.hudless || !ValidCamera(frame.camera, frame.jitter_pixels))
++    return false;
++  const auto depth = frame.depth->GetDesc(), motion = frame.motion->GetDesc();
++  const auto color = frame.hudless->GetDesc();
++  auto texture = [](const D3D12_RESOURCE_DESC& d) {
++    return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width && d.Height &&
++           d.DepthOrArraySize == 1 && d.MipLevels == 1 && d.SampleDesc.Count == 1 &&
++           !(d.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
++  };
++  if (!texture(depth) || !texture(motion) || !texture(color) ||
++      depth.Format != DXGI_FORMAT_R32_FLOAT ||
++      (motion.Format != DXGI_FORMAT_R16G16_FLOAT && motion.Format != DXGI_FORMAT_R32G32_FLOAT) ||
++      (color.Format != DXGI_FORMAT_R8G8B8A8_UNORM && color.Format != DXGI_FORMAT_B8G8R8A8_UNORM) ||
++      depth.Width != motion.Width || depth.Height != motion.Height ||
++      color.Width != backbuffer_width || color.Height != backbuffer_height ||
++      frame.depth == frame.motion || frame.hudless == frame.motion || frame.hudless == frame.depth)
++    return false;
++  if (frame.ui_alpha) {
++    const auto ui = frame.ui_alpha->GetDesc();
++    if (!texture(ui) || ui.Width != color.Width || ui.Height != color.Height ||
++        (ui.Format != DXGI_FORMAT_R8_UNORM && ui.Format != DXGI_FORMAT_R16_FLOAT &&
++         ui.Format != DXGI_FORMAT_R32_FLOAT))
++      return false;
++  }
++  auto& t = *timeline;
++  const auto& c = frame.camera;
++  if (t.sr_evaluated) {
++    const auto& s = t.camera;
++    if (t.width != depth.Width || t.height != depth.Height || t.jitter != frame.jitter_pixels ||
++        t.depth_inverted != frame.depth_inverted || ((frame.reset || pending_reset) && !t.reset) ||
++        s.view_to_clip != c.view_to_clip || s.clip_to_view != c.clip_to_view ||
++        s.clip_to_previous != c.clip_to_previous || s.previous_to_clip != c.previous_to_clip ||
++        s.position != c.position || s.up != c.up || s.right != c.right || s.forward != c.forward ||
++        s.near_plane != c.near_plane || s.far_plane != c.far_plane ||
++        s.vertical_fov != c.vertical_fov || s.aspect != c.aspect)
++      return false;
++  } else {
++    const auto constants =
++        FrameConstants(c, frame.jitter_pixels, uint32_t(depth.Width), depth.Height,
++                       frame.depth_inverted, frame.reset || pending_reset);
++    if (!Check(impl_->constants(constants, *t.token, sl::ViewportHandle(0)), "FG constants"))
++      return false;
++  }
++  const auto color_state =
++      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++  sl::Resource resources[] = {
++      {sl::ResourceType::eTex2d, frame.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE},
++      {sl::ResourceType::eTex2d, frame.motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE},
++      {sl::ResourceType::eTex2d, frame.hudless, color_state},
++      {sl::ResourceType::eTex2d, frame.ui_alpha, color_state}};
++  const sl::Extent input{0, 0, uint32_t(depth.Width), depth.Height};
++  const sl::Extent output{0, 0, backbuffer_width, backbuffer_height};
++  sl::ResourceTag tags[] = {
++      {&resources[0], sl::kBufferTypeDepth, sl::eValidUntilPresent, &input},
++      {&resources[1], sl::kBufferTypeMotionVectors, sl::eValidUntilPresent, &input},
++      {&resources[2], sl::kBufferTypeHUDLessColor, sl::eValidUntilPresent, &output},
++      {nullptr, sl::kBufferTypeBackbuffer, sl::eValidUntilPresent, &output},
++      {frame.ui_alpha ? &resources[3] : nullptr, sl::kBufferTypeUIAlpha, sl::eValidUntilPresent,
++       &output}};
++  if (!Check(
++          impl_->tag_frame(*t.token, sl::ViewportHandle(0), tags, uint32_t(std::size(tags)), list),
++          "FG tags"))
++    return false;
++  impl_->fg_reset = false;
++  return true;
++#else
++  (void)list;
++  (void)timeline;
++  (void)frame;
++  (void)backbuffer_width;
++  (void)backbuffer_height;
++  return false;
++#endif
++}
++
++bool Streamline::GetFrameGenerationState(FGState& state) {
++  state = {};
++#if REX_HAS_STREAMLINE
++  if (!impl_->attached || !support_.fg || !impl_->fg_loaded)
++    return false;
++  sl::DLSSGState value{};
++  if (!Check(impl_->fg_state(sl::ViewportHandle(0), value, nullptr), "FG present state"))
++    return false;
++  state.status = uint32_t(value.status);
++  state.frames_presented = value.numFramesActuallyPresented;
++  state.minimum_dimension = value.minWidthOrHeight;
++  state.max_generated_frames = value.numFramesToGenerateMax;
++  state.inputs_fence = static_cast<ID3D12Fence*>(value.inputsProcessingCompletionFence);
++  state.inputs_fence_value = value.lastPresentInputsProcessingCompletionFenceValue;
++  return true;
++#else
++  return false;
++#endif
++}
++
+ void Streamline::Shutdown() {
+ #if REX_HAS_STREAMLINE
+   if (impl_->init_called) {
+diff --git a/src/ui/guest_frame_timing.cpp b/src/ui/guest_frame_timing.cpp
+new file mode 100644
+index 0000000..8b2ca21
+--- /dev/null
++++ b/src/ui/guest_frame_timing.cpp
+@@ -0,0 +1,112 @@
++#include <rex/ui/guest_frame_timing.h>
++#include <rex/logging.h>
++#include <chrono>
++#include <fstream>
++#include <thread>
++#include <utility>
++
++namespace rex::ui {
++namespace {
++thread_local uint64_t render_id = 0;
++uint64_t Now() {
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(
++             std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++constexpr const char* names[] = {"input_begin",
++                                 "input_end",
++                                 "worker_dispatch_begin",
++                                 "worker_dispatch_end",
++                                 "worker_begin",
++                                 "worker_end",
++                                 "render_dispatch_begin",
++                                 "render_dispatch_end",
++                                 "render_begin",
++                                 "render_end",
++                                 "synchronized_render_begin",
++                                 "synchronized_render_end",
++                                 "guest_swap",
++                                 "cp_swap",
++                                 "reconstruction_begin",
++                                 "reconstruction_end",
++                                 "host_submit",
++                                 "present_begin",
++                                 "present_end"};
++}  // namespace
++GuestFrameTiming& GuestFrameTiming::Get() {
++  static GuestFrameTiming trace;
++  return trace;
++}
++uint64_t GuestFrameTiming::CurrentRender() {
++  return render_id;
++}
++uint64_t GuestFrameTiming::ExchangeRender(uint64_t id) {
++  const auto previous = render_id;
++  render_id = id;
++  return previous;
++}
++void GuestFrameTiming::BeginCapture(uint64_t duration_ns) {
++  std::lock_guard lock(mutex_);
++  records_.clear();
++  records_.reserve(kMaxRecords);
++  deadline_ns_ = Now() + duration_ns;
++  capturing_.store(true, std::memory_order_release);
++}
++std::vector<GuestFrameTiming::Record> GuestFrameTiming::FinishCapture() {
++  std::lock_guard lock(mutex_);
++  capturing_.store(false, std::memory_order_release);
++  return std::exchange(records_, {});
++}
++void GuestFrameTiming::Add(Event event, uint64_t id, uint64_t related, uint64_t detail) {
++  if (!capturing())
++    return;
++  std::lock_guard lock(mutex_);
++  if (!capturing())
++    return;
++  const auto now = Now();
++  if (now >= deadline_ns_ || records_.size() >= kMaxRecords) {
++    capturing_.store(false, std::memory_order_release);
++    return;
++  }
++  // Logical trace thread IDs do not expose OS handles and are stable per thread.
++  static std::atomic<uint32_t> next_thread{1};
++  thread_local const uint32_t thread = next_thread.fetch_add(1);
++  records_.push_back({now, id, related, detail, thread, event});
++}
++void GuestFrameTiming::PollCapture(const std::filesystem::path& directory) {
++  const auto now = Now();
++  if (now < next_poll_ns_)
++    return;
++  next_poll_ns_ = now + 250000000ull;
++  if (writing_capture_) {
++    // Also finish if no renderer events arrive (minimized or during loading).
++    bool finished;
++    {
++      std::lock_guard lock(mutex_);
++      finished = !capturing() || now >= deadline_ns_;
++    }
++    if (!finished)
++      return;
++    const auto records = FinishCapture();
++    writing_capture_ = false;
++    const auto path = directory / ("timing-" + std::to_string(now) + ".csv");
++    std::ofstream out(path);
++    out << "time_ns,thread,event,id,related,detail\n";
++    for (const auto& r : records)
++      out << r.time_ns << ',' << r.thread << ',' << names[size_t(r.event)] << ',' << r.id << ','
++          << r.related << ',' << r.detail << '\n';
++    out.flush();
++    if (out)
++      REXLOG_INFO("SSX_TIMING_CAPTURE records={} file={} reflex_markers=false", records.size(),
++                  path.string());
++    else
++      REXLOG_ERROR("SSX_TIMING_CAPTURE write failed: {}", path.string());
++    return;
++  }
++  std::error_code ec;
++  if (!std::filesystem::remove(directory / "capture.request", ec))
++    return;
++  BeginCapture();
++  writing_capture_ = true;
++}
++}  // namespace rex::ui
+diff --git a/src/ui/shaders/bytecode/d3d12_5_1/ssx_fg_color_cs.h b/src/ui/shaders/bytecode/d3d12_5_1/ssx_fg_color_cs.h
+new file mode 100644
+index 0000000..1dc4a66
+--- /dev/null
++++ b/src/ui/shaders/bytecode/d3d12_5_1/ssx_fg_color_cs.h
+@@ -0,0 +1,501 @@
++#if 0
++//
++// Generated by Microsoft (R) HLSL Shader Compiler 10.1
++//
++//
++// Buffer Definitions:
++//
++// cbuffer Constants
++// {
++//
++//   uint2 output_size;                 // Offset:    0 Size:     8
++//   uint2 reserved;                    // Offset:    8 Size:     8 [unused]
++//   uint4 gamma_words[64];             // Offset:   16 Size:  1024
++//
++// }
++//
++//
++// Resource Bindings:
++//
++// Name                                 Type  Format         Dim      ID      HLSL Bind  Count
++// ------------------------------ ---------- ------- ----------- ------- -------------- ------
++// linear_clamp                      sampler      NA          NA      S0             s0      1
++// post_effects                      texture  float4          2d      T0             t0      1
++// hudless                               UAV  unorm4          2d      U0             u0      1
++// Constants                         cbuffer      NA          NA     CB0            cb0      1
++//
++//
++//
++// Input signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Input
++//
++// Output signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Output
++cs_5_1
++dcl_globalFlags refactoringAllowed
++dcl_constantbuffer CB0[0:0][65], dynamicIndexed, space=0
++dcl_sampler S0[0:0], mode_default, space=0
++dcl_resource_texture2d (float,float,float,float) T0[0:0], space=0
++dcl_uav_typed_texture2d (unorm,unorm,unorm,unorm) U0[0:0], space=0
++dcl_input vThreadID.xy
++dcl_temps 6
++dcl_thread_group 8, 8, 1
++uge r0.xy, vThreadID.xyxx, CB0[0][0].xyxx
++or r0.x, r0.y, r0.x
++if_nz r0.x
++  ret
++endif
++utof r0.xy, vThreadID.xyxx
++add r0.xy, r0.xyxx, l(0.500000, 0.500000, 0.000000, 0.000000)
++utof r0.zw, CB0[0][0].xxxy
++div r0.xy, r0.xyxx, r0.zwzz
++sample_l r0.xyz, r0.xyxx, T0[0].xyzw, S0[0], l(0.000000)
++mov_sat r0.xyz, r0.xyzx
++mad r0.xyz, r0.xyzx, l(255.000000, 255.000000, 255.000000, 0.000000), l(0.500000, 0.500000, 0.500000, 0.000000)
++ftou r0.xyz, r0.xyzx
++ushr r1.xyz, r0.xyzx, l(2, 2, 2, 0)
++and r0.xyz, r0.xyzx, l(3, 3, 3, 0)
++ineg r2.xyz, r0.xyzx
++ult r3.xyzw, r0.yxxx, l(1, 1, 2, 3)
++and r4.y, r2.x, r3.z
++iadd r5.xyz, r0.xyzx, l(-3, -3, -3, 0)
++movc r4.z, r3.z, l(0), r5.x
++ieq r4.w, r3.w, l(0)
++mov r4.x, r3.y
++and r4.xyzw, r4.xyzw, CB0[0][r1.x + 1].xyzw
++or r0.xw, r4.yyyw, r4.xxxz
++or r0.x, r0.w, r0.x
++ult r4.xyzw, r0.yyzz, l(2, 3, 1, 2)
++and r0.yw, r2.yyyz, r4.xxxw
++movc r2.xz, r4.xxwx, l(0,0,0,0), r5.yyzy
++ieq r3.w, r4.y, l(0)
++mov r3.y, r0.y
++mov r3.z, r2.x
++and r3.xyzw, r3.xyzw, CB0[0][r1.y + 1].xyzw
++or r1.xy, r3.ywyy, r3.xzxx
++or r0.y, r1.y, r1.x
++ubfe r0.xy, l(10, 10, 0, 0), l(20, 10, 0, 0), r0.xyxx
++ult r0.z, r0.z, l(3)
++ieq r2.w, r0.z, l(0)
++mov r2.x, r4.z
++mov r2.y, r0.w
++and r1.xyzw, r2.xyzw, CB0[0][r1.z + 1].xyzw
++or r0.zw, r1.yyyw, r1.xxxz
++or r0.z, r0.w, r0.z
++and r0.z, r0.z, l(1023)
++utof r1.xyz, r0.xyzx
++mul r0.xyz, r1.xyzx, l(0.000978, 0.000978, 0.000978, 0.000000)
++mov r0.w, l(1.000000)
++store_uav_typed U0[0].xyzw, vThreadID.xyyy, r0.xyzw
++ret
++// Approximately 48 instruction slots used
++#endif
++
++const BYTE ssx_fg_color_cs[] =
++{
++     68,  88,  66,  67,   3, 166,
++     52, 223, 134,  21,  73,  10,
++     46, 183, 173, 223,  91, 163,
++    196,  59,   1,   0,   0,   0,
++     88,   9,   0,   0,   5,   0,
++      0,   0,  52,   0,   0,   0,
++    116,   2,   0,   0, 132,   2,
++      0,   0, 148,   2,   0,   0,
++    188,   8,   0,   0,  82,  68,
++     69,  70,  56,   2,   0,   0,
++      1,   0,   0,   0,   8,   1,
++      0,   0,   4,   0,   0,   0,
++     60,   0,   0,   0,   1,   5,
++     83,  67,   0, 133,   0,   0,
++     16,   2,   0,   0,  19,  19,
++     68,  37,  60,   0,   0,   0,
++     24,   0,   0,   0,  40,   0,
++      0,   0,  40,   0,   0,   0,
++     36,   0,   0,   0,  12,   0,
++      0,   0,   0,   0,   0,   0,
++    220,   0,   0,   0,   3,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0, 233,   0,
++      0,   0,   2,   0,   0,   0,
++      5,   0,   0,   0,   4,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0,   1,   0,
++      0,   0,  12,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0, 246,   0,   0,   0,
++      4,   0,   0,   0,   1,   0,
++      0,   0,   4,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0,   1,   0,   0,   0,
++     12,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++    254,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,   1,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0, 108, 105,
++    110, 101,  97, 114,  95,  99,
++    108,  97, 109, 112,   0, 112,
++    111, 115, 116,  95, 101, 102,
++    102, 101,  99, 116, 115,   0,
++    104, 117, 100, 108, 101, 115,
++    115,   0,  67, 111, 110, 115,
++    116,  97, 110, 116, 115,   0,
++    254,   0,   0,   0,   3,   0,
++      0,   0,  32,   1,   0,   0,
++     16,   4,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++    152,   1,   0,   0,   0,   0,
++      0,   0,   8,   0,   0,   0,
++      2,   0,   0,   0, 172,   1,
++      0,   0,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0, 208,   1,
++      0,   0,   8,   0,   0,   0,
++      8,   0,   0,   0,   0,   0,
++      0,   0, 172,   1,   0,   0,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0, 217,   1,   0,   0,
++     16,   0,   0,   0,   0,   4,
++      0,   0,   2,   0,   0,   0,
++    236,   1,   0,   0,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++    111, 117, 116, 112, 117, 116,
++     95, 115, 105, 122, 101,   0,
++    117, 105, 110, 116,  50,   0,
++    171, 171,   1,   0,  19,   0,
++      1,   0,   2,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0, 164,   1,
++      0,   0, 114, 101, 115, 101,
++    114, 118, 101, 100,   0, 103,
++     97, 109, 109,  97,  95, 119,
++    111, 114, 100, 115,   0, 117,
++    105, 110, 116,  52,   0, 171,
++      1,   0,  19,   0,   1,   0,
++      4,   0,  64,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0, 229,   1,   0,   0,
++     77, 105,  99, 114, 111, 115,
++    111, 102, 116,  32,  40,  82,
++     41,  32,  72,  76,  83,  76,
++     32,  83, 104,  97, 100, 101,
++    114,  32,  67, 111, 109, 112,
++    105, 108, 101, 114,  32,  49,
++     48,  46,  49,   0,  73,  83,
++     71,  78,   8,   0,   0,   0,
++      0,   0,   0,   0,   8,   0,
++      0,   0,  79,  83,  71,  78,
++      8,   0,   0,   0,   0,   0,
++      0,   0,   8,   0,   0,   0,
++     83,  72,  69,  88,  32,   6,
++      0,   0,  81,   0,   5,   0,
++    136,   1,   0,   0, 106,   8,
++      0,   1,  89,   8,   0,   7,
++     70, 142,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  65,   0,
++      0,   0,   0,   0,   0,   0,
++     90,   0,   0,   6,  70, 110,
++     48,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     88,  24,   0,   7,  70, 126,
++     48,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  85,  85,   0,   0,
++      0,   0,   0,   0, 156,  24,
++      0,   7,  70, 238,  49,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     17,  17,   0,   0,   0,   0,
++      0,   0,  95,   0,   0,   2,
++     50,   0,   2,   0, 104,   0,
++      0,   2,   6,   0,   0,   0,
++    155,   0,   0,   4,   8,   0,
++      0,   0,   8,   0,   0,   0,
++      1,   0,   0,   0,  80,   0,
++      0,   8,  50,   0,  16,   0,
++      0,   0,   0,   0,  70,   0,
++      2,   0,  70, 128,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     60,   0,   0,   7,  18,   0,
++     16,   0,   0,   0,   0,   0,
++     26,   0,  16,   0,   0,   0,
++      0,   0,  10,   0,  16,   0,
++      0,   0,   0,   0,  31,   0,
++      4,   3,  10,   0,  16,   0,
++      0,   0,   0,   0,  62,   0,
++      0,   1,  21,   0,   0,   1,
++     86,   0,   0,   4,  50,   0,
++     16,   0,   0,   0,   0,   0,
++     70,   0,   2,   0,   0,   0,
++      0,  10,  50,   0,  16,   0,
++      0,   0,   0,   0,  70,   0,
++     16,   0,   0,   0,   0,   0,
++      2,  64,   0,   0,   0,   0,
++      0,  63,   0,   0,   0,  63,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  86,   0,   0,   7,
++    194,   0,  16,   0,   0,   0,
++      0,   0,   6, 132,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     14,   0,   0,   7,  50,   0,
++     16,   0,   0,   0,   0,   0,
++     70,   0,  16,   0,   0,   0,
++      0,   0, 230,  10,  16,   0,
++      0,   0,   0,   0,  72,   0,
++      0,  13, 114,   0,  16,   0,
++      0,   0,   0,   0,  70,   0,
++     16,   0,   0,   0,   0,   0,
++     70, 126,  32,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,  96,  32,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,  64,   0,   0,   0,   0,
++      0,   0,  54,  32,   0,   5,
++    114,   0,  16,   0,   0,   0,
++      0,   0,  70,   2,  16,   0,
++      0,   0,   0,   0,  50,   0,
++      0,  15, 114,   0,  16,   0,
++      0,   0,   0,   0,  70,   2,
++     16,   0,   0,   0,   0,   0,
++      2,  64,   0,   0,   0,   0,
++    127,  67,   0,   0, 127,  67,
++      0,   0, 127,  67,   0,   0,
++      0,   0,   2,  64,   0,   0,
++      0,   0,   0,  63,   0,   0,
++      0,  63,   0,   0,   0,  63,
++      0,   0,   0,   0,  28,   0,
++      0,   5, 114,   0,  16,   0,
++      0,   0,   0,   0,  70,   2,
++     16,   0,   0,   0,   0,   0,
++     85,   0,   0,  10, 114,   0,
++     16,   0,   1,   0,   0,   0,
++     70,   2,  16,   0,   0,   0,
++      0,   0,   2,  64,   0,   0,
++      2,   0,   0,   0,   2,   0,
++      0,   0,   2,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
++      0,  10, 114,   0,  16,   0,
++      0,   0,   0,   0,  70,   2,
++     16,   0,   0,   0,   0,   0,
++      2,  64,   0,   0,   3,   0,
++      0,   0,   3,   0,   0,   0,
++      3,   0,   0,   0,   0,   0,
++      0,   0,  40,   0,   0,   5,
++    114,   0,  16,   0,   2,   0,
++      0,   0,  70,   2,  16,   0,
++      0,   0,   0,   0,  79,   0,
++      0,  10, 242,   0,  16,   0,
++      3,   0,   0,   0,  22,   0,
++     16,   0,   0,   0,   0,   0,
++      2,  64,   0,   0,   1,   0,
++      0,   0,   1,   0,   0,   0,
++      2,   0,   0,   0,   3,   0,
++      0,   0,   1,   0,   0,   7,
++     34,   0,  16,   0,   4,   0,
++      0,   0,  10,   0,  16,   0,
++      2,   0,   0,   0,  42,   0,
++     16,   0,   3,   0,   0,   0,
++     30,   0,   0,  10, 114,   0,
++     16,   0,   5,   0,   0,   0,
++     70,   2,  16,   0,   0,   0,
++      0,   0,   2,  64,   0,   0,
++    253, 255, 255, 255, 253, 255,
++    255, 255, 253, 255, 255, 255,
++      0,   0,   0,   0,  55,   0,
++      0,   9,  66,   0,  16,   0,
++      4,   0,   0,   0,  42,   0,
++     16,   0,   3,   0,   0,   0,
++      1,  64,   0,   0,   0,   0,
++      0,   0,  10,   0,  16,   0,
++      5,   0,   0,   0,  32,   0,
++      0,   7, 130,   0,  16,   0,
++      4,   0,   0,   0,  58,   0,
++     16,   0,   3,   0,   0,   0,
++      1,  64,   0,   0,   0,   0,
++      0,   0,  54,   0,   0,   5,
++     18,   0,  16,   0,   4,   0,
++      0,   0,  26,   0,  16,   0,
++      3,   0,   0,   0,   1,   0,
++      0,  11, 242,   0,  16,   0,
++      4,   0,   0,   0,  70,  14,
++     16,   0,   4,   0,   0,   0,
++     70, 142,  48,  48,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,  10,   0,
++     16,   0,   1,   0,   0,   0,
++     60,   0,   0,   7, 146,   0,
++     16,   0,   0,   0,   0,   0,
++     86,  13,  16,   0,   4,   0,
++      0,   0,   6,   8,  16,   0,
++      4,   0,   0,   0,  60,   0,
++      0,   7,  18,   0,  16,   0,
++      0,   0,   0,   0,  58,   0,
++     16,   0,   0,   0,   0,   0,
++     10,   0,  16,   0,   0,   0,
++      0,   0,  79,   0,   0,  10,
++    242,   0,  16,   0,   4,   0,
++      0,   0,  86,  10,  16,   0,
++      0,   0,   0,   0,   2,  64,
++      0,   0,   2,   0,   0,   0,
++      3,   0,   0,   0,   1,   0,
++      0,   0,   2,   0,   0,   0,
++      1,   0,   0,   7, 162,   0,
++     16,   0,   0,   0,   0,   0,
++     86,   9,  16,   0,   2,   0,
++      0,   0,   6,  12,  16,   0,
++      4,   0,   0,   0,  55,   0,
++      0,  12,  82,   0,  16,   0,
++      2,   0,   0,   0,   6,   3,
++     16,   0,   4,   0,   0,   0,
++      2,  64,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  86,   6,  16,   0,
++      5,   0,   0,   0,  32,   0,
++      0,   7, 130,   0,  16,   0,
++      3,   0,   0,   0,  26,   0,
++     16,   0,   4,   0,   0,   0,
++      1,  64,   0,   0,   0,   0,
++      0,   0,  54,   0,   0,   5,
++     34,   0,  16,   0,   3,   0,
++      0,   0,  26,   0,  16,   0,
++      0,   0,   0,   0,  54,   0,
++      0,   5,  66,   0,  16,   0,
++      3,   0,   0,   0,  10,   0,
++     16,   0,   2,   0,   0,   0,
++      1,   0,   0,  11, 242,   0,
++     16,   0,   3,   0,   0,   0,
++     70,  14,  16,   0,   3,   0,
++      0,   0,  70, 142,  48,  48,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   1,   0,   0,   0,
++     26,   0,  16,   0,   1,   0,
++      0,   0,  60,   0,   0,   7,
++     50,   0,  16,   0,   1,   0,
++      0,   0, 214,   5,  16,   0,
++      3,   0,   0,   0, 134,   0,
++     16,   0,   3,   0,   0,   0,
++     60,   0,   0,   7,  34,   0,
++     16,   0,   0,   0,   0,   0,
++     26,   0,  16,   0,   1,   0,
++      0,   0,  10,   0,  16,   0,
++      1,   0,   0,   0, 138,   0,
++      0,  15,  50,   0,  16,   0,
++      0,   0,   0,   0,   2,  64,
++      0,   0,  10,   0,   0,   0,
++     10,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      2,  64,   0,   0,  20,   0,
++      0,   0,  10,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  70,   0,  16,   0,
++      0,   0,   0,   0,  79,   0,
++      0,   7,  66,   0,  16,   0,
++      0,   0,   0,   0,  42,   0,
++     16,   0,   0,   0,   0,   0,
++      1,  64,   0,   0,   3,   0,
++      0,   0,  32,   0,   0,   7,
++    130,   0,  16,   0,   2,   0,
++      0,   0,  42,   0,  16,   0,
++      0,   0,   0,   0,   1,  64,
++      0,   0,   0,   0,   0,   0,
++     54,   0,   0,   5,  18,   0,
++     16,   0,   2,   0,   0,   0,
++     42,   0,  16,   0,   4,   0,
++      0,   0,  54,   0,   0,   5,
++     34,   0,  16,   0,   2,   0,
++      0,   0,  58,   0,  16,   0,
++      0,   0,   0,   0,   1,   0,
++      0,  11, 242,   0,  16,   0,
++      1,   0,   0,   0,  70,  14,
++     16,   0,   2,   0,   0,   0,
++     70, 142,  48,  48,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,  42,   0,
++     16,   0,   1,   0,   0,   0,
++     60,   0,   0,   7, 194,   0,
++     16,   0,   0,   0,   0,   0,
++     86,  13,  16,   0,   1,   0,
++      0,   0,   6,   8,  16,   0,
++      1,   0,   0,   0,  60,   0,
++      0,   7,  66,   0,  16,   0,
++      0,   0,   0,   0,  58,   0,
++     16,   0,   0,   0,   0,   0,
++     42,   0,  16,   0,   0,   0,
++      0,   0,   1,   0,   0,   7,
++     66,   0,  16,   0,   0,   0,
++      0,   0,  42,   0,  16,   0,
++      0,   0,   0,   0,   1,  64,
++      0,   0, 255,   3,   0,   0,
++     86,   0,   0,   5, 114,   0,
++     16,   0,   1,   0,   0,   0,
++     70,   2,  16,   0,   0,   0,
++      0,   0,  56,   0,   0,  10,
++    114,   0,  16,   0,   0,   0,
++      0,   0,  70,   2,  16,   0,
++      1,   0,   0,   0,   2,  64,
++      0,   0,   8,  32, 128,  58,
++      8,  32, 128,  58,   8,  32,
++    128,  58,   0,   0,   0,   0,
++     54,   0,   0,   5, 130,   0,
++     16,   0,   0,   0,   0,   0,
++      1,  64,   0,   0,   0,   0,
++    128,  63, 164,   0,   0,   7,
++    242, 224,  33,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     70,   5,   2,   0,  70,  14,
++     16,   0,   0,   0,   0,   0,
++     62,   0,   0,   1,  83,  84,
++     65,  84, 148,   0,   0,   0,
++     48,   0,   0,   0,   6,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,   4,   0,
++      0,   0,   5,   0,   0,   0,
++     19,   0,   0,   0,   2,   0,
++      0,   0,   1,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   7,   0,
++      0,   0,   2,   0,   0,   0,
++      4,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0
++};
+diff --git a/src/ui/shaders/ssx_fg_color.cs.hlsl b/src/ui/shaders/ssx_fg_color.cs.hlsl
+new file mode 100644
+index 0000000..8b5febe
+--- /dev/null
++++ b/src/ui/shaders/ssx_fg_color.cs.hlsl
+@@ -0,0 +1,22 @@
++// SSX final full-screen copy, guest 8-bit target quantization, then the exact
++// 256-entry display LUT from IssueSwap. Final RGBA8 matches the SDR presenter.
++cbuffer Constants : register(b0) {
++  uint2 output_size;
++  uint2 reserved;
++  uint4 gamma_words[64];
++};
++Texture2D<float4> post_effects : register(t0);
++SamplerState linear_clamp : register(s0);
++RWTexture2D<unorm float4> hudless : register(u0);
++uint Gamma(uint code) { return gamma_words[code >> 2][code & 3]; }
++[numthreads(8, 8, 1)]
++void main(uint3 id : SV_DispatchThreadID) {
++  if (any(id.xy >= output_size)) return;
++  float2 uv = (float2(id.xy) + .5) / float2(output_size);
++  float3 rgb = post_effects.SampleLevel(linear_clamp, uv, 0).rgb;
++  uint3 code = uint3(saturate(rgb) * 255 + .5);
++  float3 display = float3((Gamma(code.r) >> 20) & 1023,
++                         (Gamma(code.g) >> 10) & 1023,
++                         Gamma(code.b) & 1023) / 1023;
++  hudless[id.xy] = float4(display, 1);
++}
+diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
+index bebfa30..809c602 100644
+--- a/tests/unit/CMakeLists.txt
++++ b/tests/unit/CMakeLists.txt
+@@ -16,6 +16,7 @@ add_executable(unit_tests
+     system/achievement_manager_test.cpp
+     system/function_dispatcher_test.cpp
+     input/input_assignment_test.cpp
++    graphics/guest_frame_timing_test.cpp
+     codegen/codegen_writer_test.cpp
+     codegen/output_partition_test.cpp
+     codegen/output_stamp_test.cpp
+diff --git a/tests/unit/graphics/guest_frame_timing_test.cpp b/tests/unit/graphics/guest_frame_timing_test.cpp
+new file mode 100644
+index 0000000..1dc9419
+--- /dev/null
++++ b/tests/unit/graphics/guest_frame_timing_test.cpp
+@@ -0,0 +1,58 @@
++#include <catch2/catch_test_macros.hpp>
++#include <rex/ui/guest_frame_timing.h>
++#include <thread>
++#include <set>
++
++using rex::ui::GuestFrameTiming;
++using Event = GuestFrameTiming::Event;
++
++TEST_CASE("SSX timing keeps concurrent records bounded and uniquely identified", "[ssx-timing]") {
++  GuestFrameTiming trace;
++  trace.BeginCapture(60000000000ull);
++  auto record = [&] {
++    for (unsigned i = 0; i < 20000; ++i)
++      trace.Add(Event::kGuestSwap, trace.NewId());
++  };
++  std::thread a(record), b(record);
++  a.join();
++  b.join();
++  const auto records = trace.FinishCapture();
++  REQUIRE(records.size() == GuestFrameTiming::kMaxRecords);
++  std::set<uint64_t> ids;
++  uint64_t previous = 0;
++  for (const auto& r : records) {
++    CHECK(r.time_ns >= previous);
++    previous = r.time_ns;
++    ids.insert(r.id);
++  }
++  CHECK(ids.size() == records.size());
++  CHECK_FALSE(trace.capturing());
++  trace.Add(Event::kGuestSwap, 1);
++  CHECK(trace.FinishCapture().empty());
++}
++
++TEST_CASE("SSX render scope is thread local and nested scopes restore identity", "[ssx-timing]") {
++  REQUIRE(GuestFrameTiming::ExchangeRender(19) == 0);
++  bool independent = false;
++  std::thread worker([&] {
++    independent = GuestFrameTiming::CurrentRender() == 0;
++    GuestFrameTiming::ExchangeRender(23);
++  });
++  worker.join();
++  CHECK(independent);
++  CHECK(GuestFrameTiming::CurrentRender() == 19);
++  CHECK(GuestFrameTiming::ExchangeRender(27) == 19);
++  CHECK(GuestFrameTiming::ExchangeRender(19) == 27);
++  CHECK(GuestFrameTiming::ExchangeRender(0) == 19);
++}
++
++TEST_CASE("SSX swap timing rejects unversioned payloads and preserves 64-bit IDs", "[ssx-timing]") {
++  using rex::ui::DecodeGuestTimingSwap;
++  CHECK(DecodeGuestTimingSwap(0, 0xFFFFFFFF, 0xFFFFFFFF) == 0);
++  CHECK(DecodeGuestTimingSwap(rex::ui::kGuestTimingSwapSignature, 0x89ABCDEF, 0x12345678) ==
++        0x1234567889ABCDEFull);
++  GuestFrameTiming trace;
++  trace.BeginCapture(0);
++  trace.Add(Event::kGuestSwap, 1);
++  CHECK(trace.FinishCapture().empty());
++}
+diff --git a/tests/unit/graphics/ssx_frame_inputs_test.cpp b/tests/unit/graphics/ssx_frame_inputs_test.cpp
+index 589c6ff..e844a8c 100644
+--- a/tests/unit/graphics/ssx_frame_inputs_test.cpp
++++ b/tests/unit/graphics/ssx_frame_inputs_test.cpp
+@@ -3,6 +3,43 @@
+ 
+ using namespace rex::ui::d3d12;
+ 
++TEST_CASE("SSX FG motion waits for both consumers and its producer fence", "[ssx-inputs]") {
++  SsxFGTemporalPool pool;
++  std::array<std::shared_ptr<const SsxFGTemporal>, SsxFGTemporalPool::kSlotCount> held;
++  for (size_t i = 0; i < held.size(); ++i) {
++    auto frame = pool.Acquire(10 + i, 0);
++    REQUIRE(frame);
++    frame->submission = 100 + i;
++    held[i] = std::move(frame);
++  }
++  CHECK_FALSE(pool.Acquire(20, 200));
++  auto consumer = held[0];
++  held[0].reset();
++  CHECK_FALSE(pool.Acquire(20, 200));
++  auto* original = consumer.get();
++  consumer.reset();
++  CHECK_FALSE(pool.Acquire(20, 99));
++  auto recycled = pool.Acquire(20, 100);
++  REQUIRE(recycled);
++  CHECK(recycled.get() == original);
++  CHECK(recycled->guest_frame == 20);
++  CHECK(held[1]->guest_frame == 11);
++}
++
++TEST_CASE("SSX frame recycling releases old FG motion without a reference cycle", "[ssx-inputs]") {
++  SsxFrameInputPool pool;
++  auto frame = pool.Acquire(1, 0);
++  auto motion = std::make_shared<SsxFGTemporal>();
++  std::weak_ptr<const SsxFGTemporal> weak = motion;
++  frame->fg_temporal = std::move(motion);
++  frame.reset();
++  CHECK_FALSE(weak.expired());
++  auto next = pool.Acquire(2, 0);
++  REQUIRE(next);
++  CHECK_FALSE(next->fg_temporal);
++  CHECK(weak.expired());
++}
++
+ TEST_CASE("SSX frozen scene boundary retains the producer pool slot", "[ssx-inputs]") {
+   SsxFrameInputPool pool;
+   auto producer=pool.Acquire(1,0);

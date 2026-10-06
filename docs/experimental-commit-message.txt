@@ -1,0 +1,34 @@
+Add experimental graphics options, independent HDR/DLAA and DLSS/FG controls
+
+AI assistance disclosure: I used ChatGPT ASTRA throughout the development of
+this contribution, including source investigation, implementation, debugging,
+launcher development and validation tooling. I directed the work and supplied
+gameplay testing and visual feedback. Original project, ReXGlue/Xenia and NVIDIA
+authorship and licenses remain intact; untested settings remain unverified.
+
+Integrate SSX scene inputs, native camera/rider motion, jitter, DLAA, Reflex,
+Frame Generation and native HDR through an ordered ReXGlue SDK patch series.
+Preserve pre-SDR scene highlights, original grading, later effects and HUD
+blending; include the user-confirmed Tricky transition grading correction.
+
+Add a native Windows options dialog. HDR is independent of DLAA/FG and internal
+scale; DLAA works at 1x through 3x with FG off. FG requires DLAA and Reflex.
+Expose DLSS model presets, experimental Quality/Balanced/Performance, FG output
+2x through 6x, HDR peak up to 3000 nits, calibration and original runtime options.
+Keep capability checks, explicit HDR fallback status and actual FG FPS reporting.
+
+Validation: SDK/game/launcher builds; 69 relevant SDK tests, two game hook tests,
+72 launcher configuration checks. Seven fixed-1000-nit GPU cases validate
+independent HDR decoding/composition at different extents. The complete patch
+series applies to a fresh pinned SDK checkout and matches the implementation.
+
+Limitations: new DLSS modes/presets, alternative FG multipliers and HDR peak
+brightnesses have deliberately NOT been gameplay/GPU-tested for this submission.
+Previous tests do not validate the final option matrix. DLSS uses integer raster
+scales plus input resizing where needed; conventional scaling performance gains
+are not established. Whole-game coverage and independent feature combinations
+still need gameplay validation. Physics remains 30 Hz, FG output is 16:9, and
+dynamic MFG and physical 3000-nit TV calibration are not implemented/verified.
+
+Game assets, generated game source, executables, vendor DLLs, saves, personal
+settings and captures are excluded from the source submission.

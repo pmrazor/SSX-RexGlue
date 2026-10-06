@@ -1,0 +1,715 @@
+diff --git a/include/rex/ui/d3d12/ssx_native_motion.h b/include/rex/ui/d3d12/ssx_native_motion.h
+index cd76451..1c683ea 100644
+--- a/include/rex/ui/d3d12/ssx_native_motion.h
++++ b/include/rex/ui/d3d12/ssx_native_motion.h
+@@ -55,7 +55,7 @@ class SsxNativeMotion {
+   std::array<Slot, 3> slots_;
+   std::shared_ptr<const SsxFrameInputs> previous_;
+   Microsoft::WRL::ComPtr<ID3D12RootSignature> root_;
+-  Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline_;
++  Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline_, statistics_pipeline_;
+   Microsoft::WRL::ComPtr<ID3D12Resource> zero_;
+   bool unavailable_ = false;
+   uint64_t last_readback_ = 0;
+diff --git a/include/rex/ui/d3d12/ssx_reconstruction.h b/include/rex/ui/d3d12/ssx_reconstruction.h
+index 83a2ad5..1e9a5ac 100644
+--- a/include/rex/ui/d3d12/ssx_reconstruction.h
++++ b/include/rex/ui/d3d12/ssx_reconstruction.h
+@@ -23,6 +23,7 @@ class SsxReconstruction {
+     const char* reason = "unavailable";
+     uint64_t timed_frame = 0;
+     double inputs_ms = 0, dlss_ms = 0, encode_ms = 0;
++    double color_ms = 0, camera_ms = 0, native_ms = 0;
+     std::shared_ptr<const SsxFGTemporal> fg_temporal;
+   };
+   SsxReconstruction();
+diff --git a/src/graphics/d3d12/ssx_frame_inputs.cpp b/src/graphics/d3d12/ssx_frame_inputs.cpp
+index b390891..598d0dc 100644
+--- a/src/graphics/d3d12/ssx_frame_inputs.cpp
++++ b/src/graphics/d3d12/ssx_frame_inputs.cpp
+@@ -464,12 +464,13 @@ bool D3D12CommandProcessor::ReconstructSsxScene(uint64_t vs, uint64_t ps,
+     REXGPU_INFO(
+         "SSX_RECONSTRUCT mode={} frame={} scene={}x{} scene_samples={} applied={} reset={} "
+         "reason={} insertion=before_tone_map output={}x{} post_scale={} timed_frame={} "
+-        "inputs_ms={:.3f} dlss_ms={:.3f} encode_ms={:.3f}",
++        "inputs_ms={:.3f} dlss_ms={:.3f} encode_ms={:.3f} "
++        "color_ms={:.3f} camera_ms={:.3f} native_ms={:.3f}",
+         ssx_other_render_target_cache_ ? "Quality" : "DLAA", frame_current_,
+         frozen->textures[0].width, frozen->textures[0].height, f.scene_msaa_samples, result.applied,
+         result.reset, result.reason, frozen->metadata.output_width, frozen->metadata.output_height,
+         ssx_other_render_target_cache_ ? 3 : f.scale_x, result.timed_frame, result.inputs_ms,
+-        result.dlss_ms, result.encode_ms);
++        result.dlss_ms, result.encode_ms, result.color_ms, result.camera_ms, result.native_ms);
+   }
+   restarted = true;
+   if (!BeginSubmission(true))
+diff --git a/src/ui/d3d12/ssx_native_motion.cpp b/src/ui/d3d12/ssx_native_motion.cpp
+index 9ba0a63..167eb1b 100644
+--- a/src/ui/d3d12/ssx_native_motion.cpp
++++ b/src/ui/d3d12/ssx_native_motion.cpp
+@@ -14,9 +14,16 @@ REXCVAR_DEFINE_STRING(d3d12_ssx_native_capture_path, "", "UI/D3D12",
+                       "it to read back one native motion frame.")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++REXCVAR_DEFINE_STRING(d3d12_ssx_native_statistics, "sampled", "UI/D3D12",
++                      "Native-motion diagnostic counters: sampled every 120 "
++                      "frames, off, or every_frame for performance comparisons. "
++                      "Does not change motion vectors or history.")
++    .allowed({"sampled", "off", "every_frame"});
++
+ namespace rex::ui::d3d12 {
+ namespace {
+ #include "ui/shaders/bytecode/d3d12_5_1/ssx_native_motion_ps.h"
++#include "ui/shaders/bytecode/d3d12_5_1/ssx_native_motion_fast_ps.h"
+ #include "ui/shaders/bytecode/d3d12_5_1/ssx_native_motion_vs.h"
+ using Microsoft::WRL::ComPtr;
+ struct Constants {
+@@ -88,7 +95,7 @@ bool SsxNativeMotion::Initialize(const D3D12Provider& provider) {
+   D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
+   d.pRootSignature = root_.Get();
+   d.VS = {ssx_native_motion_vs, sizeof(ssx_native_motion_vs)};
+-  d.PS = {ssx_native_motion_ps, sizeof(ssx_native_motion_ps)};
++  d.PS = {ssx_native_motion_fast_ps, sizeof(ssx_native_motion_fast_ps)};
+   d.SampleMask = UINT_MAX;
+   d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+   d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+@@ -104,6 +111,11 @@ bool SsxNativeMotion::Initialize(const D3D12Provider& provider) {
+   auto* device = provider.GetDevice();
+   if (FAILED(device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pipeline_))))
+     return false;
++  d.PS = {ssx_native_motion_ps, sizeof(ssx_native_motion_ps)};
++  if (FAILED(device->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&statistics_pipeline_)))) {
++    pipeline_.Reset();
++    return false;
++  }
+   if (!Buffer(device, 32, D3D12_HEAP_TYPE_UPLOAD,
+               D3D12_RESOURCE_STATE_GENERIC_READ, zero_)) {
+     pipeline_.Reset();
+@@ -118,6 +130,7 @@ bool SsxNativeMotion::Initialize(const D3D12Provider& provider) {
+   std::memset(data, 0, 32);
+   zero_->Unmap(0, nullptr);
+   pipeline_->SetName(L"SSX experimental native rider motion");
++  statistics_pipeline_->SetName(L"SSX native rider motion with diagnostic counters");
+   unavailable_ = false;
+   return true;
+ }
+@@ -407,6 +420,10 @@ SsxNativeMotion::Result SsxNativeMotion::Record(
+     }
+   if (!chosen || !Prepare(provider, *chosen)) return result;
+   auto& slot = *chosen;
++  const auto& statistics_mode = REXCVAR_GET(d3d12_ssx_native_statistics);
++  const bool read_counters =
++      statistics_mode != "off" && (!last_readback_ || camera.plan.frame - last_readback_ >= 120);
++  const bool collect_counters = read_counters || statistics_mode == "every_frame";
+   auto* device = provider.GetDevice();
+   auto depth = frame->textures[size_t(SsxInput::kResolvedDepth)].resource.Get();
+   D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+@@ -426,13 +443,15 @@ SsxNativeMotion::Result SsxNativeMotion::Record(
+              D3D12_RESOURCE_STATE_RENDER_TARGET);
+   Transition(list, camera.validity, GuestInputTexture::kReadState,
+              D3D12_RESOURCE_STATE_RENDER_TARGET);
+-  list->CopyBufferRegion(slot.counters.Get(), 0, zero_.Get(), 0, 32);
+-  Transition(list, slot.counters.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+-             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++  if (collect_counters) {
++    list->CopyBufferRegion(slot.counters.Get(), 0, zero_.Get(), 0, 32);
++    Transition(list, slot.counters.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
++               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++  }
+   ID3D12DescriptorHeap* heaps[] = {slot.depth_heap.Get()};
+   list->SetDescriptorHeaps(1, heaps);
+   list->SetGraphicsRootSignature(root_.Get());
+-  list->SetPipelineState(pipeline_.Get());
++  list->SetPipelineState(collect_counters ? statistics_pipeline_.Get() : pipeline_.Get());
+   list->SetGraphicsRootShaderResourceView(
+       1, current_geometry.buffer->GetGPUVirtualAddress());
+   list->SetGraphicsRootShaderResourceView(
+@@ -481,16 +500,21 @@ SsxNativeMotion::Result SsxNativeMotion::Record(
+              GuestInputTexture::kReadState);
+   Transition(list, camera.validity, D3D12_RESOURCE_STATE_RENDER_TARGET,
+              GuestInputTexture::kReadState);
+-  Transition(list, slot.counters.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+-             D3D12_RESOURCE_STATE_COPY_SOURCE);
+-  if (!last_readback_ || camera.plan.frame - last_readback_ >= 120) {
+-    list->CopyBufferRegion(slot.readback.Get(), 0, slot.counters.Get(), 0, 32);
+-    slot.pending = true;
+-    slot.frame = camera.plan.frame;
+-    last_readback_ = camera.plan.frame;
++  if (collect_counters) {
++    if (read_counters) {
++      Transition(list, slot.counters.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++                 D3D12_RESOURCE_STATE_COPY_SOURCE);
++      list->CopyBufferRegion(slot.readback.Get(), 0, slot.counters.Get(), 0, 32);
++      slot.pending = true;
++      slot.frame = camera.plan.frame;
++      last_readback_ = camera.plan.frame;
++      Transition(list, slot.counters.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
++                 D3D12_RESOURCE_STATE_COPY_DEST);
++    } else {
++      Transition(list, slot.counters.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++                 D3D12_RESOURCE_STATE_COPY_DEST);
++    }
+   }
+-  Transition(list, slot.counters.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+-             D3D12_RESOURCE_STATE_COPY_DEST);
+   slot.current = frame;
+   slot.previous = previous;
+   slot.submission = submission;
+diff --git a/src/ui/d3d12/ssx_reconstruction.cpp b/src/ui/d3d12/ssx_reconstruction.cpp
+index a57c6af..f18d57d 100644
+--- a/src/ui/d3d12/ssx_reconstruction.cpp
++++ b/src/ui/d3d12/ssx_reconstruction.cpp
+@@ -184,9 +184,9 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+   if (profile && !p.queries) {
+     D3D12_QUERY_HEAP_DESC q{};
+     q.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+-    q.Count = 12;
++    q.Count = 18;
+     D3D12_RESOURCE_DESC buffer{};
+-    util::FillBufferResourceDesc(buffer, 12 * sizeof(uint64_t), D3D12_RESOURCE_FLAG_NONE);
++    util::FillBufferResourceDesc(buffer, 18 * sizeof(uint64_t), D3D12_RESOURCE_FLAG_NONE);
+     if (FAILED(provider.GetDevice()->CreateQueryHeap(&q, IID_PPV_ARGS(&p.queries))) ||
+         FAILED(provider.GetDevice()->CreateCommittedResource(
+             &util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &buffer,
+@@ -225,22 +225,27 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+     result.reason = "slot_fence";
+     return result;
+   }
+-  const uint32_t query_base = uint32_t(submission % p.slots.size()) * 4;
++  const uint32_t query_base = uint32_t(submission % p.slots.size()) * 6;
+   if (p.queries && slot.timed_frame) {
+     void* mapped = nullptr;
+-    D3D12_RANGE range{query_base * sizeof(uint64_t), (query_base + 4) * sizeof(uint64_t)};
++    D3D12_RANGE range{query_base * sizeof(uint64_t), (query_base + 6) * sizeof(uint64_t)};
+     if (SUCCEEDED(p.timings->Map(0, &range, &mapped))) {
+       const auto* ticks = static_cast<const uint64_t*>(mapped);
+-      if (ticks[query_base + 1] >= ticks[query_base] &&
+-          ticks[query_base + 2] >= ticks[query_base + 1] &&
+-          ticks[query_base + 3] >= ticks[query_base + 2] && p.timestamp_frequency) {
++      bool ordered = p.timestamp_frequency != 0;
++      for (uint32_t i = 1; i < 6; ++i)
++        ordered = ordered && ticks[query_base + i] >= ticks[query_base + i - 1];
++      if (ordered) {
++        const auto elapsed = [&](uint32_t first, uint32_t last) {
++          return 1000.0 * double(ticks[query_base + last] - ticks[query_base + first]) /
++                 p.timestamp_frequency;
++        };
+         result.timed_frame = slot.timed_frame;
+-        result.inputs_ms =
+-            1000.0 * double(ticks[query_base + 1] - ticks[query_base]) / p.timestamp_frequency;
+-        result.dlss_ms =
+-            1000.0 * double(ticks[query_base + 2] - ticks[query_base + 1]) / p.timestamp_frequency;
+-        result.encode_ms =
+-            1000.0 * double(ticks[query_base + 3] - ticks[query_base + 2]) / p.timestamp_frequency;
++        result.color_ms = elapsed(0, 1);
++        result.camera_ms = elapsed(1, 2);
++        result.native_ms = elapsed(2, 3);
++        result.inputs_ms = elapsed(0, 3);
++        result.dlss_ms = elapsed(3, 4);
++        result.encode_ms = elapsed(4, 5);
+       }
+       D3D12_RANGE none{0, 0};
+       p.timings->Unmap(0, &none);
+@@ -265,9 +270,11 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+   stamp(0);
+   list->BeginEvent(1, "SSX DLSS before tone map", sizeof("SSX DLSS before tone map"));
+   const auto linear = p.color.Record(provider, list, frame, submission, completed);
++  stamp(1);
+   const auto motion = p.camera.Record(provider, list, frame, submission, completed, seconds);
++  stamp(2);
+   const auto native = p.native.Record(provider, list, frame, motion, submission, completed);
+-  stamp(1);
++  stamp(3);
+   bool evaluated = false;
+   std::shared_ptr<SsxFGTemporal> fg_temporal;
+   Streamline::SRFrame sr_frame;
+@@ -288,7 +295,7 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+       Transition(list, resource, GuestInputTexture::kReadState,
+                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+     const auto evaluation = p.sr->EvaluateSR(list, sr_frame);
+-    stamp(2);
++    stamp(4);
+     evaluated = true;
+     for (auto* resource : {sr_frame.color, sr_frame.depth, sr_frame.motion})
+       Transition(list, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+@@ -372,10 +379,10 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+     }
+   }
+   if (!evaluated)
+-    stamp(2);
+-  stamp(3);
++    stamp(4);
++  stamp(5);
+   if (p.queries) {
+-    list->ResolveQueryData(p.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query_base, 4,
++    list->ResolveQueryData(p.queries.Get(), D3D12_QUERY_TYPE_TIMESTAMP, query_base, 6,
+                            p.timings.Get(), query_base * sizeof(uint64_t));
+     slot.timed_frame = f.guest_frame;
+   }
+diff --git a/src/ui/shaders/bytecode/d3d12_5_1/ssx_native_motion_fast_ps.h b/src/ui/shaders/bytecode/d3d12_5_1/ssx_native_motion_fast_ps.h
+new file mode 100644
+index 0000000..94bd77c
+--- /dev/null
++++ b/src/ui/shaders/bytecode/d3d12_5_1/ssx_native_motion_fast_ps.h
+@@ -0,0 +1,429 @@
++#if 0
++//
++// Generated by Microsoft (R) HLSL Shader Compiler 10.1
++//
++//
++// Buffer Definitions:
++//
++// cbuffer Constants
++// {
++//
++//   row_major float4x4 current_camera; // Offset:    0 Size:    64 [unused]
++//   row_major float4x4 previous_camera;// Offset:   64 Size:    64 [unused]
++//   float4 current_viewport;           // Offset:  128 Size:    16 [unused]
++//   float4 previous_viewport;          // Offset:  144 Size:    16
++//   uint4 offsets;                     // Offset:  160 Size:    16 [unused]
++//   uint4 counts;                      // Offset:  176 Size:    16 [unused]
++//   uint4 size;                        // Offset:  192 Size:    16
++//
++// }
++//
++//
++// Resource Bindings:
++//
++// Name                                 Type  Format         Dim      ID      HLSL Bind  Count
++// ------------------------------ ---------- ------- ----------- ------- -------------- ------
++// scene_depth                       texture   float          2d      T0             t2      1
++// Constants                         cbuffer      NA          NA     CB0            cb0      1
++//
++//
++//
++// Input signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// SV_Position              0   xyzw        0      POS   float   xyz
++// TEXCOORD                 0   xyzw        1     NONE   float   xy w
++// TEXCOORD                 1   xyz         2     NONE   float
++//
++//
++// Output signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// SV_Target                0   xy          0   TARGET   float   xy
++// SV_Target                1   x           1   TARGET    uint   x
++//
++ps_5_1
++dcl_globalFlags refactoringAllowed
++dcl_constantbuffer CB0[0:0][13], immediateIndexed, space=0
++dcl_resource_texture2d (float,float,float,float) T0[2:2], space=0
++dcl_input_ps_siv linear noperspective v0.xyz, position
++dcl_input_ps linear v1.xyw
++dcl_output o0.xy
++dcl_output o1.x
++dcl_temps 2
++ftou r0.xy, v0.xyxx
++uge r1.xy, r0.xyxx, CB0[0][12].xyxx
++or r1.x, r1.y, r1.x
++if_nz r1.x
++  discard_nz l(-1)
++endif
++mov r0.zw, l(0,0,0,0)
++ld r0.x, r0.xyzw, T0[2].xyzw
++lt r0.y, l(0.000000), r0.x
++ge r0.z, l(1.000000), r0.x
++and r0.y, r0.z, r0.y
++not r0.y, r0.y
++add r0.z, r0.x, -v0.z
++mul r0.x, r0.x, l(0.000100)
++max r0.x, r0.x, l(0.000002)
++lt r0.x, r0.x, |r0.z|
++or r0.x, r0.x, r0.y
++if_nz r0.x
++  discard_nz l(-1)
++endif
++div r0.xy, v1.xyxx, v1.wwww
++mad r0.xy, r0.xyxx, CB0[0][9].xyxx, CB0[0][9].zwzz
++add r0.xy, r0.xyxx, -v0.xyxx
++and r0.zw, r0.xxxy, l(0, 0, 0x7f800000, 0x7f800000)
++ine r0.zw, r0.zzzw, l(0, 0, 0x7f800000, 0x7f800000)
++and r0.z, r0.w, r0.z
++if_z r0.z
++  discard_nz l(-1)
++endif
++mov o0.xy, r0.xyxx
++mov o1.x, l(2)
++ret
++// Approximately 32 instruction slots used
++#endif
++
++const BYTE ssx_native_motion_fast_ps[] =
++{
++     68,  88,  66,  67,  75,  70,
++      6, 214, 147, 196, 212,  18,
++    160, 169,  65, 148,  96, 227,
++    226,  78,   1,   0,   0,   0,
++    220,   7,   0,   0,   5,   0,
++      0,   0,  52,   0,   0,   0,
++     16,   3,   0,   0, 128,   3,
++      0,   0, 204,   3,   0,   0,
++     64,   7,   0,   0,  82,  68,
++     69,  70, 212,   2,   0,   0,
++      1,   0,   0,   0, 164,   0,
++      0,   0,   2,   0,   0,   0,
++     60,   0,   0,   0,   1,   5,
++    255, 255,   0, 133,   4,   0,
++    172,   2,   0,   0,  19,  19,
++     68,  37,  60,   0,   0,   0,
++     24,   0,   0,   0,  40,   0,
++      0,   0,  40,   0,   0,   0,
++     36,   0,   0,   0,  12,   0,
++      0,   0,   0,   0,   0,   0,
++    140,   0,   0,   0,   2,   0,
++      0,   0,   5,   0,   0,   0,
++      4,   0,   0,   0, 255, 255,
++    255, 255,   2,   0,   0,   0,
++      1,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0, 152,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
++      0,   0,   1,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0, 115,  99, 101, 110,
++    101,  95, 100, 101, 112, 116,
++    104,   0,  67, 111, 110, 115,
++    116,  97, 110, 116, 115,   0,
++    171, 171, 152,   0,   0,   0,
++      7,   0,   0,   0, 188,   0,
++      0,   0, 208,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0, 212,   1,   0,   0,
++      0,   0,   0,   0,  64,   0,
++      0,   0,   0,   0,   0,   0,
++    236,   1,   0,   0,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++     16,   2,   0,   0,  64,   0,
++      0,   0,  64,   0,   0,   0,
++      0,   0,   0,   0, 236,   1,
++      0,   0,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0,  32,   2,
++      0,   0, 128,   0,   0,   0,
++     16,   0,   0,   0,   0,   0,
++      0,   0,  56,   2,   0,   0,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0,  92,   2,   0,   0,
++    144,   0,   0,   0,  16,   0,
++      0,   0,   2,   0,   0,   0,
++     56,   2,   0,   0,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++    110,   2,   0,   0, 160,   0,
++      0,   0,  16,   0,   0,   0,
++      0,   0,   0,   0, 124,   2,
++      0,   0,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0, 160,   2,
++      0,   0, 176,   0,   0,   0,
++     16,   0,   0,   0,   0,   0,
++      0,   0, 124,   2,   0,   0,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0, 167,   2,   0,   0,
++    192,   0,   0,   0,  16,   0,
++      0,   0,   2,   0,   0,   0,
++    124,   2,   0,   0,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++     99, 117, 114, 114, 101, 110,
++    116,  95,  99,  97, 109, 101,
++    114,  97,   0, 102, 108, 111,
++     97, 116,  52, 120,  52,   0,
++      2,   0,   3,   0,   4,   0,
++      4,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0, 227,   1,   0,   0,
++    112, 114, 101, 118, 105, 111,
++    117, 115,  95,  99,  97, 109,
++    101, 114,  97,   0,  99, 117,
++    114, 114, 101, 110, 116,  95,
++    118, 105, 101, 119, 112, 111,
++    114, 116,   0, 102, 108, 111,
++     97, 116,  52,   0,   1,   0,
++      3,   0,   1,   0,   4,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     49,   2,   0,   0, 112, 114,
++    101, 118, 105, 111, 117, 115,
++     95, 118, 105, 101, 119, 112,
++    111, 114, 116,   0, 111, 102,
++    102, 115, 101, 116, 115,   0,
++    117, 105, 110, 116,  52,   0,
++      1,   0,  19,   0,   1,   0,
++      4,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0, 118,   2,   0,   0,
++     99, 111, 117, 110, 116, 115,
++      0, 115, 105, 122, 101,   0,
++     77, 105,  99, 114, 111, 115,
++    111, 102, 116,  32,  40,  82,
++     41,  32,  72,  76,  83,  76,
++     32,  83, 104,  97, 100, 101,
++    114,  32,  67, 111, 109, 112,
++    105, 108, 101, 114,  32,  49,
++     48,  46,  49,   0,  73,  83,
++     71,  78, 104,   0,   0,   0,
++      3,   0,   0,   0,   8,   0,
++      0,   0,  80,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
++      0,   0,   3,   0,   0,   0,
++      0,   0,   0,   0,  15,   7,
++      0,   0,  92,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   3,   0,   0,   0,
++      1,   0,   0,   0,  15,  11,
++      0,   0,  92,   0,   0,   0,
++      1,   0,   0,   0,   0,   0,
++      0,   0,   3,   0,   0,   0,
++      2,   0,   0,   0,   7,   0,
++      0,   0,  83,  86,  95,  80,
++    111, 115, 105, 116, 105, 111,
++    110,   0,  84,  69,  88,  67,
++     79,  79,  82,  68,   0, 171,
++    171, 171,  79,  83,  71,  78,
++     68,   0,   0,   0,   2,   0,
++      0,   0,   8,   0,   0,   0,
++     56,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      3,   0,   0,   0,   0,   0,
++      0,   0,   3,  12,   0,   0,
++     56,   0,   0,   0,   1,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,   1,   0,
++      0,   0,   1,  14,   0,   0,
++     83,  86,  95,  84,  97, 114,
++    103, 101, 116,   0, 171, 171,
++     83,  72,  69,  88, 108,   3,
++      0,   0,  81,   0,   0,   0,
++    219,   0,   0,   0, 106,   8,
++      0,   1,  89,   0,   0,   7,
++     70, 142,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  13,   0,
++      0,   0,   0,   0,   0,   0,
++     88,  24,   0,   7,  70, 126,
++     48,   0,   0,   0,   0,   0,
++      2,   0,   0,   0,   2,   0,
++      0,   0,  85,  85,   0,   0,
++      0,   0,   0,   0, 100,  32,
++      0,   4, 114,  16,  16,   0,
++      0,   0,   0,   0,   1,   0,
++      0,   0,  98,  16,   0,   3,
++    178,  16,  16,   0,   1,   0,
++      0,   0, 101,   0,   0,   3,
++     50,  32,  16,   0,   0,   0,
++      0,   0, 101,   0,   0,   3,
++     18,  32,  16,   0,   1,   0,
++      0,   0, 104,   0,   0,   2,
++      2,   0,   0,   0,  28,   0,
++      0,   5,  50,   0,  16,   0,
++      0,   0,   0,   0,  70,  16,
++     16,   0,   0,   0,   0,   0,
++     80,   0,   0,   9,  50,   0,
++     16,   0,   1,   0,   0,   0,
++     70,   0,  16,   0,   0,   0,
++      0,   0,  70, 128,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  12,   0,   0,   0,
++     60,   0,   0,   7,  18,   0,
++     16,   0,   1,   0,   0,   0,
++     26,   0,  16,   0,   1,   0,
++      0,   0,  10,   0,  16,   0,
++      1,   0,   0,   0,  31,   0,
++      4,   3,  10,   0,  16,   0,
++      1,   0,   0,   0,  13,   0,
++      4,   3,   1,  64,   0,   0,
++    255, 255, 255, 255,  21,   0,
++      0,   1,  54,   0,   0,   8,
++    194,   0,  16,   0,   0,   0,
++      0,   0,   2,  64,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  45,   0,
++      0,   8,  18,   0,  16,   0,
++      0,   0,   0,   0,  70,  14,
++     16,   0,   0,   0,   0,   0,
++     70, 126,  32,   0,   0,   0,
++      0,   0,   2,   0,   0,   0,
++     49,   0,   0,   7,  34,   0,
++     16,   0,   0,   0,   0,   0,
++      1,  64,   0,   0,   0,   0,
++      0,   0,  10,   0,  16,   0,
++      0,   0,   0,   0,  29,   0,
++      0,   7,  66,   0,  16,   0,
++      0,   0,   0,   0,   1,  64,
++      0,   0,   0,   0, 128,  63,
++     10,   0,  16,   0,   0,   0,
++      0,   0,   1,   0,   0,   7,
++     34,   0,  16,   0,   0,   0,
++      0,   0,  42,   0,  16,   0,
++      0,   0,   0,   0,  26,   0,
++     16,   0,   0,   0,   0,   0,
++     59,   0,   0,   5,  34,   0,
++     16,   0,   0,   0,   0,   0,
++     26,   0,  16,   0,   0,   0,
++      0,   0,   0,   0,   0,   8,
++     66,   0,  16,   0,   0,   0,
++      0,   0,  10,   0,  16,   0,
++      0,   0,   0,   0,  42,  16,
++     16, 128,  65,   0,   0,   0,
++      0,   0,   0,   0,  56,   0,
++      0,   7,  18,   0,  16,   0,
++      0,   0,   0,   0,  10,   0,
++     16,   0,   0,   0,   0,   0,
++      1,  64,   0,   0,  23, 183,
++    209,  56,  52,   0,   0,   7,
++     18,   0,  16,   0,   0,   0,
++      0,   0,  10,   0,  16,   0,
++      0,   0,   0,   0,   1,  64,
++      0,   0, 189,  55,   6,  54,
++     49,   0,   0,   8,  18,   0,
++     16,   0,   0,   0,   0,   0,
++     10,   0,  16,   0,   0,   0,
++      0,   0,  42,   0,  16, 128,
++    129,   0,   0,   0,   0,   0,
++      0,   0,  60,   0,   0,   7,
++     18,   0,  16,   0,   0,   0,
++      0,   0,  10,   0,  16,   0,
++      0,   0,   0,   0,  26,   0,
++     16,   0,   0,   0,   0,   0,
++     31,   0,   4,   3,  10,   0,
++     16,   0,   0,   0,   0,   0,
++     13,   0,   4,   3,   1,  64,
++      0,   0, 255, 255, 255, 255,
++     21,   0,   0,   1,  14,   0,
++      0,   7,  50,   0,  16,   0,
++      0,   0,   0,   0,  70,  16,
++     16,   0,   1,   0,   0,   0,
++    246,  31,  16,   0,   1,   0,
++      0,   0,  50,   0,   0,  13,
++     50,   0,  16,   0,   0,   0,
++      0,   0,  70,   0,  16,   0,
++      0,   0,   0,   0,  70, 128,
++     48,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   9,   0,
++      0,   0, 230, 138,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   9,   0,   0,   0,
++      0,   0,   0,   8,  50,   0,
++     16,   0,   0,   0,   0,   0,
++     70,   0,  16,   0,   0,   0,
++      0,   0,  70,  16,  16, 128,
++     65,   0,   0,   0,   0,   0,
++      0,   0,   1,   0,   0,  10,
++    194,   0,  16,   0,   0,   0,
++      0,   0,   6,   4,  16,   0,
++      0,   0,   0,   0,   2,  64,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++    128, 127,   0,   0, 128, 127,
++     39,   0,   0,  10, 194,   0,
++     16,   0,   0,   0,   0,   0,
++    166,  14,  16,   0,   0,   0,
++      0,   0,   2,  64,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0, 128, 127,
++      0,   0, 128, 127,   1,   0,
++      0,   7,  66,   0,  16,   0,
++      0,   0,   0,   0,  58,   0,
++     16,   0,   0,   0,   0,   0,
++     42,   0,  16,   0,   0,   0,
++      0,   0,  31,   0,   0,   3,
++     42,   0,  16,   0,   0,   0,
++      0,   0,  13,   0,   4,   3,
++      1,  64,   0,   0, 255, 255,
++    255, 255,  21,   0,   0,   1,
++     54,   0,   0,   5,  50,  32,
++     16,   0,   0,   0,   0,   0,
++     70,   0,  16,   0,   0,   0,
++      0,   0,  54,   0,   0,   5,
++     18,  32,  16,   0,   1,   0,
++      0,   0,   1,  64,   0,   0,
++      2,   0,   0,   0,  62,   0,
++      0,   1,  83,  84,  65,  84,
++    148,   0,   0,   0,  32,   0,
++      0,   0,   2,   0,   0,   0,
++      0,   0,   0,   0,   4,   0,
++      0,   0,   9,   0,   0,   0,
++      1,   0,   0,   0,   7,   0,
++      0,   0,   1,   0,   0,   0,
++      3,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   3,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0
++};
+diff --git a/src/ui/shaders/ssx_native_motion.hlsl b/src/ui/shaders/ssx_native_motion.hlsl
+index c33460e..281223b 100644
+--- a/src/ui/shaders/ssx_native_motion.hlsl
++++ b/src/ui/shaders/ssx_native_motion.hlsl
+@@ -13,7 +13,12 @@ cbuffer Constants : register(b0) {
+ ByteAddressBuffer current_geometry : register(t0);
+ ByteAddressBuffer previous_geometry : register(t1);
+ Texture2D<float> scene_depth : register(t2);
++#ifndef SSX_NATIVE_STATISTICS
++#define SSX_NATIVE_STATISTICS 1
++#endif
++#if SSX_NATIVE_STATISTICS
+ RWByteAddressBuffer statistics : register(u2);
++#endif
+ 
+ uint3 Swap32(uint3 v) {
+   v = ((v & 0x00FF00FF) << 8) | ((v >> 8) & 0x00FF00FF);
+@@ -81,11 +86,14 @@ Targets ps_main(Varying input) {
+                           previous_viewport.xy + previous_viewport.zw;
+   float2 motion = previous_pixel - input.position.xy;
+   if (!all(isfinite(motion))) discard;
++#if SSX_NATIVE_STATISTICS
++  // Diagnostics only. The ordinary PS variant has no UAV or global atomics.
+   uint ignored;
+   statistics.InterlockedAdd(0, 1, ignored);
+   if (length(motion) > .01) statistics.InterlockedAdd(4, 1, ignored);
+   statistics.InterlockedMax(8, asuint(length(motion)), ignored);
+   statistics.InterlockedMax(12, asuint(length(input.world_delta)), ignored);
++#endif
+   Targets result;
+   result.motion = motion;
+   result.validity = 2; // Native geometry correspondence; still experimental.

@@ -89,6 +89,11 @@
             "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
         },
         {
+            "name": "win-amd64-streamline",
+            "displayName": "Windows AMD64 Streamline development checkpoint",
+            "inherits": "win-amd64-release"
+        },
+        {
             "name": "linux-amd64-debug",
             "displayName": "Linux AMD64 Debug",
             "inherits": "linux-base",
@@ -188,6 +193,7 @@
     "buildPresets": [
         { "name": "win-amd64-debug", "configurePreset": "win-amd64-debug" },
         { "name": "win-amd64-release", "configurePreset": "win-amd64-release" },
+        { "name": "win-amd64-streamline", "configurePreset": "win-amd64-streamline" },
         { "name": "win-amd64-relwithdebinfo", "configurePreset": "win-amd64-relwithdebinfo" },
         { "name": "linux-amd64-debug", "configurePreset": "linux-amd64-debug" },
         { "name": "linux-amd64-release", "configurePreset": "linux-amd64-release" },

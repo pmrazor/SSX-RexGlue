@@ -1,0 +1,897 @@
+diff --git a/include/rex/ui/d3d12/streamline.h b/include/rex/ui/d3d12/streamline.h
+index 2632564..b5e75b6 100644
+--- a/include/rex/ui/d3d12/streamline.h
++++ b/include/rex/ui/d3d12/streamline.h
+@@ -81,7 +81,10 @@ class Streamline {
+   bool ConfigureReflex(ReflexMode mode, uint32_t frame_limit_us = 0);
+   // Sleeps before SimulationStart, even with Reflex Off. Invoke immediately
+   // before input sampling and simulation, not from a presentation-only callback.
+-  std::shared_ptr<Frame> BeginFrame();
++  std::shared_ptr<Frame> BeginFrame(uint64_t ssx_worker_id = 0);
++  // Explicit coupled SSX experiment; full markers follow real worker input.
++  bool EnableSsxReflex();
++  bool CanPaintSsxFrame(const std::shared_ptr<Frame>& frame);
+   bool MarkFrame(const std::shared_ptr<Frame>& frame, Marker marker);
+   uint32_t LatencyPingMessage() const;
+   // The token ID is diagnostic identity, not a timestamp or a guest frame index.
+diff --git a/include/rex/ui/guest_frame_timing.h b/include/rex/ui/guest_frame_timing.h
+index d13d12b..a4da2cd 100644
+--- a/include/rex/ui/guest_frame_timing.h
++++ b/include/rex/ui/guest_frame_timing.h
+@@ -49,7 +49,18 @@ class GuestFrameTiming {
+     kNvidiaTokenEvaluated,
+     kNvidiaTokenPresented,
+     kNvidiaTokenDropped,
+-    kNvidiaTokenRepeated
++    kNvidiaTokenRepeated,
++    kReflexSleepBegin,
++    kReflexSleepEnd,
++    kReflexSimulationStart,
++    kReflexSimulationEnd,
++    kReflexRenderStart,
++    kReflexRenderEnd,
++    kReflexPresentStart,
++    kReflexPresentEnd,
++    kReflexBind,
++    kReflexAbort,
++    kReflexInput
+   };
+   struct Record {
+     uint64_t time_ns, id, related, detail;
+diff --git a/include/rex/ui/guest_reflex.h b/include/rex/ui/guest_reflex.h
+new file mode 100644
+index 0000000..f64c420
+--- /dev/null
++++ b/include/rex/ui/guest_reflex.h
+@@ -0,0 +1,56 @@
++// Opt-in SSX coupling: one actual input/simulation update per rendered frame.
++#pragma once
++#include <array>
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <functional>
++#include <mutex>
++#include <string>
++
++namespace rex::ui {
++class GuestReflex {
++ public:
++  struct Backend {
++    std::function<bool(uint64_t)> begin, end;
++    std::function<bool(uint64_t, uint64_t)> bind;
++    std::function<void(uint64_t)> cancel, complete;
++    std::function<void(uint64_t, bool, bool)> input;
++  };
++  struct Sample {
++    uint64_t key = 0, generation = 0, timestamp = 0;
++  };
++  static GuestReflex& Get();
++  static std::string RequestedMode();
++  void Attach(const void* owner, Backend backend);
++  void Detach(const void* owner);
++  bool enabled();
++  // Called outside guest locks, before original worker code / controller reads.
++  bool BeginWorker(uint64_t worker);
++  void Input(uint64_t worker);
++  void Published(uint64_t worker, Sample sample);
++  void EndWorker(uint64_t worker);
++  // Called before normal render job takes renderer/device locks.
++  bool WaitForRender(uint64_t render);
++  bool Selection(uint64_t render, uint32_t channel, Sample& sample);
++  void Complete(uint64_t render);
++  void Abort(uint64_t render);
++  // UI enqueues pings; backend consumes them at actual worker input sampling.
++  void QueuePing();
++  void QueueFlash();
++  void SetPingMessage(uint32_t message);
++  uint32_t PingMessage();
++
++ private:
++  void CancelLocked();
++  std::mutex mutex_;
++  std::condition_variable changed_;
++  const void* owner_ = nullptr;
++  Backend backend_;
++  uint64_t wanted_ = 0, worker_ = 0, render_ = 0;
++  bool finished_ = false, input_ = false, ping_ = false, flash_ = false;
++  uint32_t ping_message_ = 0;
++  std::array<Sample, 2> samples_{};
++  static constexpr auto kWait = std::chrono::milliseconds(500);
++};
++}  // namespace rex::ui
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index 649bc54..6e07a94 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -3,6 +3,7 @@
+ # Core UI sources
+ set(REXUI_CORE_SOURCES
+     guest_frame_timing.cpp
++    guest_reflex.cpp
+     graphics_upload_buffer_pool.cpp
+     graphics_util.cpp
+     image_decode.cpp
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 45f6df0..e08657d 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -1,4 +1,5 @@
+ #include <rex/ui/guest_frame_timing.h>
++#include <rex/ui/guest_reflex.h>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -583,6 +584,31 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
+ }
+ 
+ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawers) {
++  GuestOutputProperties guest_output_properties;
++  GuestOutputPaintConfig guest_output_paint_config;
++  Microsoft::WRL::ComPtr<ID3D12Resource> guest_output_resource;
++  std::shared_ptr<const SsxFrameInputs> frame_inputs;
++  uint64_t timing_id = 0;
++  std::shared_ptr<Streamline::Frame> frame_token;
++  {
++    uint32_t guest_output_mailbox_index;
++    std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
++        guest_output_mailbox_index, &guest_output_properties, &guest_output_paint_config));
++    if (guest_output_mailbox_index != UINT32_MAX) {
++      guest_output_resource = guest_output_resources_[guest_output_mailbox_index].second;
++      frame_inputs = guest_frame_inputs_[guest_output_mailbox_index];
++      timing_id = guest_timing_ids_[guest_output_mailbox_index];
++      frame_token = guest_frame_tokens_[guest_output_mailbox_index];
++    }
++    // Incremented the reference count of the guest output resource - safe to
++    // leave the consumer critical section now as everything here either will be
++    // using the new reference or is exclusively owned by main target painting
++    // (and multiple threads can't paint the main target at the same time).
++  }
++
++  if (auto* sl = provider_.GetStreamline(); sl && !sl->CanPaintSsxFrame(frame_token))
++    return PaintResult::kNotPresented;
++
+   // Begin the command list with the command allocator not currently potentially
+   // used on the GPU.
+   UINT64 current_paint_submission = paint_context_.paint_submission_tracker.GetCurrentSubmission();
+@@ -613,28 +639,6 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+ 
+   // Draw the guest output.
+ 
+-  GuestOutputProperties guest_output_properties;
+-  GuestOutputPaintConfig guest_output_paint_config;
+-  Microsoft::WRL::ComPtr<ID3D12Resource> guest_output_resource;
+-  std::shared_ptr<const SsxFrameInputs> frame_inputs;
+-  uint64_t timing_id = 0;
+-  std::shared_ptr<Streamline::Frame> frame_token;
+-  {
+-    uint32_t guest_output_mailbox_index;
+-    std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
+-        guest_output_mailbox_index, &guest_output_properties, &guest_output_paint_config));
+-    if (guest_output_mailbox_index != UINT32_MAX) {
+-      guest_output_resource = guest_output_resources_[guest_output_mailbox_index].second;
+-      frame_inputs = guest_frame_inputs_[guest_output_mailbox_index];
+-      timing_id = guest_timing_ids_[guest_output_mailbox_index];
+-      frame_token = guest_frame_tokens_[guest_output_mailbox_index];
+-    }
+-    // Incremented the reference count of the guest output resource - safe to
+-    // leave the consumer critical section now as everything here either will be
+-    // using the new reference or is exclusively owned by main target painting
+-    // (and multiple threads can't paint the main target at the same time).
+-  }
+-
+   const auto inputs_completed = paint_context_.paint_submission_tracker.GetCompletedSubmission();
+   paint_context_.fg_capture.Record(device, command_list, frame_inputs, guest_output_resource.Get(),
+                                    current_paint_submission, inputs_completed);
+@@ -1255,8 +1259,12 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   if (auto* sl = provider_.GetStreamline(); sl && GuestFrameTiming::ContinuousMarkersEnabled()) {
+     const auto token_result = sl->PresentRenderToken(frame_token, present);
+     present_result = token_result.result;
++    if (token_result.matched)
++      GuestReflex::Get().Complete(token_result.render_id);
++    else if (token_result.render_id)
++      GuestReflex::Get().Abort(token_result.render_id);
+     if (token_result.matched && token_result.render_id % 120 < 3)
+-      REXGPU_INFO("SSX_TOKEN_PRESENT render={} nvidia={} result={:08X} reflex=false fg=false",
++      REXGPU_INFO("SSX_TOKEN_PRESENT render={} nvidia={} result={:08X} fg=false",
+                   token_result.render_id, token_result.token_id, uint32_t(present_result));
+   } else {
+     present_result = present();
+diff --git a/src/ui/d3d12/d3d12_provider.cpp b/src/ui/d3d12/d3d12_provider.cpp
+index cae7003..f2f5d1b 100644
+--- a/src/ui/d3d12/d3d12_provider.cpp
++++ b/src/ui/d3d12/d3d12_provider.cpp
+@@ -377,6 +377,8 @@ bool D3D12Provider::Initialize() {
+     streamline_.reset();
+     REXGPU_WARN("Streamline attachment failed; using standard D3D12");
+   }
++  if (streamline_ && !streamline_->EnableSsxReflex())
++    REXGPU_WARN("SSX coupled Reflex configuration failed; standard scheduling retained");
+   D3D12_COMMAND_QUEUE_DESC queue_desc;
+   queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+   if (REXCVAR_GET(d3d12_queue_priority) >= 2) {
+diff --git a/src/ui/d3d12/streamline.cpp b/src/ui/d3d12/streamline.cpp
+index 648c506..35e00a2 100644
+--- a/src/ui/d3d12/streamline.cpp
++++ b/src/ui/d3d12/streamline.cpp
+@@ -1,4 +1,5 @@
+ #include <rex/ui/guest_frame_timing.h>
++#include <rex/ui/guest_reflex.h>
+ #include <rex/ui/d3d12/streamline.h>
+ #include <rex/ui/d3d12/ssx_temporal_alignment.h>
+ 
+@@ -180,6 +181,10 @@ struct Streamline::Impl {
+   size_t render_token_slot = 0;
+   std::array<std::weak_ptr<Frame>, 3> full_tokens{};
+   size_t full_token_slot = 0;
++  bool ssx_sync_enabled = false;
++  std::shared_ptr<Frame> ssx_sync_frame;
++  uint64_t ssx_present_count = 0;
++  uint64_t last_report_id = 0;
+   bool sr_configured = false, sr_attempted = false, sr_have_frame = false;
+   bool sr_reset = true;
+   Quality sr_quality = Quality::kQuality;
+@@ -217,6 +222,7 @@ struct Streamline::Frame {
+   unsigned phase = 0;
+   bool render_only = false, present_attempted = false;
+   uint64_t render_id = 0;
++  uint64_t ssx_worker_id = 0;
+   bool fg_tagged = false, sr_evaluated = false, reset = false;
+   SRCamera camera;
+   std::array<float, 2> jitter{};
+@@ -538,7 +544,7 @@ Streamline::SREvaluation Streamline::EvaluateSR(ID3D12GraphicsCommandList* list,
+   if (frame.timeline) {
+     auto& t = *frame.timeline;
+     t.sr_evaluated = true;
+-    if (t.render_only)
++    if (t.render_only || t.ssx_worker_id)
+       GuestFrameTiming::Get().Add(GuestFrameTiming::Event::kNvidiaTokenEvaluated, t.render_id,
+                                   t.token_id, frame.id);
+     t.camera = c;
+@@ -575,9 +581,106 @@ bool Streamline::ReleaseSR() {
+   return true;
+ }
+ 
++bool Streamline::EnableSsxReflex() {
++#if REX_HAS_STREAMLINE
++  const auto mode = GuestReflex::RequestedMode();
++  if (mode == "disabled")
++    return true;
++  if (mode != "off" && mode != "on" && mode != "boost")
++    return false;
++  if (!ConfigureReflex(mode == "on"      ? ReflexMode::kOn
++                       : mode == "boost" ? ReflexMode::kOnWithBoost
++                                         : ReflexMode::kOff))
++    return false;
++  {
++    std::lock_guard lock(api_mutex_);
++    impl_->ssx_sync_enabled = true;
++  }
++  GuestReflex::Backend backend;
++  backend.begin = [this](uint64_t worker) {
++    std::lock_guard lock(api_mutex_);
++    impl_->ssx_sync_frame = BeginFrame(worker);
++    return bool(impl_->ssx_sync_frame);
++  };
++  backend.end = [this](uint64_t worker) {
++    std::lock_guard lock(api_mutex_);
++    const auto& frame = impl_->ssx_sync_frame;
++    return frame && frame->ssx_worker_id == worker && MarkFrame(frame, Marker::kSimulationEnd);
++  };
++  backend.bind = [this](uint64_t worker, uint64_t render) {
++    std::lock_guard lock(api_mutex_);
++    const auto& frame = impl_->ssx_sync_frame;
++    if (!frame || frame->ssx_worker_id != worker || frame->phase != 2 || frame->render_id)
++      return false;
++    frame->render_id = render;
++    GuestFrameTiming::Get().Add(GuestFrameTiming::Event::kReflexBind, worker, frame->token_id,
++                                render);
++    return true;
++  };
++  backend.input = [this](uint64_t worker, bool ping, bool flash) {
++    std::lock_guard lock(api_mutex_);
++    const auto& frame = impl_->ssx_sync_frame;
++    if (!frame || frame->ssx_worker_id != worker || frame->phase != 1)
++      return;
++    if (ping)
++      MarkFrame(frame, Marker::kLatencyPing);
++    if (flash)
++      MarkFrame(frame, Marker::kInputFlash);
++    GuestFrameTiming::Get().Add(GuestFrameTiming::Event::kReflexInput, worker, frame->token_id,
++                                ping);
++  };
++  backend.cancel = [this](uint64_t worker) {
++    std::lock_guard lock(api_mutex_);
++    auto& frame = impl_->ssx_sync_frame;
++    if (!frame || frame->ssx_worker_id != worker)
++      return;
++    GuestFrameTiming::Get().Add(GuestFrameTiming::Event::kReflexAbort, worker, frame->token_id,
++                                frame->phase);
++    frame->phase = 6;  // Retire; do not invent missing PCL markers.
++    frame.reset();
++  };
++  backend.complete = [this](uint64_t worker) {
++    std::lock_guard lock(api_mutex_);
++    if (impl_->ssx_sync_frame && impl_->ssx_sync_frame->ssx_worker_id == worker)
++      impl_->ssx_sync_frame.reset();
++  };
++  GuestReflex::Get().Attach(this, std::move(backend));
++  GuestReflex::Get().SetPingMessage(LatencyPingMessage());
++  REXGPU_INFO("SSX_REFLEX coupled=true mode={} physics_hz=30 fg=false", mode);
++  return true;
++#else
++  return GuestReflex::RequestedMode() == "disabled";
++#endif
++}
++
++bool Streamline::CanPaintSsxFrame(const std::shared_ptr<Frame>& frame) {
++  std::lock_guard lock(api_mutex_);
++#if REX_HAS_STREAMLINE
++  if (frame && frame->ssx_worker_id && frame->phase == 6)
++    return false;
++  if (impl_->ssx_sync_enabled && impl_->ssx_sync_frame) {
++    const auto& current = impl_->ssx_sync_frame;
++    return frame == current && current->phase == 3;
++  }
++#else
++  (void)frame;
++#endif
++  return true;
++}
++
+ std::shared_ptr<Streamline::Frame> Streamline::AcquireRenderToken(uint64_t render_id) {
+   std::lock_guard lock(api_mutex_);
+ #if REX_HAS_STREAMLINE
++  if (impl_->ssx_sync_enabled) {
++    auto frame = impl_->ssx_sync_frame;
++    if (!frame || frame->render_id != render_id || frame->phase != 2)
++      return nullptr;
++    if (!MarkFrame(frame, Marker::kRenderSubmitStart))
++      return nullptr;
++    GuestFrameTiming::Get().Add(GuestFrameTiming::Event::kNvidiaTokenCreated, render_id,
++                                frame->token_id);
++    return frame;
++  }
+   if (!impl_->attached || !render_id || impl_->fg_active || impl_->reflex_mode != ReflexMode::kOff)
+     return nullptr;
+   for (auto& weak : impl_->full_tokens)
+@@ -626,7 +729,8 @@ Streamline::TokenPresentation Streamline::PresentRenderToken(
+   if (!present)
+     return result;
+ #if REX_HAS_STREAMLINE
+-  const bool owned = impl_->attached && frame && frame->owner == this && frame->render_only;
++  const bool owned = impl_->attached && frame && frame->owner == this &&
++                     (frame->render_only || frame->ssx_worker_id);
+   if (owned) {
+     result.render_id = frame->render_id;
+     result.token_id = frame->token_id;  // cached; never dereference a retired SL slot
+@@ -637,9 +741,45 @@ Streamline::TokenPresentation Streamline::PresentRenderToken(
+   }
+   // Keep options, evaluation, token allocation and the actual Present serialized.
+   // No fabricated PCL simulation/render markers are issued by this adapter.
++  if (result.matched && frame->ssx_worker_id) {
++    result.matched =
++        MarkFrame(frame, Marker::kRenderSubmitEnd) && MarkFrame(frame, Marker::kPresentStart);
++  }
+   result.result = present();
+   if (result.matched) {
+     frame->present_attempted = true;
++    if (frame->ssx_worker_id) {
++      if (!MarkFrame(frame, Marker::kPresentEnd))
++        result.matched = false;
++      if (++impl_->ssx_present_count % 30 == 0) {
++        ReflexState state;
++        if (GetReflexState(state)) {
++          unsigned complete = 0;
++          for (const auto& report : state.reports) {
++            if (report.frame_id <= impl_->last_report_id || !report.simulation_start_us ||
++                !report.simulation_end_us || !report.render_start_us || !report.render_end_us ||
++                !report.present_start_us || !report.present_end_us || !report.gpu_end_us)
++              continue;
++            ++complete;
++            REXGPU_INFO(
++                "SSX_REFLEX_REPORT token={} sim={}..{} render={}..{} present={}..{} "
++                "driver={}..{} queue={}..{} gpu={}..{}",
++                report.frame_id, report.simulation_start_us, report.simulation_end_us,
++                report.render_start_us, report.render_end_us, report.present_start_us,
++                report.present_end_us, report.driver_start_us, report.driver_end_us,
++                report.queue_start_us, report.queue_end_us, report.gpu_start_us, report.gpu_end_us);
++          }
++          for (const auto& report : state.reports)
++            if (report.gpu_end_us)
++              impl_->last_report_id = std::max(impl_->last_report_id, report.frame_id);
++          REXGPU_INFO(
++              "SSX_REFLEX frames={} new_complete_reports={} low_latency_available={} "
++              "reports_available={}",
++              impl_->ssx_present_count, complete, state.low_latency_available,
++              state.reports_available);
++        }
++      }
++    }
+     frame->phase = 6;
+     GuestFrameTiming::Get().Add(GuestFrameTiming::Event::kNvidiaTokenPresented, frame->render_id,
+                                 frame->token_id, uint32_t(result.result));
+@@ -693,7 +833,7 @@ bool Streamline::ConfigureReflex(ReflexMode mode, uint32_t frame_limit_us) {
+ #endif
+ }
+ 
+-std::shared_ptr<Streamline::Frame> Streamline::BeginFrame() {
++std::shared_ptr<Streamline::Frame> Streamline::BeginFrame(uint64_t ssx_worker_id) {
+   std::lock_guard lock(api_mutex_);
+ #if REX_HAS_STREAMLINE
+   if (!impl_->attached || !impl_->reflex_configured)
+@@ -704,10 +844,21 @@ std::shared_ptr<Streamline::Frame> Streamline::BeginFrame() {
+   for (auto& pending : impl_->render_tokens)
+     RetireRenderToken(pending);
+   auto frame = std::make_shared<Frame>();
+-  if (!Check(impl_->frame_token(frame->token, nullptr), "frame token") || !frame->token ||
+-      !Check(impl_->reflex_sleep(*frame->token), "Reflex sleep") ||
+-      !Check(impl_->pcl_marker(sl::PCLMarker::eSimulationStart, *frame->token), "simulation start"))
++  if (!Check(impl_->frame_token(frame->token, nullptr), "frame token") || !frame->token)
++    return nullptr;
++  auto& trace = GuestFrameTiming::Get();
++  const auto token_id = uint32_t(*frame->token);
++  if (ssx_worker_id)
++    trace.Add(GuestFrameTiming::Event::kReflexSleepBegin, ssx_worker_id, token_id);
++  if (!Check(impl_->reflex_sleep(*frame->token), "Reflex sleep"))
+     return nullptr;
++  if (ssx_worker_id)
++    trace.Add(GuestFrameTiming::Event::kReflexSleepEnd, ssx_worker_id, token_id);
++  if (!Check(impl_->pcl_marker(sl::PCLMarker::eSimulationStart, *frame->token), "simulation start"))
++    return nullptr;
++  if (ssx_worker_id)
++    trace.Add(GuestFrameTiming::Event::kReflexSimulationStart, ssx_worker_id, token_id);
++  frame->ssx_worker_id = ssx_worker_id;
+   frame->owner = this;
+   frame->token_id = uint32_t(*frame->token);
+   frame->phase = 1;
+@@ -715,6 +866,7 @@ std::shared_ptr<Streamline::Frame> Streamline::BeginFrame() {
+   impl_->full_token_slot = (impl_->full_token_slot + 1) % impl_->full_tokens.size();
+   return frame;
+ #else
++  (void)ssx_worker_id;
+   return nullptr;
+ #endif
+ }
+@@ -764,6 +916,14 @@ bool Streamline::MarkFrame(const std::shared_ptr<Frame>& frame, Marker marker) {
+     return false;
+   if (!Check(impl_->pcl_marker(pcl, *frame->token), "PCL marker"))
+     return false;
++  if (frame->ssx_worker_id && expected) {
++    constexpr GuestFrameTiming::Event events[] = {
++        GuestFrameTiming::Event::kReflexSimulationEnd, GuestFrameTiming::Event::kReflexRenderStart,
++        GuestFrameTiming::Event::kReflexRenderEnd, GuestFrameTiming::Event::kReflexPresentStart,
++        GuestFrameTiming::Event::kReflexPresentEnd};
++    GuestFrameTiming::Get().Add(events[expected - 1], frame->ssx_worker_id, frame->token_id,
++                                frame->render_id);
++  }
+   if (expected)
+     ++frame->phase;
+   return true;
+@@ -1021,6 +1181,7 @@ bool Streamline::GetFrameGenerationState(FGState& state) {
+ }
+ 
+ void Streamline::Shutdown() {
++  GuestReflex::Get().Detach(this);
+   std::lock_guard lock(api_mutex_);
+ #if REX_HAS_STREAMLINE
+   if (impl_->init_called) {
+diff --git a/src/ui/guest_frame_timing.cpp b/src/ui/guest_frame_timing.cpp
+index 9958463..c382aef 100644
+--- a/src/ui/guest_frame_timing.cpp
++++ b/src/ui/guest_frame_timing.cpp
+@@ -1,4 +1,5 @@
+ #include <rex/ui/guest_frame_timing.h>
++#include <rex/ui/guest_reflex.h>
+ #include <rex/logging.h>
+ #include <rex/cvar.h>
+ #include <chrono>
+@@ -55,15 +56,26 @@ constexpr const char* names[] = {"input_begin",
+                                  "nvidia_token_evaluated",
+                                  "nvidia_token_presented",
+                                  "nvidia_token_dropped",
+-                                 "nvidia_token_repeated"};
+-static_assert(std::size(names) == size_t(GuestFrameTiming::Event::kNvidiaTokenRepeated) + 1);
++                                 "nvidia_token_repeated",
++                                 "reflex_sleep_begin",
++                                 "reflex_sleep_end",
++                                 "reflex_simulation_start",
++                                 "reflex_simulation_end",
++                                 "reflex_render_start",
++                                 "reflex_render_end",
++                                 "reflex_present_start",
++                                 "reflex_present_end",
++                                 "reflex_bind",
++                                 "reflex_abort",
++                                 "reflex_input"};
++static_assert(std::size(names) == size_t(GuestFrameTiming::Event::kReflexInput) + 1);
+ }  // namespace
+ GuestFrameTiming& GuestFrameTiming::Get() {
+   static GuestFrameTiming trace;
+   return trace;
+ }
+ bool GuestFrameTiming::ContinuousMarkersEnabled() {
+-  return REXCVAR_GET(ssx_frame_token_handoff);
++  return REXCVAR_GET(ssx_frame_token_handoff) || GuestReflex::RequestedMode() != "disabled";
+ }
+ uint64_t GuestFrameTiming::CurrentRender() {
+   return render_id;
+@@ -125,8 +137,8 @@ void GuestFrameTiming::PollCapture(const std::filesystem::path& directory) {
+           << r.related << ',' << r.detail << '\n';
+     out.flush();
+     if (out)
+-      REXLOG_INFO("SSX_TIMING_CAPTURE records={} file={} reflex_markers=false", records.size(),
+-                  path.string());
++      REXLOG_INFO("SSX_TIMING_CAPTURE records={} file={} contains_optional_reflex_events=true",
++                  records.size(), path.string());
+     else
+       REXLOG_ERROR("SSX_TIMING_CAPTURE write failed: {}", path.string());
+     return;
+diff --git a/src/ui/guest_reflex.cpp b/src/ui/guest_reflex.cpp
+new file mode 100644
+index 0000000..df4bb6a
+--- /dev/null
++++ b/src/ui/guest_reflex.cpp
+@@ -0,0 +1,168 @@
++#include <rex/ui/guest_reflex.h>
++#include <rex/cvar.h>
++#include <rex/logging.h>
++#include <utility>
++
++REXCVAR_DEFINE_STRING(
++    ssx_reflex_sync, "disabled", "SSX",
++    "Experimental coupled 30 Hz input/simulation/render Reflex: disabled, off, on, boost. "
++    "Changes scheduling and removes interpolated extra frames; FG remains off.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++namespace rex::ui {
++GuestReflex& GuestReflex::Get() {
++  static GuestReflex value;
++  return value;
++}
++std::string GuestReflex::RequestedMode() {
++  return REXCVAR_GET(ssx_reflex_sync);
++}
++void GuestReflex::Attach(const void* owner, Backend backend) {
++  std::lock_guard lock(mutex_);
++  CancelLocked();
++  owner_ = owner;
++  backend_ = std::move(backend);
++  ping_ = flash_ = false;
++}
++void GuestReflex::Detach(const void* owner) {
++  std::lock_guard lock(mutex_);
++  if (owner != owner_)
++    return;
++  CancelLocked();
++  backend_ = {};
++  owner_ = nullptr;
++  ping_message_ = 0;
++  changed_.notify_all();
++}
++bool GuestReflex::enabled() {
++  std::lock_guard lock(mutex_);
++  return owner_ != nullptr;
++}
++void GuestReflex::CancelLocked() {
++  if (worker_ && backend_.cancel)
++    backend_.cancel(worker_);
++  wanted_ = worker_ = render_ = 0;
++  finished_ = input_ = false;
++  samples_ = {};
++  changed_.notify_all();
++}
++bool GuestReflex::BeginWorker(uint64_t worker) {
++  std::unique_lock lock(mutex_);
++  if (!owner_)
++    return false;
++  // Do not overwrite the exact samples promised to an in-flight rendered frame.
++  // Waiting is outside the original worker function and all its guest locks.
++  if (!changed_.wait_for(lock, kWait, [&] { return !owner_ || !worker_; })) {
++    REXLOG_WARN("SSX_REFLEX abort=present_timeout worker={}", worker_);
++    CancelLocked();
++    return false;
++  }
++  if (!owner_ || !wanted_ || !worker)
++    return false;
++  if (!backend_.begin(worker)) {
++    CancelLocked();
++    return false;
++  }
++  worker_ = worker;
++  input_ = finished_ = false;
++  samples_ = {};
++  return true;
++}
++void GuestReflex::Input(uint64_t worker) {
++  std::lock_guard lock(mutex_);
++  if (worker_ == worker && worker) {
++    input_ = true;
++    if (backend_.input)
++      backend_.input(worker, std::exchange(ping_, false), std::exchange(flash_, false));
++  }
++}
++void GuestReflex::Published(uint64_t worker, Sample sample) {
++  std::lock_guard lock(mutex_);
++  if (!worker || worker_ != worker || !sample.key || !sample.generation)
++    return;
++  for (auto& slot : samples_) {
++    if (!slot.key || uint32_t(slot.key >> 32) == uint32_t(sample.key >> 32)) {
++      slot = sample;
++      return;
++    }
++  }
++  REXLOG_WARN("SSX_REFLEX abort=unexpected_sample_channel worker={}", worker);
++  CancelLocked();
++}
++void GuestReflex::EndWorker(uint64_t worker) {
++  std::lock_guard lock(mutex_);
++  if (!worker || worker_ != worker)
++    return;
++  if (!input_ || !samples_[0].key || !samples_[1].key || !backend_.end(worker)) {
++    CancelLocked();
++    return;
++  }
++  finished_ = true;
++  changed_.notify_all();
++}
++bool GuestReflex::WaitForRender(uint64_t render) {
++  std::unique_lock lock(mutex_);
++  if (!owner_ || !render)
++    return false;
++  wanted_ = render;
++  changed_.notify_all();
++  if (!changed_.wait_for(lock, kWait,
++                         [&] { return !owner_ || !wanted_ || (finished_ && !render_); })) {
++    REXLOG_WARN("SSX_REFLEX abort=worker_timeout render={}", render);
++    CancelLocked();
++    return false;
++  }
++  if (!owner_ || !worker_ || !backend_.bind(worker_, render)) {
++    CancelLocked();
++    return false;
++  }
++  render_ = render;
++  wanted_ = 0;
++  return true;
++}
++bool GuestReflex::Selection(uint64_t render, uint32_t channel, Sample& sample) {
++  std::lock_guard lock(mutex_);
++  if (!render || render != render_ || !finished_)
++    return false;
++  for (const auto& slot : samples_) {
++    if (uint32_t(slot.key >> 32) == channel) {
++      sample = slot;
++      return true;
++    }
++  }
++  return false;
++}
++void GuestReflex::Complete(uint64_t render) {
++  std::lock_guard lock(mutex_);
++  if (!render || render != render_)
++    return;
++  if (backend_.complete)
++    backend_.complete(worker_);
++  worker_ = render_ = 0;
++  finished_ = input_ = false;
++  samples_ = {};
++  // Preserve the next renderer's outstanding request.
++  changed_.notify_all();
++}
++void GuestReflex::Abort(uint64_t render) {
++  std::lock_guard lock(mutex_);
++  if (render && render == render_)
++    CancelLocked();
++}
++void GuestReflex::QueuePing() {
++  std::lock_guard lock(mutex_);
++  ping_ = true;
++}
++void GuestReflex::QueueFlash() {
++  std::lock_guard lock(mutex_);
++  flash_ = true;
++}
++void GuestReflex::SetPingMessage(uint32_t message) {
++  std::lock_guard lock(mutex_);
++  ping_message_ = message;
++}
++uint32_t GuestReflex::PingMessage() {
++  std::lock_guard lock(mutex_);
++  return ping_message_;
++}
++}  // namespace rex::ui
+diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
+index dc0b4c2..84ccda4 100644
+--- a/src/ui/windowed_app_context_sdl.cpp
++++ b/src/ui/windowed_app_context_sdl.cpp
+@@ -21,11 +21,19 @@
+ #include <rex/logging.h>
+ #include <rex/platform.h>
+ #include <rex/ui/flags.h>
++#include <rex/ui/guest_reflex.h>
+ #include <rex/ui/window_sdl.h>
+ 
++#if REX_PLATFORM_WIN32
++#include <windows.h>
++#endif
++
+ namespace rex::ui {
+ 
+ SDLWindowedAppContext::~SDLWindowedAppContext() {
++#if REX_PLATFORM_WIN32
++  SDL_SetWindowsMessageHook(nullptr, nullptr);
++#endif
+   if (event_watch_registered_) {
+     SDL_RemoveEventWatch(WatchEvent, this);
+   }
+@@ -68,6 +76,19 @@ bool SDLWindowedAppContext::Initialize() {
+     return false;
+   }
+   event_watch_registered_ = true;
++#if REX_PLATFORM_WIN32
++  SDL_SetWindowsMessageHook(
++      [](void*, MSG* message) -> bool {
++        auto& reflex = GuestReflex::Get();
++        const auto ping_message = reflex.PingMessage();
++        if (ping_message && message->message == ping_message) {
++          reflex.QueuePing();
++          return false;
++        }
++        return true;
++      },
++      nullptr);
++#endif
+   return true;
+ }
+ 
+@@ -139,6 +160,13 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
+       break;
+     case SDL_EVENT_KEY_DOWN:
+     case SDL_EVENT_KEY_UP: {
++      // Reflex Analyzer uses F13. Consume it instead of exposing it to game
++      // bindings, and associate the ping with the worker that next reads input.
++      if (event.key.key == SDLK_F13 && GuestReflex::Get().enabled()) {
++        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat)
++          GuestReflex::Get().QueuePing();
++        break;
++      }
+       if (WindowSDL* window = GetWindow(event.key.windowID)) {
+         window->HandleKeyEvent(event);
+       }
+@@ -158,6 +186,9 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
+     }
+     case SDL_EVENT_MOUSE_BUTTON_DOWN:
+     case SDL_EVENT_MOUSE_BUTTON_UP: {
++      if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT &&
++          GuestReflex::Get().enabled())
++        GuestReflex::Get().QueueFlash();
+       if (WindowSDL* window = GetWindow(event.button.windowID)) {
+         window->HandleMouseEvent(event);
+       }
+diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
+index 809c602..abde0d9 100644
+--- a/tests/unit/CMakeLists.txt
++++ b/tests/unit/CMakeLists.txt
+@@ -17,6 +17,7 @@ add_executable(unit_tests
+     system/function_dispatcher_test.cpp
+     input/input_assignment_test.cpp
+     graphics/guest_frame_timing_test.cpp
++    graphics/guest_reflex_test.cpp
+     codegen/codegen_writer_test.cpp
+     codegen/output_partition_test.cpp
+     codegen/output_stamp_test.cpp
+diff --git a/tests/unit/graphics/guest_reflex_test.cpp b/tests/unit/graphics/guest_reflex_test.cpp
+new file mode 100644
+index 0000000..6c68ad9
+--- /dev/null
++++ b/tests/unit/graphics/guest_reflex_test.cpp
+@@ -0,0 +1,108 @@
++#include <catch2/catch_test_macros.hpp>
++#include <rex/ui/guest_reflex.h>
++#include <atomic>
++#include <thread>
++
++using rex::ui::GuestReflex;
++using namespace std::chrono_literals;
++
++TEST_CASE("SSX coupled Reflex binds actual input and both published channels", "[ssx-reflex]") {
++  GuestReflex scheduler;
++  std::atomic<unsigned> begins{0}, ends{0}, binds{0}, cancels{0};
++  std::atomic<unsigned> inputs{0};
++  std::atomic<bool> saw_ping{false}, saw_flash{false};
++  GuestReflex::Backend backend;
++  backend.begin = [&](uint64_t w) {
++    ++begins;
++    return w == 10;
++  };
++  backend.end = [&](uint64_t w) {
++    ++ends;
++    return w == 10;
++  };
++  backend.bind = [&](uint64_t w, uint64_t r) {
++    ++binds;
++    return w == 10 && r == 20;
++  };
++  backend.cancel = [&](uint64_t) { ++cancels; };
++  backend.input = [&](uint64_t w, bool ping, bool flash) {
++    if (w == 10)
++      ++inputs;
++    saw_ping = ping;
++    saw_flash = flash;
++  };
++  scheduler.Attach(&scheduler, backend);
++  scheduler.QueuePing();
++  scheduler.QueueFlash();
++  std::atomic<bool> rendered{false};
++  std::thread render([&] { rendered = scheduler.WaitForRender(20); });
++  bool begun = false;
++  for (unsigned i = 0; i < 100 && !begun; ++i) {
++    begun = scheduler.BeginWorker(10);
++    if (!begun)
++      std::this_thread::sleep_for(1ms);
++  }
++  if (begun) {
++    scheduler.Input(10);
++    scheduler.Published(10, {uint64_t(1) << 32 | 100, 7, 123});
++    scheduler.Published(10, {uint64_t(2) << 32 | 200, 8, 123});
++    scheduler.EndWorker(10);
++  }
++  render.join();
++  REQUIRE(begun);
++  REQUIRE(rendered.load());
++  GuestReflex::Sample sample;
++  REQUIRE(scheduler.Selection(20, 1, sample));
++  CHECK(sample.generation == 7);
++  CHECK_FALSE(scheduler.Selection(21, 1, sample));
++  scheduler.Complete(19);  // Wrong frame cannot release the worker.
++  CHECK(scheduler.Selection(20, 2, sample));
++  scheduler.Complete(20);
++  CHECK_FALSE(scheduler.Selection(20, 1, sample));
++  CHECK_FALSE(scheduler.BeginWorker(11));  // No render request, normal worker runs unchanged.
++  CHECK(begins == 1);
++  CHECK(ends == 1);
++  CHECK(binds == 1);
++  CHECK(cancels == 0);
++  CHECK(inputs == 1);
++  CHECK(saw_ping);
++  CHECK(saw_flash);
++  scheduler.Detach(&scheduler);
++}
++
++TEST_CASE("SSX coupled Reflex rejects absent input and wakes waiting render on detach",
++          "[ssx-reflex]") {
++  GuestReflex scheduler;
++  std::atomic<unsigned> cancelled{0}, ended{0};
++  GuestReflex::Backend backend;
++  backend.begin = [](uint64_t) { return true; };
++  backend.end = [&](uint64_t) {
++    ++ended;
++    return true;
++  };
++  backend.bind = [](uint64_t, uint64_t) { return true; };
++  backend.cancel = [&](uint64_t) { ++cancelled; };
++  scheduler.Attach(&scheduler, backend);
++  std::atomic<bool> rendered{true};
++  std::thread render([&] { rendered = scheduler.WaitForRender(20); });
++  bool begun = false;
++  for (unsigned i = 0; i < 100 && !begun; ++i) {
++    begun = scheduler.BeginWorker(10);
++    if (!begun)
++      std::this_thread::sleep_for(1ms);
++  }
++  if (begun)
++    scheduler.EndWorker(10);
++  else
++    scheduler.Detach(&scheduler);
++  render.join();
++  REQUIRE(begun);
++  CHECK_FALSE(rendered.load());
++  CHECK(cancelled == 1);
++  CHECK(ended == 0);
++  std::thread waiting([&] { rendered = scheduler.WaitForRender(30); });
++  scheduler.Detach(&scheduler);
++  waiting.join();
++  CHECK_FALSE(rendered.load());
++  CHECK_FALSE(scheduler.enabled());
++}

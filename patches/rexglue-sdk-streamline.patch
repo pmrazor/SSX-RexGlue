@@ -1,0 +1,517 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9b3cdf5..9d36ca1 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -21,6 +21,8 @@ project(ReXGlue
+ option(REXGLUE_BUILD_TESTS       "Build PPC instruction and unit tests" OFF)
+ option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
+ option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
++option(REXGLUE_ENABLE_STREAMLINE "Build the experimental NVIDIA Streamline connection" OFF)
++set(REXGLUE_STREAMLINE_DIR "" CACHE PATH "Extracted NVIDIA Streamline 2.14.1 SDK")
+ option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
+ option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter registry and overlay" ON)
+ # Propagate profiling defines globally (compiled out in Release)
+diff --git a/include/rex/ui/d3d12/d3d12_provider.h b/include/rex/ui/d3d12/d3d12_provider.h
+index 35035a4..6c342d1 100644
+--- a/include/rex/ui/d3d12/d3d12_provider.h
++++ b/include/rex/ui/d3d12/d3d12_provider.h
+@@ -14,6 +14,7 @@
+ #include <memory>
+ 
+ #include <rex/ui/d3d12/d3d12_api.h>
++#include <rex/ui/d3d12/streamline.h>
+ #include <rex/ui/graphics_provider.h>
+ 
+ namespace rex::ui::d3d12 {
+@@ -36,6 +37,7 @@ class D3D12Provider : public GraphicsProvider {
+   IDXGraphicsAnalysis* GetGraphicsAnalysis() const { return graphics_analysis_; }
+   ID3D12Device* GetDevice() const { return device_; }
+   ID3D12CommandQueue* GetDirectQueue() const { return direct_queue_; }
++  Streamline* GetStreamline() const { return streamline_.get(); }
+ 
+   uint32_t GetDescriptorSize(D3D12_DESCRIPTOR_HEAP_TYPE type) const {
+     return descriptor_sizes_[type];
+@@ -154,6 +156,7 @@ class D3D12Provider : public GraphicsProvider {
+   ID3D12Device* device_ = nullptr;
+   ID3D12CommandQueue* direct_queue_ = nullptr;
+   IDXGraphicsAnalysis* graphics_analysis_ = nullptr;
++  std::unique_ptr<Streamline> streamline_;
+ 
+   uint32_t descriptor_sizes_[D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES];
+ 
+diff --git a/include/rex/ui/d3d12/streamline.h b/include/rex/ui/d3d12/streamline.h
+new file mode 100644
+index 0000000..db772da
+--- /dev/null
++++ b/include/rex/ui/d3d12/streamline.h
+@@ -0,0 +1,64 @@
++// Optional NVIDIA Streamline connection. No NVIDIA headers in the public ABI.
++#pragma once
++
++#include <cstdint>
++#include <filesystem>
++#include <memory>
++#include <string>
++
++#include <rex/ui/d3d12/d3d12_api.h>
++
++namespace rex::ui::d3d12 {
++
++// This checkpoint connects the real SDK and presentation hooks, but deliberately
++// does not enable SR or FG without a game-specific temporal resource producer.
++class Streamline {
++ public:
++  enum class Quality { kQuality, kBalanced, kPerformance, kUltraPerformance, kDLAA };
++
++  struct Support {
++    bool sr = false;
++    bool fg = false;
++    bool reflex = false;
++    bool pcl = false;
++    bool low_latency_available = false;
++    uint32_t max_generated_frames = 0;
++    std::string sr_result;
++    std::string fg_result;
++    std::string reflex_result;
++    std::string pcl_result;
++  };
++
++  struct OptimalSettings {
++    uint32_t width = 0, height = 0;
++    uint32_t min_width = 0, min_height = 0;
++    uint32_t max_width = 0, max_height = 0;
++  };
++
++  // The directory must contain the signed production DLLs of Streamline 2.14.1.
++  // Failure is optional: the caller continues with the normal D3D12 renderer.
++  static std::unique_ptr<Streamline> Create(const std::filesystem::path& binary_directory);
++  ~Streamline();
++  Streamline(const Streamline&) = delete;
++  Streamline& operator=(const Streamline&) = delete;
++
++  // Before any command queues or swap chains are created. Upgrades both COM
++  // references transactionally; on failure the original interfaces are restored.
++  bool Attach(ID3D12Device*& device, IDXGIFactory2*& factory);
++  const Support& support() const { return support_; }
++  bool GetOptimalSettings(Quality quality, uint32_t output_width, uint32_t output_height,
++                          OptimalSettings& settings);
++
++  // Caller must first drain GPU work. Shut down before releasing the device and
++  // factory; destroy this object only AFTER releasing every Streamline COM proxy.
++  void Shutdown();
++
++ private:
++  struct Impl;
++  Streamline();
++  bool Initialize(const std::filesystem::path& binary_directory);
++  std::unique_ptr<Impl> impl_;
++  Support support_;
++};
++
++}  // namespace rex::ui::d3d12
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index 5bd3dc5..324af7b 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -60,6 +60,7 @@ if(REXGLUE_USE_D3D12)
+         d3d12/d3d12_submission_tracker.cpp
+         d3d12/d3d12_upload_buffer_pool.cpp
+         d3d12/d3d12_util.cpp
++        d3d12/streamline.cpp
+     )
+ endif()
+ 
+@@ -96,6 +97,25 @@ endif()
+ add_library(rexui OBJECT ${REXUI_SOURCES})
+ add_library(rex::ui ALIAS rexui)
+ 
++if(REXGLUE_ENABLE_STREAMLINE)
++    if(NOT REXGLUE_USE_D3D12 OR NOT REX_PLATFORM STREQUAL "win-amd64")
++        message(FATAL_ERROR "Streamline currently requires Windows x64 and D3D12")
++    endif()
++    if(NOT EXISTS "${REXGLUE_STREAMLINE_DIR}/include/sl.h")
++        message(FATAL_ERROR "Set REXGLUE_STREAMLINE_DIR to the extracted Streamline 2.14.1 SDK")
++    endif()
++    # 2.14.1 sl_pcl.h aliases a function as a type under C++23. Fix only the
++    # build copy; leave the downloaded SDK and its signatures untouched.
++    set(streamline_headers "${CMAKE_CURRENT_BINARY_DIR}/streamline-include")
++    file(COPY "${REXGLUE_STREAMLINE_DIR}/include/" DESTINATION "${streamline_headers}")
++    file(READ "${streamline_headers}/sl_pcl.h" streamline_pcl_header)
++    string(REPLACE "using to_underlying = std::to_underlying;" "using std::to_underlying;"
++        streamline_pcl_header "${streamline_pcl_header}")
++    file(WRITE "${streamline_headers}/sl_pcl.h" "${streamline_pcl_header}")
++    target_include_directories(rexui SYSTEM PRIVATE "${streamline_headers}")
++    target_compile_definitions(rexui PRIVATE REX_HAS_STREAMLINE=1)
++endif()
++
+ rex_target_pch(rexui <rex/math.h>)
+ 
+ target_include_directories(rexui PUBLIC
+@@ -173,4 +193,3 @@ endif()
+ if(REXGLUE_USE_D3D12)
+     target_link_libraries(rexui PUBLIC dxc-headers)
+ endif()
+-
+diff --git a/src/ui/d3d12/d3d12_provider.cpp b/src/ui/d3d12/d3d12_provider.cpp
+index bf8252b..cae7003 100644
+--- a/src/ui/d3d12/d3d12_provider.cpp
++++ b/src/ui/d3d12/d3d12_provider.cpp
+@@ -23,6 +23,13 @@
+ REXCVAR_DEFINE_BOOL(d3d12_debug, false, "UI/D3D12", "Enable Direct3D 12 and DXGI debug layer")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++REXCVAR_DEFINE_BOOL(d3d12_streamline, false, "UI/D3D12",
++                    "Experimental NVIDIA SDK connection (SR and FG are not yet enabled)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_STRING(d3d12_streamline_path, "", "UI/D3D12",
++                      "Directory containing signed Streamline 2.14.1 production DLLs")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ REXCVAR_DEFINE_BOOL(d3d12_break_on_error, false, "UI/D3D12",
+                     "Break on Direct3D 12 validation errors");
+ 
+@@ -65,6 +72,10 @@ std::unique_ptr<D3D12Provider> D3D12Provider::Create() {
+ }
+ 
+ D3D12Provider::~D3D12Provider() {
++  // The presenter's and command processor's submissions are drained by their
++  // owners before the provider is destroyed. Keep the interposer loaded until
++  // all proxy COM interfaces below have been released.
++  if (streamline_) streamline_->Shutdown();
+   if (graphics_analysis_ != nullptr) {
+     graphics_analysis_->Release();
+   }
+@@ -77,6 +88,7 @@ D3D12Provider::~D3D12Provider() {
+   if (dxgi_factory_ != nullptr) {
+     dxgi_factory_->Release();
+   }
++  streamline_.reset();
+ 
+   if (REXCVAR_GET(d3d12_debug) && pfn_dxgi_get_debug_interface1_) {
+     Microsoft::WRL::ComPtr<IDXGIDebug> dxgi_debug;
+@@ -121,6 +133,11 @@ bool D3D12Provider::EnableIncreaseBasePriorityPrivilege() {
+ }
+ 
+ bool D3D12Provider::Initialize() {
++  if (REXCVAR_GET(d3d12_streamline)) {
++    streamline_ = Streamline::Create(
++        std::filesystem::u8path(REXCVAR_GET(d3d12_streamline_path)));
++    if (!streamline_) REXGPU_WARN("Using standard D3D12 without Streamline");
++  }
+   // Load the core libraries.
+   library_dxgi_ = LoadLibraryW(L"dxgi.dll");
+   library_d3d12_ = LoadLibraryW(L"D3D12.dll");
+@@ -355,6 +372,11 @@ bool D3D12Provider::Initialize() {
+   }
+ 
+   // Create the command queue for graphics.
++  if (streamline_ && !streamline_->Attach(device, dxgi_factory)) {
++    streamline_->Shutdown();
++    streamline_.reset();
++    REXGPU_WARN("Streamline attachment failed; using standard D3D12");
++  }
+   D3D12_COMMAND_QUEUE_DESC queue_desc;
+   queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+   if (REXCVAR_GET(d3d12_queue_priority) >= 2) {
+@@ -387,6 +409,7 @@ bool D3D12Provider::Initialize() {
+     }
+     if (!queue_created) {
+       REXLOG_ERROR("Failed to create a Direct3D 12 direct command queue");
++      if (streamline_) streamline_->Shutdown();
+       device->Release();
+       dxgi_factory->Release();
+       return false;
+diff --git a/src/ui/d3d12/streamline.cpp b/src/ui/d3d12/streamline.cpp
+new file mode 100644
+index 0000000..9c7a1a0
+--- /dev/null
++++ b/src/ui/d3d12/streamline.cpp
+@@ -0,0 +1,288 @@
++#include <rex/ui/d3d12/streamline.h>
++
++#include <bit>
++#include <utility>
++
++#include <rex/logging.h>
++
++#if REX_HAS_STREAMLINE
++#include <sl.h>
++#include <sl_dlss.h>
++#include <sl_dlss_g.h>
++#include <sl_helpers.h>
++#include <sl_pcl.h>
++#include <sl_reflex.h>
++#include <sl_security.h>
++
++static_assert(SL_VERSION_MAJOR == 2 && SL_VERSION_MINOR == 14 && SL_VERSION_PATCH == 1,
++              "This integration is pinned to Streamline 2.14.1");
++#endif
++
++namespace rex::ui::d3d12 {
++
++#if REX_HAS_STREAMLINE
++namespace {
++void LogStreamline(sl::LogType type, const char* message) {
++  if (type == sl::LogType::eError) {
++    REXGPU_ERROR("Streamline: {}", message);
++  } else if (type == sl::LogType::eWarn) {
++    REXGPU_WARN("Streamline: {}", message);
++  } else {
++    REXGPU_INFO("Streamline: {}", message);
++  }
++}
++
++bool Check(sl::Result result, const char* operation) {
++  if (result == sl::Result::eOk)
++    return true;
++  REXGPU_WARN("Streamline {} failed: {}", operation, sl::getResultAsStr(result));
++  return false;
++}
++}  // namespace
++
++struct Streamline::Impl {
++  HMODULE module = nullptr;
++  bool init_called = false;
++  bool attached = false;
++  PFun_slInit* init = nullptr;
++  PFun_slShutdown* shutdown = nullptr;
++  PFun_slSetD3DDevice* set_device = nullptr;
++  PFun_slUpgradeInterface* upgrade = nullptr;
++  PFun_slIsFeatureSupported* is_supported = nullptr;
++  PFun_slGetFeatureFunction* get_function = nullptr;
++  PFun_slDLSSGetOptimalSettings* optimal = nullptr;
++  PFun_slDLSSGGetState* fg_state = nullptr;
++  PFun_slDLSSGSetOptions* fg_options = nullptr;
++  PFun_slReflexGetState* reflex_state = nullptr;
++  PFun_slReflexSetOptions* reflex_options = nullptr;
++
++  // The provider releases its COM proxies before destroying this Impl.
++  ~Impl() {
++    if (module)
++      FreeLibrary(module);
++  }
++
++  template <typename T>
++  bool Import(T*& function, const char* name) {
++    function = std::bit_cast<T*>(GetProcAddress(module, name));
++    if (!function)
++      REXGPU_WARN("Streamline export missing: {}", name);
++    return function != nullptr;
++  }
++
++  template <typename T>
++  bool ImportFeature(T*& function, sl::Feature feature, const char* name) {
++    void* address = nullptr;
++    if (!Check(get_function(feature, name, address), name))
++      return false;
++    function = reinterpret_cast<T*>(address);
++    return function != nullptr;
++  }
++};
++#else
++struct Streamline::Impl {};
++#endif
++
++Streamline::Streamline() : impl_(std::make_unique<Impl>()) {}
++Streamline::~Streamline() {
++  Shutdown();
++}
++
++std::unique_ptr<Streamline> Streamline::Create(const std::filesystem::path& directory) {
++  std::unique_ptr<Streamline> result(new Streamline);
++  if (!result->Initialize(directory))
++    return nullptr;
++  return result;
++}
++
++bool Streamline::Initialize(const std::filesystem::path& directory) {
++#if REX_HAS_STREAMLINE
++  std::error_code error;
++  const auto absolute_directory = std::filesystem::absolute(directory, error);
++  if (error || directory.empty()) {
++    REXGPU_WARN("Streamline requires an explicit DLL directory");
++    return false;
++  }
++  const auto interposer = absolute_directory / L"sl.interposer.dll";
++  if (!std::filesystem::is_regular_file(interposer, error)) {
++    REXGPU_WARN("Streamline interposer not found: {}", interposer.string());
++    return false;
++  }
++  if (!sl::security::verifyEmbeddedSignature(interposer.c_str())) {
++    REXGPU_WARN("Streamline NVIDIA signature verification failed: {}", interposer.string());
++    return false;
++  }
++  impl_->module = LoadLibraryExW(interposer.c_str(), nullptr,
++                                 LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
++  if (!impl_->module) {
++    REXGPU_WARN("Streamline load failed: Windows error {}", GetLastError());
++    return false;
++  }
++  if (!impl_->Import(impl_->init, "slInit") || !impl_->Import(impl_->shutdown, "slShutdown") ||
++      !impl_->Import(impl_->set_device, "slSetD3DDevice") ||
++      !impl_->Import(impl_->upgrade, "slUpgradeInterface") ||
++      !impl_->Import(impl_->is_supported, "slIsFeatureSupported") ||
++      !impl_->Import(impl_->get_function, "slGetFeatureFunction"))
++    return false;
++
++  const wchar_t* plugin_paths[] = {absolute_directory.c_str()};
++  const sl::Feature features[] = {sl::kFeatureDLSS, sl::kFeatureDLSS_G, sl::kFeatureReflex,
++                                  sl::kFeaturePCL};
++  sl::Preferences preferences{};
++  preferences.pathsToPlugins = plugin_paths;
++  preferences.numPathsToPlugins = 1;
++  preferences.featuresToLoad = features;
++  preferences.numFeaturesToLoad = uint32_t(std::size(features));
++  preferences.renderAPI = sl::RenderAPI::eD3D12;
++  preferences.engine = sl::EngineType::eCustom;
++  preferences.engineVersion = "ReXGlue-0.10.0-SSX";
++  // Development project identity, not an NVIDIA-issued application ID.
++  preferences.projectId = "850f4edf-03bc-4a15-96e2-ea9dc09a812f";
++  preferences.flags = sl::PreferenceFlags::eDisableCLStateTracking |
++                      sl::PreferenceFlags::eUseManualHooking |
++                      sl::PreferenceFlags::eUseDXGIFactoryProxy |
++                      sl::PreferenceFlags::eUseFrameBasedResourceTagging;
++  preferences.logMessageCallback = LogStreamline;
++  // No OTA/downloaded plugins: keep binaries consistent with the pinned headers.
++  impl_->init_called = true;
++  return Check(impl_->init(preferences, sl::kSDKVersion), "slInit");
++#else
++  (void)directory;
++  REXGPU_WARN("Streamline requested, but this SDK was built without REXGLUE_ENABLE_STREAMLINE");
++  return false;
++#endif
++}
++
++bool Streamline::Attach(ID3D12Device*& device, IDXGIFactory2*& factory) {
++#if REX_HAS_STREAMLINE
++  if (!impl_->init_called || impl_->attached || !device || !factory)
++    return false;
++  if (!Check(impl_->set_device(device), "slSetD3DDevice"))
++    return false;
++  LUID luid = device->GetAdapterLuid();
++  sl::AdapterInfo adapter{};
++  adapter.deviceLUID = reinterpret_cast<uint8_t*>(&luid);
++  adapter.deviceLUIDSizeInBytes = sizeof(luid);
++  auto query = [&](sl::Feature feature, std::string& description) {
++    auto result = impl_->is_supported(feature, adapter);
++    description = sl::getResultAsStr(result);
++    return result == sl::Result::eOk;
++  };
++  support_.sr = query(sl::kFeatureDLSS, support_.sr_result);
++  support_.fg = query(sl::kFeatureDLSS_G, support_.fg_result);
++  support_.reflex = query(sl::kFeatureReflex, support_.reflex_result);
++  support_.pcl = query(sl::kFeaturePCL, support_.pcl_result);
++  REXGPU_INFO("Streamline support: SR={}, FG={}, Reflex={}, PCL={}", support_.sr_result,
++              support_.fg_result, support_.reflex_result, support_.pcl_result);
++  if (!support_.sr && !support_.fg) {
++    REXGPU_WARN("Streamline has no supported DLSS feature on the selected adapter");
++    return false;
++  }
++
++  if (support_.sr &&
++      !impl_->ImportFeature(impl_->optimal, sl::kFeatureDLSS, "slDLSSGetOptimalSettings"))
++    return false;
++  if (support_.fg) {
++    if (!impl_->ImportFeature(impl_->fg_options, sl::kFeatureDLSS_G, "slDLSSGSetOptions") ||
++        !impl_->ImportFeature(impl_->fg_state, sl::kFeatureDLSS_G, "slDLSSGGetState"))
++      return false;
++    const sl::DLSSGOptions options{};  // Off until valid SSX frame inputs exist.
++    if (!Check(impl_->fg_options(sl::ViewportHandle(0), options), "FG off"))
++      return false;
++    sl::DLSSGState state{};
++    if (Check(impl_->fg_state(sl::ViewportHandle(0), state, nullptr), "FG capabilities")) {
++      support_.max_generated_frames = state.numFramesToGenerateMax;
++    }
++  }
++  if (support_.reflex) {
++    if (!impl_->ImportFeature(impl_->reflex_options, sl::kFeatureReflex, "slReflexSetOptions") ||
++        !impl_->ImportFeature(impl_->reflex_state, sl::kFeatureReflex, "slReflexGetState")) {
++      return false;
++    }
++    const sl::ReflexOptions options{};  // Must initialize even while disabled.
++    if (!Check(impl_->reflex_options(options), "Reflex off"))
++      return false;
++    sl::ReflexState state{};
++    if (Check(impl_->reflex_state(state), "Reflex capabilities")) {
++      support_.low_latency_available = state.lowLatencyAvailable;
++    }
++  }
++  // Retain originals so a partially failed upgrade can restore both references.
++  Microsoft::WRL::ComPtr<ID3D12Device> original_device(device);
++  Microsoft::WRL::ComPtr<IDXGIFactory2> original_factory(factory);
++  void* upgraded_device = device;
++  void* upgraded_factory = factory;
++  const bool upgraded = Check(impl_->upgrade(&upgraded_device), "device proxy") &&
++                        Check(impl_->upgrade(&upgraded_factory), "factory proxy");
++  device = static_cast<ID3D12Device*>(upgraded_device);
++  factory = static_cast<IDXGIFactory2*>(upgraded_factory);
++  if (!upgraded) {
++    device->Release();
++    factory->Release();
++    device = original_device.Detach();
++    factory = original_factory.Detach();
++    return false;
++  }
++  impl_->attached = true;
++  REXGPU_INFO("Streamline 2.14.1 presentation connected; SR/FG/Reflex remain off");
++  return true;
++#else
++  (void)device;
++  (void)factory;
++  return false;
++#endif
++}
++
++bool Streamline::GetOptimalSettings(Quality quality, uint32_t width, uint32_t height,
++                                    OptimalSettings& settings) {
++  settings = {};
++#if REX_HAS_STREAMLINE
++  if (!impl_->attached || !support_.sr || !impl_->optimal || !width || !height)
++    return false;
++  sl::DLSSOptions options{};
++  switch (quality) {
++    case Quality::kQuality:
++      options.mode = sl::DLSSMode::eMaxQuality;
++      break;
++    case Quality::kBalanced:
++      options.mode = sl::DLSSMode::eBalanced;
++      break;
++    case Quality::kPerformance:
++      options.mode = sl::DLSSMode::eMaxPerformance;
++      break;
++    case Quality::kUltraPerformance:
++      options.mode = sl::DLSSMode::eUltraPerformance;
++      break;
++    case Quality::kDLAA:
++      options.mode = sl::DLSSMode::eDLAA;
++      break;
++    default:
++      return false;
++  }
++  options.outputWidth = width;
++  options.outputHeight = height;
++  sl::DLSSOptimalSettings optimal{};
++  if (!Check(impl_->optimal(options, optimal), "DLSS optimal settings"))
++    return false;
++  settings = {optimal.optimalRenderWidth, optimal.optimalRenderHeight, optimal.renderWidthMin,
++              optimal.renderHeightMin,    optimal.renderWidthMax,      optimal.renderHeightMax};
++  return settings.width != 0 && settings.height != 0;
++#else
++  (void)quality;
++  (void)width;
++  (void)height;
++  return false;
++#endif
++}
++
++void Streamline::Shutdown() {
++#if REX_HAS_STREAMLINE
++  if (impl_->init_called) {
++    Check(impl_->shutdown(), "slShutdown");
++    impl_->init_called = false;
++    impl_->attached = false;
++  }
++#endif
++}
++
++}  // namespace rex::ui::d3d12

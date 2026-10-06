@@ -1,0 +1,84 @@
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index c5e6497..23ea892 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -487,6 +487,9 @@ class D3D12CommandProcessor : public CommandProcessor {
+   // Guest frame index, since some transient resources can be reused across
+   // submissions. Values updated in the beginning of a frame.
+   uint64_t frame_current_ = 1;
++
++  // Last dimensions/formats reported by the opt-in swap diagnostic.
++  std::array<uint32_t, 12> logged_swap_description_ = {};
+   uint64_t frame_completed_ = 0;
+   // Submission indices of frames that have already been submitted.
+   uint64_t closed_frame_submissions_[kQueueFrames] = {};
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index acadd7b..b776967 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -40,6 +40,8 @@ REXCVAR_DEFINE_BOOL(d3d12_gpu_profile, false, "GPU/D3D12",
+                     "Measure GPU time per category (guest draws, render target transfers, "
+                     "resolves, texture loads, swap) with timestamp queries and log it "
+                     "every 2 seconds.");
++REXCVAR_DEFINE_BOOL(d3d12_log_swap, false, "GPU/D3D12",
++                    "Log actual swap source, active output, scale and format when they change.");
+ REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+@@ -2138,6 +2140,30 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+   bool swap_source_scaled = frontbuffer_width_unscaled && frontbuffer_height_unscaled &&
+                             (source_width_scaled != frontbuffer_width_unscaled ||
+                              source_height_scaled != frontbuffer_height_unscaled);
++  if (REXCVAR_GET(d3d12_log_swap)) {
++    const std::array<uint32_t, 12> description = {
++        frontbuffer_width, frontbuffer_height, frontbuffer_width_unscaled,
++        frontbuffer_height_unscaled, source_width_scaled, source_height_scaled,
++        guest_output_width, guest_output_height, texture_cache_->draw_resolution_scale_x(),
++        texture_cache_->draw_resolution_scale_y(), uint32_t(frontbuffer_format),
++        uint32_t(swap_texture_desc.Format)};
++    if (description != logged_swap_description_) {
++      logged_swap_description_ = description;
++      REXGPU_INFO(
++          "SSX_SWAP frame={} packet={}x{} texture_guest={}x{} source={}x{} active={}x{} "
++          "draw_scale={}x{} path={} xenos_format={} dxgi_format={}",
++          frame_current_, frontbuffer_width, frontbuffer_height, frontbuffer_width_unscaled,
++          frontbuffer_height_unscaled, source_width_scaled, source_height_scaled,
++          guest_output_width, guest_output_height, texture_cache_->draw_resolution_scale_x(),
++          texture_cache_->draw_resolution_scale_y(),
++          render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock
++              ? "rov"
++              : "rtv",
++          uint32_t(frontbuffer_format), uint32_t(swap_texture_desc.Format));
++    }
++  } else {
++    logged_swap_description_ = {};
++  }
+   if (texture_cache_->IsDrawResolutionScaled() && !swap_source_scaled) {
+     static bool draw_scale_swap_unscaled_logged = false;
+     if (!draw_scale_swap_unscaled_logged) {
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 306118e..68dda6d 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -32,6 +32,8 @@
+ 
+ REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
+                     "Allow variable refresh rate and tearing");
++REXCVAR_DEFINE_BOOL(d3d12_log_presenter, false, "UI/D3D12",
++                    "Log swap chain dimensions and format on surface connect or resize.");
+ 
+ namespace rex::ui::d3d12 {
+ 
+@@ -478,6 +480,12 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+         provider_.OffsetRTVDescriptor(rtv_heap_start, PaintContext::kRTVIndexSwapChainBuffer0 + i));
+   }
+ 
++  if (REXCVAR_GET(d3d12_log_presenter)) {
++    REXLOG_INFO("SSX_PRESENT surface={}x{} swapchain={}x{} dxgi_format={} allows_tearing={}",
++                new_surface_width, new_surface_height, paint_context_.swap_chain_width,
++                paint_context_.swap_chain_height, uint32_t(kSwapChainFormat),
++                paint_context_.swap_chain_allows_tearing);
++  }
+   is_vsync_implicit_out = false;
+   return SurfacePaintConnectResult::kSuccess;
+ }

@@ -1,0 +1,1205 @@
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 47c08aa..a3f5ae3 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -40,6 +40,7 @@
+ #include <rex/ui/d3d12/d3d12_descriptor_heap_pool.h>
+ #include <rex/ui/d3d12/d3d12_provider.h>
+ #include <rex/ui/d3d12/guest_frame_inputs.h>
++#include <rex/ui/d3d12/ssx_reconstruction.h>
+ #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
+ #include <rex/ui/d3d12/d3d12_util.h>
+ #include <rex/ui/renderdoc_api.h>
+@@ -822,6 +823,12 @@ class D3D12CommandProcessor : public CommandProcessor {
+   uint32_t ssx_jittered_draws_ = 0, ssx_jitter_skipped_draws_ = 0;
+   uint32_t ssx_scene_draw_ = 0, ssx_jitter_unknown_ = 0;
+   uint32_t ssx_jitter_fixed_ = 0, ssx_jitter_inverse_ = 0;
++  uint32_t ssx_scene_msaa_samples_ = 1;
++  uint64_t ssx_reconstruction_frame_ = 0, ssx_reconstruction_log_frame_ = 0;
++  bool ssx_reconstruction_failed_ = false;
++  std::unique_ptr<ui::d3d12::SsxReconstruction> ssx_reconstruction_;
++  bool ReconstructSsxScene(uint64_t vs, uint64_t ps, const draw_util::ViewportInfo& viewport,
++                           bool& restarted);
+   std::array<uint64_t,8> ssx_jitter_unknown_shaders_{};
+   std::array<float,2> ssx_draw_jitter_ndc_{};
+   bool ssx_inverse_vertex_ = false, ssx_inverse_pixel_ = false;
+diff --git a/include/rex/ui/d3d12/guest_frame_inputs.h b/include/rex/ui/d3d12/guest_frame_inputs.h
+index 92e3b80..d7c3d61 100644
+--- a/include/rex/ui/d3d12/guest_frame_inputs.h
++++ b/include/rex/ui/d3d12/guest_frame_inputs.h
+@@ -73,6 +73,7 @@ struct SsxFrameMetadata {
+   bool depth_before_lighting = false;
+   uint32_t jitter_unknown_before_color = 0;
+   uint32_t jitter_fixed_screen_draws = 0, jitter_inverse_draws = 0;
++  uint32_t scene_msaa_samples = 1;  // Peak guest sample count before tone mapping.
+   std::array<uint64_t,8> jitter_unknown_shaders{};
+ 
+   bool Has(SsxInput role) const { return (captured_mask & (1u << size_t(role))) != 0; }
+@@ -107,6 +108,9 @@ struct GuestInputTexture {
+ };
+ 
+ struct SsxFrameInputs {
++  // A frozen boundary packet retains its producer's pool slot as well as COM
++  // resources, preventing pool reuse while reconstruction still references it.
++  std::shared_ptr<const SsxFrameInputs> producer_owner;
+   SsxFrameMetadata metadata;
+   SsxGeometry geometry;
+   std::array<GuestInputTexture, size_t(SsxInput::kCount)> textures;
+diff --git a/include/rex/ui/d3d12/ssx_reconstruction.h b/include/rex/ui/d3d12/ssx_reconstruction.h
+new file mode 100644
+index 0000000..9423b60
+--- /dev/null
++++ b/include/rex/ui/d3d12/ssx_reconstruction.h
+@@ -0,0 +1,33 @@
++#pragma once
++#include <rex/ui/d3d12/guest_frame_inputs.h>
++#include <rex/ui/d3d12/ssx_camera_motion.h>
++#include <rex/ui/d3d12/streamline.h>
++
++namespace rex::ui::d3d12 {
++class D3D12Provider;
++// Decompose the captured unjittered world-to-clip transform. Reject skewed,
++// off-axis and non-perspective cameras rather than supplying invented constants.
++// The returned projection and history use SSX's reversed device-depth space.
++bool BuildSsxSRCamera(const SsxFrameMetadata& frame, const SsxMotionPlan& motion,
++                      Streamline::SRCamera& camera);
++
++// Experimental same-resolution reconstruction at the guest tone-map boundary.
++// Single command-processor-thread owner. Uses separate command lists on the
++// provider's direct queue; the caller first submits all input-producing work.
++class SsxReconstruction {
++ public:
++  struct Result {
++    bool submitted = false, applied = false, reset = false;
++    const char* reason = "unavailable";
++  };
++  SsxReconstruction();
++  ~SsxReconstruction();
++  Result Submit(const D3D12Provider& provider, const std::shared_ptr<const SsxFrameInputs>& frame,
++                ID3D12Resource* destination, D3D12_RESOURCE_STATES destination_state,
++                double seconds);
++
++ private:
++  struct Impl;
++  std::unique_ptr<Impl> impl_;
++};
++}  // namespace rex::ui::d3d12
+diff --git a/include/rex/ui/d3d12/streamline.h b/include/rex/ui/d3d12/streamline.h
+index 645bdbb..c702e6f 100644
+--- a/include/rex/ui/d3d12/streamline.h
++++ b/include/rex/ui/d3d12/streamline.h
+@@ -69,12 +69,13 @@ class Streamline {
+     // GPU completion. Input states must be NON_PIXEL_SHADER_RESOURCE, output
+     // UNORDERED_ACCESS; Streamline restores these resource states on return.
+     ID3D12Resource* color = nullptr;   // FP16 RGBA, decoded linear, unexposed.
+-    ID3D12Resource* depth = nullptr;   // R32_FLOAT, non-inverted device depth.
++    ID3D12Resource* depth = nullptr;   // R32_FLOAT, device depth matching camera matrices.
+     ID3D12Resource* motion = nullptr;  // RG32/RG16 float, prev-current pixels.
+     ID3D12Resource* output = nullptr;  // FP16 RGBA, distinct UAV texture.
+     // Motion includes camera and object motion, excluding projection jitter.
+     // First frame, configuration change, ID gap or failure also force a reset.
+     bool reset = false;
++    bool depth_inverted = false;
+   };
+   struct SREvaluation {
+     bool recorded = false;
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index bfdb52c..760c4b5 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -1805,6 +1805,9 @@ bool D3D12CommandProcessor::SetupContext() {
+ 
+ void D3D12CommandProcessor::ShutdownContext() {
+   AwaitAllQueueOperationsCompletion();
++  ssx_reconstruction_.reset();
++  ssx_reconstruction_failed_ = false;
++  ssx_reconstruction_frame_ = ssx_reconstruction_log_frame_ = 0;
+   ssx_inputs_.reset();
+   ssx_input_pool_.Clear();
+   ssx_input_attempt_frame_ = 0;
+@@ -2719,6 +2722,25 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   // Update constant buffers, descriptors and root parameters.
+   CollectSsxFrameInputs(vertex_shader->ucode_data_hash(),
+                        pixel_shader ? pixel_shader->ucode_data_hash() : 0, viewport_info);
++  bool ssx_restarted = false;
++  if (!ReconstructSsxScene(vertex_shader->ucode_data_hash(),
++                           pixel_shader ? pixel_shader->ucode_data_hash() : 0,
++                           viewport_info, ssx_restarted)) return false;
++  if (ssx_restarted) {
++    // BeginSubmission invalidates all command-list binding caches. Restore the
++    // tone-map draw on its fresh list; never inherit bindings from DLSS.
++    if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
++                                      normalized_color_mask, *vertex_shader)) return false;
++    texture_cache_->RequestTextures(used_texture_mask);
++    deferred_command_list_.SetPipelineStateHandle(pipeline_handle);
++    current_guest_pipeline_ = pipeline_handle;
++    current_external_pipeline_ = nullptr;
++    UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control);
++    UpdateSystemConstantValues(memexport_used, primitive_polygonal,
++                               primitive_processing_result.line_loop_closing_index,
++                               primitive_processing_result.host_shader_index_endian, viewport_info,
++                               used_texture_mask, normalized_depth_control, normalized_color_mask);
++  }
+   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
+     return false;
+   }
+diff --git a/src/graphics/d3d12/ssx_frame_inputs.cpp b/src/graphics/d3d12/ssx_frame_inputs.cpp
+index e9e9a27..507d9a6 100644
+--- a/src/graphics/d3d12/ssx_frame_inputs.cpp
++++ b/src/graphics/d3d12/ssx_frame_inputs.cpp
+@@ -1,7 +1,9 @@
+ #include <rex/graphics/d3d12/command_processor.h>
+ 
+ #include <rex/ui/d3d12/ssx_jitter.h>
++#include <rex/ui/d3d12/ssx_temporal_alignment.h>
+ #include <cmath>
++#include <chrono>
+ #include <cstring>
+ #include <rex/cvar.h>
+ #include <rex/graphics/flags.h>
+@@ -16,8 +18,13 @@ REXCVAR_DEFINE_BOOL(d3d12_ssx_jitter, false, "GPU/D3D12",
+                     "temporal reconstruction")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++REXCVAR_DECLARE(bool, d3d12_ssx_dlaa);
++
+ namespace rex::graphics::d3d12 {
+ bool D3D12CommandProcessor::SsxJitterTranslationEnabled() const {
++  if (REXCVAR_GET(d3d12_ssx_dlaa) &&
++      (ssx_reconstruction_failed_ || !GetD3D12Provider().GetStreamline() ||
++       !GetD3D12Provider().GetStreamline()->support().sr)) return false;
+   return ssx_title_id_ == 0x4541096D && REXCVAR_GET(d3d12_ssx_frame_inputs) &&
+          REXCVAR_GET(d3d12_ssx_jitter);
+ }
+@@ -38,10 +45,9 @@ void D3D12CommandProcessor::ApplySsxJitter(const D3D12Shader& shader, uint64_t p
+       ssx_jittered_draws_ = ssx_jitter_skipped_draws_ = 0;
+       ssx_scene_draw_ = ssx_jitter_unknown_ = ssx_jitter_fixed_ = ssx_jitter_inverse_ = 0;
+       ssx_jitter_unknown_shaders_ = {};
++      ssx_scene_msaa_samples_ = 1;
+     }
+     ++ssx_scene_draw_;
+-    if (!REXCVAR_GET(d3d12_ssx_jitter))
+-      return;
+     const auto sx = texture_cache_->draw_resolution_scale_x();
+     const auto sy = texture_cache_->draw_resolution_scale_y();
+     if (!sx || !sy || viewport.xy_offset[0] || viewport.xy_offset[1] ||
+@@ -55,6 +61,9 @@ void D3D12CommandProcessor::ApplySsxJitter(const D3D12Shader& shader, uint64_t p
+     if (depth.depth_base != 720 || depth.depth_base_bit_11 ||
+         depth.depth_format != xenos::DepthRenderTargetFormat::kD24FS8)
+       return;
++    ssx_scene_msaa_samples_ = std::max(ssx_scene_msaa_samples_,
++        1u << uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples));
++    if (!SsxJitterTranslationEnabled()) return;
+     const auto unknown = [&] {
+       ++ssx_jitter_unknown_;
+       for (auto& hash : ssx_jitter_unknown_shaders_) {
+@@ -227,7 +236,7 @@ void D3D12CommandProcessor::CollectSsxFrameInputs(uint64_t vs, uint64_t ps,
+   metadata.scene_height = scene_height;
+   metadata.scale_x = sx;
+   metadata.scale_y = sy;
+-  metadata.jitter_enabled = REXCVAR_GET(d3d12_ssx_jitter);
++  metadata.jitter_enabled = SsxJitterTranslationEnabled();
+   if (metadata.jitter_enabled)
+     metadata.jitter_pixels = ui::d3d12::SsxJitterPixels(frame_current_);
+   const auto& regs = *register_file_;
+@@ -274,6 +283,8 @@ void D3D12CommandProcessor::CollectSsxFrameInputs(uint64_t vs, uint64_t ps,
+       metadata.guest_depth_info = regs[XE_GPU_REG_RB_DEPTH_INFO];
+     }
+   } else if (pass == SsxPass::kToneMap) {
++    metadata.jittered_draws = ssx_jittered_draws_;
++    metadata.scene_msaa_samples = ssx_scene_msaa_samples_;
+     metadata.color_draw = ssx_scene_draw_;
+     metadata.jitter_unknown_before_color = ssx_jitter_unknown_;
+     metadata.jitter_unknown_shaders = ssx_jitter_unknown_shaders_;
+@@ -303,6 +314,63 @@ void D3D12CommandProcessor::CollectSsxFrameInputs(uint64_t vs, uint64_t ps,
+   }
+ }
+ 
++bool D3D12CommandProcessor::ReconstructSsxScene(uint64_t vs, uint64_t ps,
++    const draw_util::ViewportInfo& viewport, bool& restarted) {
++  using namespace ui::d3d12;
++  restarted = false;
++  if (!REXCVAR_GET(d3d12_ssx_dlaa) || ssx_reconstruction_failed_ || !ssx_inputs_ ||
++      ssx_inputs_->metadata.guest_frame != frame_current_ ||
++      ssx_reconstruction_frame_ == frame_current_) return true;
++  const auto& f = ssx_inputs_->metadata;
++  if (!f.scale_x || !f.scale_y ||
++      IdentifySsxPass(ssx_title_id_,vs,ps,viewport.xy_extent[0]/f.scale_x,
++                      viewport.xy_extent[1]/f.scale_y) != SsxPass::kToneMap) return true;
++  ssx_reconstruction_frame_ = frame_current_;
++  auto* sr = GetD3D12Provider().GetStreamline();
++  if (!sr || !sr->support().sr || render_target_cache_->GetPath() != RenderTargetCache::Path::kPixelShaderInterlock ||
++      !f.jitter_enabled || f.scene_msaa_samples != 1) {
++    REXGPU_WARN("SSX_DLAA fallback frame={} reason=prerequisites scene_samples={} jitter={}",
++                frame_current_,f.scene_msaa_samples,f.jitter_enabled);
++    ssx_reconstruction_failed_ = true;
++    return true;
++  }
++  const auto alignment = CheckSsxTemporalAlignment(*ssx_inputs_);
++  if (alignment != SsxAlignmentStatus::kCompatible) {
++    // Menu/loading packets may have no world camera or early scene depth.
++    // They don't consume a DLSS frame; the next complete packet resets history.
++    if (!ssx_reconstruction_log_frame_ || frame_current_-ssx_reconstruction_log_frame_ >= 120) {
++      ssx_reconstruction_log_frame_ = frame_current_;
++      REXGPU_WARN("SSX_DLAA skipped frame={} reason={}",frame_current_,SsxAlignmentName(alignment));
++    }
++    if (alignment == SsxAlignmentStatus::kJitterCoverage ||
++        alignment == SsxAlignmentStatus::kDepthView || alignment == SsxAlignmentStatus::kExtent)
++      ssx_reconstruction_failed_ = true;
++    return true;
++  }
++  D3D12TextureCache::ActiveTextureSnapshotSource source;
++  if (!texture_cache_->GetActiveTextureSnapshotSource(0,source)) return true;
++  auto frozen = std::make_shared<SsxFrameInputs>(*ssx_inputs_);
++  frozen->producer_owner = ssx_inputs_;
++  frozen->metadata.output_width = frozen->textures[0].width;
++  frozen->metadata.output_height = frozen->textures[0].height;
++  if (!EndSubmission(false)) return false;
++  // The previous submission includes all scene draws, resolves and input copies.
++  // Separate lists isolate DLSS/native-motion binding changes from guest draws.
++  if (!ssx_reconstruction_) ssx_reconstruction_ = std::make_unique<SsxReconstruction>();
++  const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
++  const auto result = ssx_reconstruction_->Submit(GetD3D12Provider(),frozen,source.resource,source.state,seconds);
++  if (result.submitted) NotifyQueueOperationsDoneDirectly();
++  if (!result.applied) ssx_reconstruction_failed_ = true;
++  if (!result.applied || !ssx_reconstruction_log_frame_ || frame_current_-ssx_reconstruction_log_frame_ >= 120) {
++    ssx_reconstruction_log_frame_ = frame_current_;
++    REXGPU_INFO("SSX_DLAA frame={} scene={}x{} scene_samples={} applied={} reset={} reason={} insertion=before_tone_map",
++                frame_current_,frozen->textures[0].width,frozen->textures[0].height,
++                f.scene_msaa_samples,result.applied,result.reset,result.reason);
++  }
++  restarted = true;
++  return BeginSubmission(true);
++}
++
+ std::shared_ptr<const ui::d3d12::SsxFrameInputs> D3D12CommandProcessor::SealSsxFrameInputs(
+     uint32_t width, uint32_t height) {
+   if (!REXCVAR_GET(d3d12_ssx_frame_inputs))
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index dc2ab34..ae25e87 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -66,6 +66,8 @@ if(REXGLUE_USE_D3D12)
+         d3d12/ssx_camera_motion.cpp
+         d3d12/ssx_native_motion.cpp
+         d3d12/ssx_scene_color.cpp
++        d3d12/ssx_reconstruction.cpp
++        d3d12/ssx_reconstruction_camera.cpp
+     )
+ endif()
+ 
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index b070a60..803c261 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -44,6 +44,7 @@ REXCVAR_DEFINE_BOOL(d3d12_ssx_camera_motion, false, "UI/D3D12",
+ REXCVAR_DEFINE_BOOL(d3d12_ssx_native_motion, false, "UI/D3D12",
+                     "Experimental captured rider geometry motion; requires SSX camera motion. No DLSS/FG.")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DECLARE(bool, d3d12_ssx_dlaa);
+ 
+ namespace rex::ui::d3d12 {
+ 
+@@ -642,11 +643,11 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+     }
+   }
+ 
+-  if (REXCVAR_GET(d3d12_ssx_scene_color))
++  if (REXCVAR_GET(d3d12_ssx_scene_color) && !REXCVAR_GET(d3d12_ssx_dlaa))
+     paint_context_.scene_color.Record(provider_, command_list, frame_inputs,
+                                       current_paint_submission, inputs_completed);
+ 
+-  if (REXCVAR_GET(d3d12_ssx_camera_motion)) {
++  if (REXCVAR_GET(d3d12_ssx_camera_motion) && !REXCVAR_GET(d3d12_ssx_dlaa)) {
+     const double seconds = std::chrono::duration<double>(
+         std::chrono::steady_clock::now().time_since_epoch()).count();
+     const auto motion = paint_context_.camera_motion.Record(provider_, command_list, frame_inputs,
+diff --git a/src/ui/d3d12/ssx_reconstruction.cpp b/src/ui/d3d12/ssx_reconstruction.cpp
+new file mode 100644
+index 0000000..57b8793
+--- /dev/null
++++ b/src/ui/d3d12/ssx_reconstruction.cpp
+@@ -0,0 +1,291 @@
++#include <rex/ui/d3d12/ssx_reconstruction.h>
++#include <rex/ui/d3d12/d3d12_provider.h>
++#include <rex/ui/d3d12/d3d12_submission_tracker.h>
++#include <rex/ui/d3d12/d3d12_util.h>
++#include <rex/ui/d3d12/ssx_native_motion.h>
++#include <rex/ui/d3d12/ssx_scene_color.h>
++#include <rex/logging.h>
++#include <rex/cvar.h>
++
++REXCVAR_DEFINE_BOOL(
++    d3d12_ssx_dlaa, false, "GPU/D3D12",
++    "Experimental DLAA before SSX tone mapping; single-sample ROV scene only. "
++    "Requires Streamline, SSX inputs, native motion and jitter; no upscaling or FG.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++namespace rex::ui::d3d12 {
++namespace {
++#include "ui/shaders/bytecode/d3d12_5_1/ssx_reconstruction_encode_cs.h"
++using Microsoft::WRL::ComPtr;
++void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
++                D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to) {
++  if (from == to)
++    return;
++  D3D12_RESOURCE_BARRIER b{};
++  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++  b.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, from, to};
++  list->ResourceBarrier(1, &b);
++}
++}  // namespace
++struct SsxReconstruction::Impl {
++  struct Slot {
++    ComPtr<ID3D12CommandAllocator> allocator;
++    ComPtr<ID3D12GraphicsCommandList> list;
++    ComPtr<ID3D12Resource> output, encoded, destination;
++    ComPtr<ID3D12DescriptorHeap> heap;
++    std::shared_ptr<const SsxFrameInputs> input;
++    uint64_t submission = 0;
++    uint32_t width = 0, height = 0;
++  };
++  std::array<Slot, 3> slots;
++  D3D12SubmissionTracker tracker;
++  SsxCameraMotion camera;
++  SsxNativeMotion native;
++  SsxSceneColor color;
++  Streamline* sr = nullptr;
++  ComPtr<ID3D12RootSignature> root;
++  ComPtr<ID3D12PipelineState> pipeline;
++  uint32_t width = 0, height = 0;
++  uint64_t previous_frame = 0;
++  bool initialized = false;
++
++  ~Impl() {
++    if (initialized) {
++      tracker.AwaitAllSubmissionsCompletion();
++      if (sr)
++        sr->ReleaseSR();
++    }
++  }
++  bool Initialize(const D3D12Provider& provider) {
++    if (initialized)
++      return true;
++    sr = provider.GetStreamline();
++    if (!sr || !sr->support().sr)
++      return false;
++    auto* device = provider.GetDevice();
++    if (!tracker.Initialize(device, provider.GetDirectQueue()))
++      return false;
++    D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0},
++                                       {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 2}};
++    D3D12_ROOT_PARAMETER params[2]{};
++    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++    params[0].Constants = {0, 0, 4};
++    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    params[1].DescriptorTable = {2, ranges};
++    D3D12_ROOT_SIGNATURE_DESC desc{};
++    desc.NumParameters = 2;
++    desc.pParameters = params;
++    root.Attach(util::CreateRootSignature(provider, desc));
++    if (!root)
++      return false;
++    pipeline.Attach(util::CreateComputePipeline(device, ssx_reconstruction_encode_cs,
++                                                sizeof(ssx_reconstruction_encode_cs), root.Get()));
++    if (!pipeline)
++      return false;
++    initialized = true;
++    return true;
++  }
++  bool Prepare(const D3D12Provider& provider, Slot& slot, uint32_t w, uint32_t h) {
++    auto* d = provider.GetDevice();
++    if (!slot.allocator) {
++      if (FAILED(d->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
++                                           IID_PPV_ARGS(&slot.allocator))) ||
++          FAILED(d->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, slot.allocator.Get(),
++                                      nullptr, IID_PPV_ARGS(&slot.list))))
++        return false;
++      if (FAILED(slot.list->Close()))
++        return false;
++      D3D12_DESCRIPTOR_HEAP_DESC heap{};
++      heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
++      heap.NumDescriptors = 3;
++      heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
++      if (FAILED(d->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&slot.heap))))
++        return false;
++    }
++    if (slot.output && slot.width == w && slot.height == h)
++      return true;
++    D3D12_HEAP_PROPERTIES heap{};
++    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
++    D3D12_RESOURCE_DESC desc{};
++    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++    desc.Width = w;
++    desc.Height = h;
++    desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
++    desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
++    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++    ComPtr<ID3D12Resource> output, encoded;
++    if (FAILED(d->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
++                                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
++                                          IID_PPV_ARGS(&output))) ||
++        FAILED(d->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
++                                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
++                                          IID_PPV_ARGS(&encoded))))
++      return false;
++    output->SetName(L"SSX DLAA linear output before tone map");
++    encoded->SetName(L"SSX reconstructed color encoded for guest tone map");
++    slot.output = std::move(output);
++    slot.encoded = std::move(encoded);
++    slot.width = w;
++    slot.height = h;
++    return true;
++  }
++};
++SsxReconstruction::SsxReconstruction() : impl_(std::make_unique<Impl>()) {}
++SsxReconstruction::~SsxReconstruction() = default;
++SsxReconstruction::Result SsxReconstruction::Submit(
++    const D3D12Provider& provider, const std::shared_ptr<const SsxFrameInputs>& frame,
++    ID3D12Resource* destination, D3D12_RESOURCE_STATES destination_state, double seconds) {
++  auto& p = *impl_;
++  Result result;
++  if (!frame || !destination) {
++    result.reason = "missing";
++    return result;
++  }
++  const auto& f = frame->metadata;
++  if (f.scene_msaa_samples != 1) {
++    result.reason = "multisampled_scene";
++    return result;
++  }
++  auto alignment = CheckSsxTemporalAlignment(*frame);
++  if (alignment != SsxAlignmentStatus::kCompatible) {
++    result.reason = SsxAlignmentName(alignment);
++    return result;
++  }
++  SsxColorConstants decode;
++  if (!PlanSsxSceneColor(*frame, decode)) {
++    result.reason = "color_contract";
++    return result;
++  }
++  const auto dest = destination->GetDesc();
++  if (dest.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || dest.Width != decode.width ||
++      dest.Height != decode.height || dest.Format != DXGI_FORMAT_R16G16B16A16_FLOAT ||
++      dest.SampleDesc.Count != 1 || dest.DepthOrArraySize != 1) {
++    result.reason = "destination_contract";
++    return result;
++  }
++  if (!p.Initialize(provider))
++    return result;
++  if (p.width != decode.width || p.height != decode.height) {
++    if (!p.tracker.AwaitAllSubmissionsCompletion() || !p.sr->ReleaseSR() ||
++        !p.sr->ConfigureSsxSR(Streamline::Quality::kDLAA, decode.width, decode.height)) {
++      result.reason = "configuration";
++      return result;
++    }
++    p.width = decode.width;
++    p.height = decode.height;
++    p.camera.Reset(SsxMotionReset::kResize);
++    p.native.Reset();
++  }
++  const auto submission = p.tracker.GetCurrentSubmission();
++  auto& slot = p.slots[submission % p.slots.size()];
++  if (slot.submission && !p.tracker.AwaitSubmissionCompletion(slot.submission)) {
++    result.reason = "slot_fence";
++    return result;
++  }
++  const auto completed = p.tracker.GetCompletedSubmission();
++  if (!p.Prepare(provider, slot, p.width, p.height) || FAILED(slot.allocator->Reset()) ||
++      FAILED(slot.list->Reset(slot.allocator.Get(), nullptr))) {
++    result.reason = "resources";
++    return result;
++  }
++  if (p.previous_frame && f.guest_frame != p.previous_frame + 1) {
++    p.camera.Reset(SsxMotionReset::kFrameGap);
++    p.native.Reset();
++  }
++  p.previous_frame = f.guest_frame;
++  auto* list = slot.list.Get();
++  list->BeginEvent(1, "SSX DLAA before tone map", sizeof("SSX DLAA before tone map"));
++  const auto linear = p.color.Record(provider, list, frame, submission, completed);
++  const auto motion = p.camera.Record(provider, list, frame, submission, completed, seconds);
++  const auto native = p.native.Record(provider, list, frame, motion, submission, completed);
++  Streamline::SRFrame sr_frame;
++  sr_frame.id = f.guest_frame;
++  sr_frame.jitter_pixels = f.jitter_pixels;
++  sr_frame.depth_inverted = true;
++  sr_frame.reset = motion.plan.constants.reset || native.rejected ||
++                   (native.captured && native.matched != native.captured);
++  result.reason = "temporal_inputs";
++  if (linear.color && motion.vectors && motion.plan.usable &&
++      BuildSsxSRCamera(f, motion.plan, sr_frame.camera)) {
++    sr_frame.color = linear.color;
++    sr_frame.depth = frame->textures[size_t(SsxInput::kResolvedDepth)].resource.Get();
++    sr_frame.motion = motion.vectors;
++    sr_frame.output = slot.output.Get();
++    for (auto* resource : {sr_frame.color, sr_frame.depth, sr_frame.motion})
++      Transition(list, resource, GuestInputTexture::kReadState,
++                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++    const auto evaluation = p.sr->EvaluateSR(list, sr_frame);
++    for (auto* resource : {sr_frame.color, sr_frame.depth, sr_frame.motion})
++      Transition(list, resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++                 GuestInputTexture::kReadState);
++    result.reset = evaluation.history_reset;
++    result.reason = "evaluate";
++    if (evaluation.recorded) {
++      auto* device = provider.GetDevice();
++      auto handle = slot.heap->GetCPUDescriptorHandleForHeapStart();
++      const auto step =
++          device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++      D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
++      srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
++      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++      srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++      srv.Texture2D.MipLevels = 1;
++      device->CreateShaderResourceView(slot.output.Get(), &srv, handle);
++      handle.ptr += step;
++      device->CreateShaderResourceView(frame->textures[0].resource.Get(), &srv, handle);
++      handle.ptr += step;
++      D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
++      uav.Format = srv.Format;
++      uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
++      device->CreateUnorderedAccessView(slot.encoded.Get(), nullptr, &uav, handle);
++      Transition(list, slot.output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++      auto* heap = slot.heap.Get();
++      list->SetDescriptorHeaps(1, &heap);
++      list->SetComputeRootSignature(p.root.Get());
++      list->SetPipelineState(p.pipeline.Get());
++      struct {
++        uint32_t width, height;
++        float inverse_scale;
++        uint32_t unused;
++      } k{p.width, p.height, 1 / decode.color_scale, 0};
++      list->SetComputeRoot32BitConstants(0, 4, &k, 0);
++      list->SetComputeRootDescriptorTable(1, heap->GetGPUDescriptorHandleForHeapStart());
++      list->Dispatch((p.width + 7) / 8, (p.height + 7) / 8, 1);
++      Transition(list, slot.encoded.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++                 D3D12_RESOURCE_STATE_COPY_SOURCE);
++      Transition(list, destination, destination_state, D3D12_RESOURCE_STATE_COPY_DEST);
++      D3D12_TEXTURE_COPY_LOCATION from{}, to{};
++      from.pResource = slot.encoded.Get();
++      from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++      to.pResource = destination;
++      to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++      list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
++      Transition(list, destination, D3D12_RESOURCE_STATE_COPY_DEST, destination_state);
++      Transition(list, slot.encoded.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
++                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++      Transition(list, slot.output.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++      result.applied = true;
++      result.reason = "applied";
++    }
++  }
++  list->EndEvent();
++  slot.input = frame;
++  slot.destination = destination;
++  if (FAILED(list->Close())) {
++    result.applied = false;
++    result.reason = "close";
++    return result;
++  }
++  ID3D12CommandList* lists[] = {list};
++  provider.GetDirectQueue()->ExecuteCommandLists(1, lists);
++  slot.submission = submission;
++  result.submitted = true;
++  if (!p.tracker.NextSubmission()) {
++    result.applied = false;
++    result.reason = "signal";
++  }
++  return result;
++}
++}  // namespace rex::ui::d3d12
+diff --git a/src/ui/d3d12/ssx_reconstruction_camera.cpp b/src/ui/d3d12/ssx_reconstruction_camera.cpp
+new file mode 100644
+index 0000000..d3bf42a
+--- /dev/null
++++ b/src/ui/d3d12/ssx_reconstruction_camera.cpp
+@@ -0,0 +1,121 @@
++#include <rex/ui/d3d12/ssx_reconstruction.h>
++#include <algorithm>
++#include <cmath>
++
++namespace rex::ui::d3d12 {
++namespace {
++using Matrix = std::array<float, 16>;
++bool Invert(const Matrix& m, Matrix& result) {
++  double a[4][8]{};
++  for (unsigned r = 0; r < 4; ++r) {
++    for (unsigned c = 0; c < 4; ++c) {
++      if (!std::isfinite(m[r * 4 + c]))
++        return false;
++      a[r][c] = m[r * 4 + c];
++    }
++    a[r][r + 4] = 1;
++  }
++  for (unsigned c = 0; c < 4; ++c) {
++    unsigned pivot = c;
++    for (unsigned r = c + 1; r < 4; ++r)
++      if (std::abs(a[r][c]) > std::abs(a[pivot][c]))
++        pivot = r;
++    if (std::abs(a[pivot][c]) < 1e-12)
++      return false;
++    for (unsigned i = 0; i < 8; ++i)
++      std::swap(a[c][i], a[pivot][i]);
++    const double divisor = a[c][c];
++    for (double& x : a[c])
++      x /= divisor;
++    for (unsigned r = 0; r < 4; ++r) {
++      if (r == c)
++        continue;
++      const double factor = a[r][c];
++      for (unsigned i = 0; i < 8; ++i)
++        a[r][i] -= factor * a[c][i];
++    }
++  }
++  for (unsigned r = 0; r < 4; ++r)
++    for (unsigned c = 0; c < 4; ++c)
++      result[r * 4 + c] = float(a[r][c + 4]);
++  return true;
++}
++double Dot(const std::array<float, 3>& a, const std::array<float, 3>& b) {
++  return double(a[0]) * b[0] + double(a[1]) * b[1] + double(a[2]) * b[2];
++}
++Matrix Multiply(const Matrix& a, const Matrix& b) {
++  Matrix result{};
++  for (unsigned r = 0; r < 4; ++r)
++    for (unsigned c = 0; c < 4; ++c) {
++      double value = 0;
++      for (unsigned k = 0; k < 4; ++k)
++        value += double(a[r * 4 + k]) * b[k * 4 + c];
++      result[r * 4 + c] = float(value);
++    }
++  return result;
++}
++}  // namespace
++bool BuildSsxSRCamera(const SsxFrameMetadata& f, const SsxMotionPlan& motion,
++                      Streamline::SRCamera& out) {
++  out = {};
++  if (!f.camera_samples || f.camera_conflict || !f.camera_viewport_valid ||
++      f.guest_viewport_z != std::array<float, 2>{-1, 1} || !motion.usable)
++    return false;
++  const auto& m = f.world_to_clip_candidate;
++  for (float value : m)
++    if (!std::isfinite(value))
++      return false;
++  Streamline::SRCamera c;
++  c.right = {m[0], m[4], m[8]};
++  c.up = {m[1], m[5], m[9]};
++  c.forward = {m[3], m[7], m[11]};
++  const double sx = std::sqrt(Dot(c.right, c.right)), sy = std::sqrt(Dot(c.up, c.up));
++  if (sx < .05 || sy < .05 || std::abs(Dot(c.forward, c.forward) - 1) > 0.0002)
++    return false;
++  for (unsigned i = 0; i < 3; ++i) {
++    c.right[i] /= float(sx);
++    c.up[i] /= float(sy);
++  }
++  if (std::abs(Dot(c.right, c.up)) > .0002 || std::abs(Dot(c.right, c.forward)) > .0002 ||
++      std::abs(Dot(c.up, c.forward)) > .0002)
++    return false;
++  const std::array<float, 3> cross{c.right[1] * c.up[2] - c.right[2] * c.up[1],
++                                   c.right[2] * c.up[0] - c.right[0] * c.up[2],
++                                   c.right[0] * c.up[1] - c.right[1] * c.up[0]};
++  // SSX's observed view is right-handed: forward is negative camera-view Z.
++  if (Dot(cross, c.forward) > -.999)
++    return false;
++  const std::array<float, 3> z{m[2], m[6], m[10]};
++  const double a = Dot(z, c.forward) / Dot(c.forward, c.forward);
++  const double b = m[14] - a * m[15];
++  for (unsigned i = 0; i < 3; ++i)
++    if (std::abs(z[i] - a * c.forward[i]) > 0.0002)
++      return false;
++  if (!(a > 1.000001 && a < 2 && b < 0))
++    return false;
++  c.near_plane = float(-b / a);
++  c.far_plane = float(b / (1 - a));
++  if (c.near_plane < .01f || c.far_plane <= c.near_plane || c.far_plane > 1e7f)
++    return false;
++  c.vertical_fov = float(2 * std::atan(1 / sy));
++  c.aspect = float(sy / sx);
++  for (unsigned i = 0; i < 3; ++i)
++    c.position[i] = float(-(m[12] / sx * c.right[i] + m[13] / sy * c.up[i] + m[15] * c.forward[i]));
++  c.view_to_clip = {float(sx),    0,  0, 0, 0,         float(sy), 0, 0, 0, 0,
++                    float(a - 1), -1, 0, 0, float(-b), 0};
++  if (!Invert(c.view_to_clip, c.clip_to_view))
++    return false;
++  const Matrix identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
++  if (motion.constants.reset)
++    c.clip_to_previous = identity;
++  else {
++    // Both ends of the history transform need z' = w-z, not just the depth flag.
++    const Matrix reverse{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -1, 0, 0, 0, 1, 1};
++    c.clip_to_previous = Multiply(Multiply(reverse, motion.constants.clip_to_previous), reverse);
++  }
++  if (!Invert(c.clip_to_previous, c.previous_to_clip))
++    return false;
++  out = c;
++  return true;
++}
++}  // namespace rex::ui::d3d12
+diff --git a/src/ui/d3d12/streamline.cpp b/src/ui/d3d12/streamline.cpp
+index 4f394d7..ace1e0a 100644
+--- a/src/ui/d3d12/streamline.cpp
++++ b/src/ui/d3d12/streamline.cpp
+@@ -424,7 +424,7 @@ Streamline::SREvaluation Streamline::EvaluateSR(ID3D12GraphicsCommandList* list,
+   constants.cameraFar = c.far_plane;
+   constants.cameraFOV = c.vertical_fov;
+   constants.cameraAspectRatio = c.aspect;
+-  constants.depthInverted = sl::Boolean::eFalse;
++  constants.depthInverted = frame.depth_inverted ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+   constants.cameraMotionIncluded = sl::Boolean::eTrue;
+   constants.motionVectors3D = sl::Boolean::eFalse;
+   constants.motionVectorsJittered = sl::Boolean::eFalse;
+diff --git a/src/ui/shaders/bytecode/d3d12_5_1/ssx_reconstruction_encode_cs.h b/src/ui/shaders/bytecode/d3d12_5_1/ssx_reconstruction_encode_cs.h
+new file mode 100644
+index 0000000..c6c1cd5
+--- /dev/null
++++ b/src/ui/shaders/bytecode/d3d12_5_1/ssx_reconstruction_encode_cs.h
+@@ -0,0 +1,327 @@
++#if 0
++//
++// Generated by Microsoft (R) HLSL Shader Compiler 10.1
++//
++//
++// Buffer Definitions: 
++//
++// cbuffer Constants
++// {
++//
++//   uint2 extent;                      // Offset:    0 Size:     8
++//   float inverse_color_scale;         // Offset:    8 Size:     4
++//   uint unused;                       // Offset:   12 Size:     4 [unused]
++//
++// }
++//
++//
++// Resource Bindings:
++//
++// Name                                 Type  Format         Dim      ID      HLSL Bind  Count
++// ------------------------------ ---------- ------- ----------- ------- -------------- ------
++// reconstructed                     texture  float4          2d      T0             t0      1 
++// original                          texture  float4          2d      T1             t1      1 
++// encoded                               UAV  float4          2d      U0             u0      1 
++// Constants                         cbuffer      NA          NA     CB0            cb0      1 
++//
++//
++//
++// Input signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Input
++//
++// Output signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Output
++cs_5_1
++dcl_globalFlags refactoringAllowed
++dcl_constantbuffer CB0[0:0][1], immediateIndexed, space=0
++dcl_resource_texture2d (float,float,float,float) T0[0:0], space=0
++dcl_resource_texture2d (float,float,float,float) T1[1:1], space=0
++dcl_uav_typed_texture2d (float,float,float,float) U0[0:0], space=0
++dcl_input vThreadID.xy
++dcl_temps 3
++dcl_thread_group 8, 8, 1
++uge r0.xy, vThreadID.xyxx, CB0[0][0].xyxx
++or r0.x, r0.y, r0.x
++if_nz r0.x
++  ret 
++endif 
++mov r0.xy, vThreadID.xyxx
++mov r0.zw, l(0,0,0,0)
++ld r1.xyzw, r0.xyww, T1[1].xyzw
++ld r0.xyz, r0.xyzw, T0[0].xyzw
++and r2.xyz, r0.xyzx, l(0x7f800000, 0x7f800000, 0x7f800000, 0)
++ine r2.xyz, r2.xyzx, l(0x7f800000, 0x7f800000, 0x7f800000, 0)
++and r0.w, r2.y, r2.x
++and r0.w, r2.z, r0.w
++max r0.xyz, r0.xyzx, l(0.000000, 0.000000, 0.000000, 0.000000)
++sqrt r0.xyz, r0.xyzx
++mul r0.xyz, r0.xyzx, CB0[0][0].zzzz
++movc r1.xyz, r0.wwww, r0.xyzx, r1.xyzx
++store_uav_typed U0[0].xyzw, vThreadID.xyyy, r1.xyzw
++ret 
++// Approximately 19 instruction slots used
++#endif
++
++const BYTE ssx_reconstruction_encode_cs[] =
++{
++     68,  88,  66,  67, 217, 192, 
++    185, 107, 129,   3, 193, 103, 
++    102, 154, 141,  81, 168,  95, 
++     57,  25,   1,   0,   0,   0, 
++    240,   5,   0,   0,   5,   0, 
++      0,   0,  52,   0,   0,   0, 
++    164,   2,   0,   0, 180,   2, 
++      0,   0, 196,   2,   0,   0, 
++     84,   5,   0,   0,  82,  68, 
++     69,  70, 104,   2,   0,   0, 
++      1,   0,   0,   0,   8,   1, 
++      0,   0,   4,   0,   0,   0, 
++     60,   0,   0,   0,   1,   5, 
++     83,  67,   0, 133,   0,   0, 
++     64,   2,   0,   0,  19,  19, 
++     68,  37,  60,   0,   0,   0, 
++     24,   0,   0,   0,  40,   0, 
++      0,   0,  40,   0,   0,   0, 
++     36,   0,   0,   0,  12,   0, 
++      0,   0,   0,   0,   0,   0, 
++    220,   0,   0,   0,   2,   0, 
++      0,   0,   5,   0,   0,   0, 
++      4,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++      1,   0,   0,   0,  12,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0, 234,   0, 
++      0,   0,   2,   0,   0,   0, 
++      5,   0,   0,   0,   4,   0, 
++      0,   0, 255, 255, 255, 255, 
++      1,   0,   0,   0,   1,   0, 
++      0,   0,  12,   0,   0,   0, 
++      0,   0,   0,   0,   1,   0, 
++      0,   0, 243,   0,   0,   0, 
++      4,   0,   0,   0,   5,   0, 
++      0,   0,   4,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0,   1,   0,   0,   0, 
++     12,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++    251,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      1,   0,   0,   0,   1,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0, 114, 101, 
++     99, 111, 110, 115, 116, 114, 
++    117,  99, 116, 101, 100,   0, 
++    111, 114, 105, 103, 105, 110, 
++     97, 108,   0, 101, 110,  99, 
++    111, 100, 101, 100,   0,  67, 
++    111, 110, 115, 116,  97, 110, 
++    116, 115,   0, 171, 171, 171, 
++    251,   0,   0,   0,   3,   0, 
++      0,   0,  32,   1,   0,   0, 
++     16,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++    152,   1,   0,   0,   0,   0, 
++      0,   0,   8,   0,   0,   0, 
++      2,   0,   0,   0, 168,   1, 
++      0,   0,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0, 204,   1, 
++      0,   0,   8,   0,   0,   0, 
++      4,   0,   0,   0,   2,   0, 
++      0,   0, 232,   1,   0,   0, 
++      0,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0,  12,   2,   0,   0, 
++     12,   0,   0,   0,   4,   0, 
++      0,   0,   0,   0,   0,   0, 
++     28,   2,   0,   0,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++    101, 120, 116, 101, 110, 116, 
++      0, 117, 105, 110, 116,  50, 
++      0, 171, 171, 171,   1,   0, 
++     19,   0,   1,   0,   2,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++    159,   1,   0,   0, 105, 110, 
++    118, 101, 114, 115, 101,  95, 
++     99, 111, 108, 111, 114,  95, 
++    115,  99,  97, 108, 101,   0, 
++    102, 108, 111,  97, 116,   0, 
++    171, 171,   0,   0,   3,   0, 
++      1,   0,   1,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0, 224,   1, 
++      0,   0, 117, 110, 117, 115, 
++    101, 100,   0, 100, 119, 111, 
++    114, 100,   0, 171, 171, 171, 
++      0,   0,  19,   0,   1,   0, 
++      1,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  19,   2,   0,   0, 
++     77, 105,  99, 114, 111, 115, 
++    111, 102, 116,  32,  40,  82, 
++     41,  32,  72,  76,  83,  76, 
++     32,  83, 104,  97, 100, 101, 
++    114,  32,  67, 111, 109, 112, 
++    105, 108, 101, 114,  32,  49, 
++     48,  46,  49,   0,  73,  83, 
++     71,  78,   8,   0,   0,   0, 
++      0,   0,   0,   0,   8,   0, 
++      0,   0,  79,  83,  71,  78, 
++      8,   0,   0,   0,   0,   0, 
++      0,   0,   8,   0,   0,   0, 
++     83,  72,  69,  88, 136,   2, 
++      0,   0,  81,   0,   5,   0, 
++    162,   0,   0,   0, 106,   8, 
++      0,   1,  89,   0,   0,   7, 
++     70, 142,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   1,   0, 
++      0,   0,   0,   0,   0,   0, 
++     88,  24,   0,   7,  70, 126, 
++     48,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  85,  85,   0,   0, 
++      0,   0,   0,   0,  88,  24, 
++      0,   7,  70, 126,  48,   0, 
++      1,   0,   0,   0,   1,   0, 
++      0,   0,   1,   0,   0,   0, 
++     85,  85,   0,   0,   0,   0, 
++      0,   0, 156,  24,   0,   7, 
++     70, 238,  49,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  85,  85, 
++      0,   0,   0,   0,   0,   0, 
++     95,   0,   0,   2,  50,   0, 
++      2,   0, 104,   0,   0,   2, 
++      3,   0,   0,   0, 155,   0, 
++      0,   4,   8,   0,   0,   0, 
++      8,   0,   0,   0,   1,   0, 
++      0,   0,  80,   0,   0,   8, 
++     50,   0,  16,   0,   0,   0, 
++      0,   0,  70,   0,   2,   0, 
++     70, 128,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  60,   0, 
++      0,   7,  18,   0,  16,   0, 
++      0,   0,   0,   0,  26,   0, 
++     16,   0,   0,   0,   0,   0, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,  31,   0,   4,   3, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,  62,   0,   0,   1, 
++     21,   0,   0,   1,  54,   0, 
++      0,   4,  50,   0,  16,   0, 
++      0,   0,   0,   0,  70,   0, 
++      2,   0,  54,   0,   0,   8, 
++    194,   0,  16,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  45,   0, 
++      0,   8, 242,   0,  16,   0, 
++      1,   0,   0,   0,  70,  15, 
++     16,   0,   0,   0,   0,   0, 
++     70, 126,  32,   0,   1,   0, 
++      0,   0,   1,   0,   0,   0, 
++     45,   0,   0,   8, 114,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,  14,  16,   0,   0,   0, 
++      0,   0,  70, 126,  32,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   1,   0,   0,  10, 
++    114,   0,  16,   0,   2,   0, 
++      0,   0,  70,   2,  16,   0, 
++      0,   0,   0,   0,   2,  64, 
++      0,   0,   0,   0, 128, 127, 
++      0,   0, 128, 127,   0,   0, 
++    128, 127,   0,   0,   0,   0, 
++     39,   0,   0,  10, 114,   0, 
++     16,   0,   2,   0,   0,   0, 
++     70,   2,  16,   0,   2,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0, 128, 127,   0,   0, 
++    128, 127,   0,   0, 128, 127, 
++      0,   0,   0,   0,   1,   0, 
++      0,   7, 130,   0,  16,   0, 
++      0,   0,   0,   0,  26,   0, 
++     16,   0,   2,   0,   0,   0, 
++     10,   0,  16,   0,   2,   0, 
++      0,   0,   1,   0,   0,   7, 
++    130,   0,  16,   0,   0,   0, 
++      0,   0,  42,   0,  16,   0, 
++      2,   0,   0,   0,  58,   0, 
++     16,   0,   0,   0,   0,   0, 
++     52,   0,   0,  10, 114,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,   2,  16,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  75,   0, 
++      0,   5, 114,   0,  16,   0, 
++      0,   0,   0,   0,  70,   2, 
++     16,   0,   0,   0,   0,   0, 
++     56,   0,   0,   9, 114,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,   2,  16,   0,   0,   0, 
++      0,   0, 166, 138,  48,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     55,   0,   0,   9, 114,   0, 
++     16,   0,   1,   0,   0,   0, 
++    246,  15,  16,   0,   0,   0, 
++      0,   0,  70,   2,  16,   0, 
++      0,   0,   0,   0,  70,   2, 
++     16,   0,   1,   0,   0,   0, 
++    164,   0,   0,   7, 242, 224, 
++     33,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  70,   5, 
++      2,   0,  70,  14,  16,   0, 
++      1,   0,   0,   0,  62,   0, 
++      0,   1,  83,  84,  65,  84, 
++    148,   0,   0,   0,  19,   0, 
++      0,   0,   3,   0,   0,   0, 
++      0,   0,   0,   0,   1,   0, 
++      0,   0,   3,   0,   0,   0, 
++      1,   0,   0,   0,   5,   0, 
++      0,   0,   2,   0,   0,   0, 
++      1,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   2,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   2,   0,   0,   0, 
++      1,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   1,   0, 
++      0,   0
++};
+diff --git a/src/ui/shaders/ssx_reconstruction_encode.cs.hlsl b/src/ui/shaders/ssx_reconstruction_encode.cs.hlsl
+new file mode 100644
+index 0000000..5d86050
+--- /dev/null
++++ b/src/ui/shaders/ssx_reconstruction_encode.cs.hlsl
+@@ -0,0 +1,15 @@
++// Return reconstructed linear RGB to the representation consumed by SSX's
++// original tone map. Keep the original alpha; DLSS alpha upscaling is disabled.
++cbuffer Constants : register(b0) { uint2 extent; float inverse_color_scale; uint unused; };
++Texture2D<float4> reconstructed : register(t0);
++Texture2D<float4> original : register(t1);
++RWTexture2D<float4> encoded : register(u0);
++[numthreads(8,8,1)]
++void main(uint3 id : SV_DispatchThreadID) {
++  if (any(id.xy >= extent)) return;
++  float4 raw = original.Load(int3(id.xy,0));
++  float3 value = reconstructed.Load(int3(id.xy,0)).rgb;
++  // A failed numerical pixel keeps its guest color, not a purple/NaN result.
++  float3 result = all(isfinite(value)) ? sqrt(max(value,0))*inverse_color_scale : raw.rgb;
++  encoded[id.xy] = float4(result,raw.a);
++}
+diff --git a/tests/unit/graphics/ssx_frame_inputs_test.cpp b/tests/unit/graphics/ssx_frame_inputs_test.cpp
+index 92e60b2..589c6ff 100644
+--- a/tests/unit/graphics/ssx_frame_inputs_test.cpp
++++ b/tests/unit/graphics/ssx_frame_inputs_test.cpp
+@@ -3,6 +3,22 @@
+ 
+ using namespace rex::ui::d3d12;
+ 
++TEST_CASE("SSX frozen scene boundary retains the producer pool slot", "[ssx-inputs]") {
++  SsxFrameInputPool pool;
++  auto producer=pool.Acquire(1,0);
++  auto* original=producer.get();
++  auto frozen=std::make_shared<SsxFrameInputs>(*producer);
++  frozen->producer_owner=producer;
++  producer.reset();
++  std::array<std::shared_ptr<SsxFrameInputs>,5> other;
++  for(auto& item:other) {
++    item=pool.Acquire(2,0); REQUIRE(item); CHECK(item.get()!=original);
++  }
++  CHECK_FALSE(pool.Acquire(3,0));
++  frozen.reset();
++  CHECK(pool.Acquire(3,0).get()==original);
++}
++
+ TEST_CASE("SSX pass selection excludes bloom and unrelated titles", "[ssx-inputs]") {
+   constexpr uint32_t title = 0x4541096D;
+   constexpr uint64_t tone_vs = 0xE857B4AF9617DC29ull, tone_ps = 0xA2CD8E82699B2C0Aull;
+diff --git a/tests/unit/graphics/ssx_motion_test.cpp b/tests/unit/graphics/ssx_motion_test.cpp
+index 606c6ca..288dfd7 100644
+--- a/tests/unit/graphics/ssx_motion_test.cpp
++++ b/tests/unit/graphics/ssx_motion_test.cpp
+@@ -2,8 +2,66 @@
+ #include <catch2/catch_approx.hpp>
+ #include <limits>
+ #include <rex/ui/d3d12/ssx_camera_motion.h>
++#include <rex/ui/d3d12/ssx_reconstruction.h>
+ 
+ using namespace rex::ui::d3d12;
++
++TEST_CASE("SSX DLSS camera decomposition preserves reversed depth and world position", "[ssx-motion]") {
++  SsxFrameMetadata f;
++  f.camera_samples=1; f.camera_viewport_valid=true; f.guest_viewport_z={-1,1};
++  const float a=8000.f/(8000.f-.5f), b=-.5f*a;
++  f.world_to_clip_candidate={1.5f,0,0,0, 0,8.f/3,0,0, 0,0,-a,-1, -75,-1600.f/3,1000*a+b,1000};
++  SsxMotionPlan p; p.usable=true; p.constants.reset=1;
++  Streamline::SRCamera c;
++  REQUIRE(BuildSsxSRCamera(f,p,c));
++  CHECK(c.position[0]==Catch::Approx(50).margin(.001));
++  CHECK(c.position[1]==Catch::Approx(200).margin(.001));
++  CHECK(c.position[2]==Catch::Approx(1000).margin(.001));
++  CHECK(c.near_plane==Catch::Approx(.5).margin(.001));
++  CHECK(c.far_plane==Catch::Approx(8000).margin(40));
++  for (auto [distance,expected] : {std::pair{c.near_plane,1.f},std::pair{c.far_plane,0.f}}) {
++    const auto& m=c.view_to_clip;
++    CHECK((-distance*m[10]+m[14])/distance==Catch::Approx(expected).margin(.00001));
++  }
++  auto bad=f; bad.world_to_clip_candidate[1]+=.2f;
++  CHECK_FALSE(BuildSsxSRCamera(bad,p,c));
++  bad=f; bad.world_to_clip_candidate[3]+=.1f;
++  CHECK_FALSE(BuildSsxSRCamera(bad,p,c));
++  bad=f; bad.guest_viewport_z={1,0};
++  CHECK_FALSE(BuildSsxSRCamera(bad,p,c));
++  bad=f; bad.camera_conflict=true;
++  CHECK_FALSE(BuildSsxSRCamera(bad,p,c));
++}
++
++TEST_CASE("SSX DLSS history transforms both ends of reversed clip space", "[ssx-motion]") {
++  SsxFrameMetadata f;
++  f.guest_frame=1; f.scene_width=1120; f.scene_height=584; f.scale_x=f.scale_y=3;
++  f.camera_samples=1; f.camera_viewport_valid=true; f.captured_mask=3;
++  f.guest_viewport_xy={560,-292,560,292}; f.guest_viewport_z={-1,1};
++  const float a=8000.f/(8000.f-.5f), b=-.5f*a;
++  f.world_to_clip_candidate={1.5f,0,0,0, 0,8.f/3,0,0, 0,0,-a,-1, -75,-1600.f/3,1000*a+b,1000};
++  const auto previous=f.world_to_clip_candidate;
++  SsxMotionHistory h; h.Advance(f,1);
++  f.guest_frame=2;
++  f.world_to_clip_candidate[12]-=.3f;
++  f.world_to_clip_candidate[14]+=a*.25f;
++  f.world_to_clip_candidate[15]+=.25f;
++  const auto plan=h.Advance(f,1.016);
++  REQUIRE(plan.constants.reset==0);
++  Streamline::SRCamera c;
++  REQUIRE(BuildSsxSRCamera(f,plan,c));
++  auto transform=[](const std::array<double,4>& v,const std::array<float,16>& m) {
++    std::array<double,4> out{};
++    for(unsigned i=0;i<4;++i) for(unsigned j=0;j<4;++j) out[i]+=v[j]*m[j*4+i];
++    return out;
++  };
++  const std::array<double,4> point{55,210,800,1};
++  auto current=transform(point,f.world_to_clip_candidate), target=transform(point,previous);
++  current[2]=current[3]-current[2]; target[2]=target[3]-target[2];
++  const auto actual=transform(current,c.clip_to_previous);
++  for(unsigned i=0;i<3;++i)
++    CHECK(actual[i]/actual[3]==Catch::Approx(target[i]/target[3]).margin(.00001));
++}
+ namespace {
+ SsxFrameMetadata Frame(uint64_t id = 1) {
+   SsxFrameMetadata f;

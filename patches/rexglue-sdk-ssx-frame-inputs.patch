@@ -1,0 +1,778 @@
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 1125c21..cb32d8c 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -39,6 +39,7 @@
+ #include <rex/system/kernel_state.h>
+ #include <rex/ui/d3d12/d3d12_descriptor_heap_pool.h>
+ #include <rex/ui/d3d12/d3d12_provider.h>
++#include <rex/ui/d3d12/guest_frame_inputs.h>
+ #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
+ #include <rex/ui/d3d12/d3d12_util.h>
+ #include <rex/ui/renderdoc_api.h>
+@@ -815,6 +816,16 @@ class D3D12CommandProcessor : public CommandProcessor {
+ 
+   // Temporary storage for memexport stream constants used in the draw.
+   std::vector<draw_util::MemExportRange> memexport_ranges_;
++
++  uint32_t ssx_title_id_ = 0;
++  uint64_t ssx_input_attempt_frame_ = 0;
++  uint64_t ssx_last_input_log_frame_ = 0;
++  ui::d3d12::SsxFrameInputPool ssx_input_pool_;
++  std::shared_ptr<ui::d3d12::SsxFrameInputs> ssx_inputs_;
++  void CollectSsxFrameInputs(uint64_t vs, uint64_t ps, const draw_util::ViewportInfo& viewport);
++  bool CopySsxInputTexture(ui::d3d12::SsxInput role, uint32_t fetch, DXGI_FORMAT format,
++                           uint32_t mip = 0);
++  std::shared_ptr<const ui::d3d12::SsxFrameInputs> SealSsxFrameInputs(uint32_t width, uint32_t height);
+ };
+ 
+ }  // namespace rex::graphics::d3d12
+diff --git a/include/rex/graphics/d3d12/texture_cache.h b/include/rex/graphics/d3d12/texture_cache.h
+index 4d845c7..f04107f 100644
+--- a/include/rex/graphics/d3d12/texture_cache.h
++++ b/include/rex/graphics/d3d12/texture_cache.h
+@@ -96,6 +96,19 @@ class D3D12TextureCache final : public TextureCache {
+   // binding the actual drawing pipeline.
+   void RequestTextures(uint32_t used_texture_mask) override;
+ 
++  struct ActiveTextureSnapshotSource {
++    // Borrowed only until the next cache operation, on the command processor
++    // thread. Copy now; AddRef alone does not preserve these texture contents.
++    ID3D12Resource* resource = nullptr;
++    D3D12_RESOURCE_STATES state{};
++    uint32_t guest_width = 0, guest_height = 0;
++    uint32_t guest_address = 0, host_swizzle = 0;
++    uint32_t swizzled_signs = 0;
++    std::array<uint32_t, 6> guest_fetch{};
++    bool scaled = false;
++  };
++  bool GetActiveTextureSnapshotSource(uint32_t fetch_index, ActiveTextureSnapshotSource& out) const;
++
+   // Returns whether texture SRV keys stored externally are still valid for the
+   // current bindings and host shader binding layout. Both keys and
+   // host_shader_bindings must have host_shader_binding_count elements
+@@ -252,6 +265,7 @@ class D3D12TextureCache final : public TextureCache {
+     ~D3D12Texture();
+ 
+     ID3D12Resource* resource() const { return resource_.Get(); }
++    D3D12_RESOURCE_STATES resource_state() const { return resource_state_; }
+ 
+     D3D12_RESOURCE_STATES SetResourceState(D3D12_RESOURCE_STATES new_state) {
+       D3D12_RESOURCE_STATES old_state = resource_state_;
+diff --git a/include/rex/ui/d3d12/d3d12_presenter.h b/include/rex/ui/d3d12/d3d12_presenter.h
+index 83d09f7..fa4b01b 100644
+--- a/include/rex/ui/d3d12/d3d12_presenter.h
++++ b/include/rex/ui/d3d12/d3d12_presenter.h
+@@ -19,6 +19,7 @@
+ #include <rex/ui/d3d12/d3d12_provider.h>
+ #include <rex/ui/d3d12/d3d12_submission_tracker.h>
+ #include <rex/ui/presenter.h>
++#include <rex/ui/d3d12/guest_frame_inputs.h>
+ #include <rex/ui/surface.h>
+ 
+ namespace rex::ui::d3d12 {
+@@ -64,9 +65,12 @@ class D3D12Presenter final : public Presenter {
+     // kGuestOutputInternalState, and the callback must also transition it back
+     // to kGuestOutputInternalState before finishing.
+     ID3D12Resource* resource_uav_capable() const { return resource_.Get(); }
++    void SetFrameInputs(std::shared_ptr<const SsxFrameInputs> inputs) { inputs_ = std::move(inputs); }
++    const std::shared_ptr<const SsxFrameInputs>& frame_inputs() const { return inputs_; }
+ 
+    private:
+     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
++    std::shared_ptr<const SsxFrameInputs> inputs_;
+   };
+ 
+   static std::unique_ptr<D3D12Presenter> Create(HostGpuLossCallback host_gpu_loss_callback,
+@@ -238,6 +242,9 @@ class D3D12Presenter final : public Presenter {
+     // paint usage.
+     std::array<std::pair<UINT64, Microsoft::WRL::ComPtr<ID3D12Resource>>, kGuestOutputMailboxSize>
+         guest_output_resource_paint_refs;
++    // Keep inputs associated with their guest image, including repeat UI paints.
++    std::vector<std::pair<UINT64, std::shared_ptr<const SsxFrameInputs>>> frame_input_paint_refs;
++    uint64_t last_input_frame_logged = 0;
+ 
+     // Current intermediate textures for guest output painting, refreshed when
+     // painting guest output. While not in use, they are in
+@@ -295,6 +302,7 @@ class D3D12Presenter final : public Presenter {
+   // texture, which may be null. The indices are the mailbox indices.
+   std::array<std::pair<UINT64, Microsoft::WRL::ComPtr<ID3D12Resource>>, kGuestOutputMailboxSize>
+       guest_output_resources_;
++  std::array<std::shared_ptr<const SsxFrameInputs>, kGuestOutputMailboxSize> guest_frame_inputs_;
+   // The guest output resources are protected by two submission trackers - the
+   // refresher ones (for writing to them via the guest_output_resources_
+   // references) and the paint one (for presenting it via the
+diff --git a/include/rex/ui/d3d12/guest_frame_inputs.h b/include/rex/ui/d3d12/guest_frame_inputs.h
+new file mode 100644
+index 0000000..be7fe91
+--- /dev/null
++++ b/include/rex/ui/d3d12/guest_frame_inputs.h
+@@ -0,0 +1,120 @@
++// SSX input collection checkpoint. Raw candidates are not DLSS-ready inputs.
++#pragma once
++
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <memory>
++
++#include <rex/ui/d3d12/d3d12_api.h>
++
++namespace rex::ui::d3d12 {
++
++enum class SsxInput : size_t { kEncodedColor, kResolvedDepth, kLogExposure, kCount };
++enum class SsxPass { kNone, kWorldTransform, kToneMap, kDepthReduction };
++
++inline bool IsKnownSsxScene(uint32_t width, uint32_t height) {
++  return (width == 1120 && height == 584) || (width == 1280 && height == 720);
++}
++
++// Guest dimensions, not host allocation dimensions. Excludes the quarter-size
++// tone-map draw which uses the same shaders as the full scene.
++inline SsxPass IdentifySsxPass(uint32_t title, uint64_t vs, uint64_t ps, uint32_t width,
++                               uint32_t height) {
++  if (title != 0x4541096D)
++    return SsxPass::kNone;
++  if (IsKnownSsxScene(width, height)) {
++    if (vs == 0xC44105DD14EFDB33ull)
++      return SsxPass::kWorldTransform;
++    if (vs == 0xE857B4AF9617DC29ull && ps == 0xA2CD8E82699B2C0Aull)
++      return SsxPass::kToneMap;
++  }
++  if (((width == 560 && height == 292) || (width == 640 && height == 360)) &&
++      vs == 0x7365E5786AD4C10Cull && ps == 0x0E6C83314BF3FBA1ull)
++    return SsxPass::kDepthReduction;
++  return SsxPass::kNone;
++}
++
++struct SsxFrameMetadata {
++  uint64_t guest_frame = 0;
++  uint32_t scene_width = 0, scene_height = 0;
++  uint32_t scale_x = 0, scale_y = 0;
++  uint32_t output_width = 0, output_height = 0;
++  uint32_t captured_mask = 0;
++  uint32_t failed_mask = 0;
++  uint32_t duplicate_mask = 0;
++  uint32_t camera_samples = 0;
++  bool camera_conflict = false;
++  bool exposure_branch = false;
++  // Shader C441... first applies c244..247 to the vertex, then c192..195
++  // to that result. Keep both separately; never call their product a camera.
++  std::array<float, 16> world_to_clip_candidate{};
++  std::array<float, 16> first_object_to_world{};
++  std::array<float, 2> guest_viewport_z{};
++  uint32_t guest_depth_info = 0;
++  // Guest PS c0..8 and c255, in register order (not packed host CB indices).
++  std::array<float, 40> tone_map_constants{};
++  uint32_t exposure_source_mip = 0;
++
++  bool Has(SsxInput role) const { return (captured_mask & (1u << size_t(role))) != 0; }
++  bool RawResourcesComplete() const {
++    return captured_mask == 7 && failed_mask == 0 && duplicate_mask == 0;
++  }
++  // Projection/depth convention, jitter, previous camera and dense object motion
++  // are intentionally NOT marked valid by this collection checkpoint.
++};
++
++struct GuestInputTexture {
++  Microsoft::WRL::ComPtr<ID3D12Resource> resource;
++  DXGI_FORMAT view_format = DXGI_FORMAT_UNKNOWN;
++  uint32_t host_swizzle = 0;
++  uint32_t swizzled_signs = 0;
++  // Unmodified fetch words include guest swizzle, sign, exponent adjustment,
++  // mip range and filtering. Copying the storage does not apply these to texels.
++  std::array<uint32_t, 6> guest_fetch{};
++  uint32_t guest_address = 0;
++  uint32_t source_mip = 0;
++  uint32_t width = 0, height = 0;
++  static constexpr D3D12_RESOURCE_STATES kReadState =
++      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++
++  // Only call on a pool slot which is CPU-exclusive and whose copy fence has
++  // completed. The pool caller establishes this lifetime guarantee; Prepare
++  // checks dimensions, format and allocation success, not fences or references.
++  bool Prepare(ID3D12Device* device, DXGI_FORMAT format, uint32_t new_width, uint32_t new_height,
++               bool& newly_created);
++  uint32_t GetCopyRestoreBarriers(ID3D12Resource* source, D3D12_RESOURCE_STATES source_state,
++                                  uint32_t mip, std::array<D3D12_RESOURCE_BARRIER, 3>& out) const;
++};
++
++struct SsxFrameInputs {
++  SsxFrameMetadata metadata;
++  std::array<GuestInputTexture, size_t(SsxInput::kCount)> textures;
++  uint64_t last_copy_submission = 0;
++};
++
++// Bounded memory and no waits on the game thread. Mailbox and paint references
++// keep a slot immutable; its producing GPU submission must also have completed.
++class SsxFrameInputPool {
++ public:
++  static constexpr size_t kSlotCount = 6;
++  std::shared_ptr<SsxFrameInputs> Acquire(uint64_t frame, uint64_t completed_submission) {
++    for (auto& slot : slots_) {
++      if (!slot)
++        slot = std::make_shared<SsxFrameInputs>();
++      if (slot.use_count() != 1 || slot->last_copy_submission > completed_submission)
++        continue;
++      slot->metadata = {};
++      slot->metadata.guest_frame = frame;
++      return slot;
++    }
++    return nullptr;
++  }
++  // Caller drains the producer queue first; consumers retain their own refs.
++  void Clear() { slots_ = {}; }
++
++ private:
++  std::array<std::shared_ptr<SsxFrameInputs>, kSlotCount> slots_;
++};
++
++}  // namespace rex::ui::d3d12
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index 0d8f8af..66351e0 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -75,6 +75,7 @@ if(REXGLUE_USE_D3D12)
+     set(REXGPU_XENOS_D3D12_SOURCES
+         d3d12/graphics_system.cpp
+         d3d12/command_processor.cpp
++        d3d12/ssx_frame_inputs.cpp
+         d3d12/primitive_processor.cpp
+         d3d12/render_target_cache.cpp
+         d3d12/shader.cpp
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index c14df89..7b1e2f9 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -167,6 +167,7 @@ void D3D12CommandProcessor::InvalidateVertexBufferResidencyRange(uint32_t first_
+ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
+                                                     uint32_t title_id, bool blocking) {
+   CommandProcessor::InitializeShaderStorage(cache_root, title_id, blocking);
++  ssx_title_id_ = title_id;
+   pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking);
+ }
+ 
+@@ -1804,6 +1805,10 @@ bool D3D12CommandProcessor::SetupContext() {
+ 
+ void D3D12CommandProcessor::ShutdownContext() {
+   AwaitAllQueueOperationsCompletion();
++  ssx_inputs_.reset();
++  ssx_input_pool_.Clear();
++  ssx_input_attempt_frame_ = 0;
++  ssx_last_input_log_frame_ = 0;
+   // Pair our own Start even if shutdown interrupts a guest frame. Never end a
+   // capture initiated by RenderDoc's UI/hotkey.
+   if (renderdoc_capture_owned_) {
+@@ -2205,10 +2210,11 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
+   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
+ 
++  auto ssx_frame_inputs = SealSsxFrameInputs(guest_output_width, guest_output_height);
+   presenter->RefreshGuestOutput(
+       guest_output_width, guest_output_height, display_width, display_height,
+       [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource, guest_output_width,
+-       guest_output_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
++       guest_output_height, ssx_frame_inputs](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+         const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+         ID3D12Device* device = provider.GetDevice();
+ 
+@@ -2467,7 +2473,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+         // presenter so it can submit its own commands for displaying it to the
+         // queue.
+         SubmitBarriers();
+-        EndSubmission(true);
++        if (!EndSubmission(true)) return false;
++        static_cast<ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(context)
++            .SetFrameInputs(ssx_frame_inputs);
+         return true;
+       });
+ 
+@@ -2702,6 +2710,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+                              used_texture_mask, normalized_depth_control, normalized_color_mask);
+ 
+   // Update constant buffers, descriptors and root parameters.
++  CollectSsxFrameInputs(vertex_shader->ucode_data_hash(),
++                       pixel_shader ? pixel_shader->ucode_data_hash() : 0, viewport_info);
+   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
+     return false;
+   }
+@@ -3769,6 +3779,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+     // host Present instead would mix independent UI and guest frame boundaries.
+     EndRenderDocGuestCapture();
+     frame_open_ = false;
++    ssx_inputs_.reset();
+     // Submission already closed now, so minus 1.
+     closed_frame_submissions_[(frame_current_++) % kQueueFrames] = submission_current_ - 1;
+ 
+diff --git a/src/graphics/d3d12/ssx_frame_inputs.cpp b/src/graphics/d3d12/ssx_frame_inputs.cpp
+new file mode 100644
+index 0000000..db00f84
+--- /dev/null
++++ b/src/graphics/d3d12/ssx_frame_inputs.cpp
+@@ -0,0 +1,207 @@
++#include <rex/graphics/d3d12/command_processor.h>
++
++#include <cmath>
++#include <cstring>
++#include <rex/cvar.h>
++#include <rex/logging.h>
++
++REXCVAR_DEFINE_BOOL(d3d12_ssx_frame_inputs, false, "GPU/D3D12",
++                    "Collect SSX color/depth/exposure and transform candidates (not DLSS-ready)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++namespace rex::graphics::d3d12 {
++using ui::d3d12::GuestInputTexture;
++using ui::d3d12::IdentifySsxPass;
++using ui::d3d12::SsxInput;
++using ui::d3d12::SsxPass;
++
++bool D3D12CommandProcessor::CopySsxInputTexture(SsxInput role, uint32_t fetch, DXGI_FORMAT format,
++                                                uint32_t mip) {
++  auto& metadata = ssx_inputs_->metadata;
++  const auto bit = 1u << size_t(role);
++  if ((metadata.captured_mask | metadata.failed_mask) & bit) {
++    metadata.duplicate_mask |= bit;
++    return false;
++  }
++  metadata.failed_mask |= bit;  // Every early return invalidates this input.
++  D3D12TextureCache::ActiveTextureSnapshotSource source;
++  if (!texture_cache_->GetActiveTextureSnapshotSource(fetch, source))
++    return false;
++  auto desc = source.resource->GetDesc();
++  if (desc.Format != format || mip >= desc.MipLevels)
++    return false;
++  const uint32_t sx = source.scaled ? metadata.scale_x : 1;
++  const uint32_t sy = source.scaled ? metadata.scale_y : 1;
++  const uint32_t width = std::max(1u, uint32_t(desc.Width) >> mip);
++  const uint32_t height = std::max(1u, desc.Height >> mip);
++  if (role == SsxInput::kLogExposure) {
++    // At 3x the last guest mip may be a small grid; don't invent a scalar.
++    if (width > 8 || height > 8)
++      return false;
++  } else if (source.guest_width != metadata.scene_width ||
++             source.guest_height != metadata.scene_height || mip != 0 ||
++             width != metadata.scene_width * sx || height != metadata.scene_height * sy ||
++             sx != metadata.scale_x || sy != metadata.scale_y)
++    return false;
++  auto& snapshot = ssx_inputs_->textures[size_t(role)];
++  bool created;
++  if (!snapshot.Prepare(GetD3D12Provider().GetDevice(), format, width, height, created))
++    return false;
++  if (created) {
++    static constexpr const wchar_t* names[] = {L"SSX encoded scene color snapshot",
++                                               L"SSX resolved depth snapshot",
++                                               L"SSX log exposure snapshot"};
++    snapshot.resource->SetName(names[size_t(role)]);
++  }
++  snapshot.source_mip = mip;
++  snapshot.guest_address = source.guest_address;
++  snapshot.host_swizzle = source.host_swizzle;
++  snapshot.swizzled_signs = source.swizzled_signs;
++  snapshot.guest_fetch = source.guest_fetch;
++  snapshot.view_format = role == SsxInput::kLogExposure ? DXGI_FORMAT_R16_UNORM : format;
++  // Flush RequestTextures' transitions, copy, then restore the exact tracked
++  // source state before the guest draw. Copying doesn't change graphics bindings.
++  PushTransitionBarrier(source.resource, source.state, D3D12_RESOURCE_STATE_COPY_SOURCE);
++  if (!created)
++    PushTransitionBarrier(snapshot.resource.Get(), GuestInputTexture::kReadState,
++                          D3D12_RESOURCE_STATE_COPY_DEST);
++  SubmitBarriers();
++  D3D12_TEXTURE_COPY_LOCATION from{};
++  from.pResource = source.resource;
++  from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++  from.SubresourceIndex = mip;
++  D3D12_TEXTURE_COPY_LOCATION to{};
++  to.pResource = snapshot.resource.Get();
++  to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++  deferred_command_list_.D3DCopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
++  std::array<D3D12_RESOURCE_BARRIER, 3> restore;
++  const auto restore_count =
++      snapshot.GetCopyRestoreBarriers(source.resource, source.state, mip, restore);
++  deferred_command_list_.D3DResourceBarrier(restore_count, restore.data());
++  ssx_inputs_->last_copy_submission = submission_current_;
++  metadata.captured_mask |= bit;
++  metadata.failed_mask &= ~bit;
++  return true;
++}
++
++void D3D12CommandProcessor::CollectSsxFrameInputs(uint64_t vs, uint64_t ps,
++                                                  const draw_util::ViewportInfo& viewport) {
++  if (!REXCVAR_GET(d3d12_ssx_frame_inputs) || ssx_title_id_ != 0x4541096D)
++    return;
++  const auto sx = texture_cache_->draw_resolution_scale_x();
++  const auto sy = texture_cache_->draw_resolution_scale_y();
++  if (!sx || !sy || viewport.xy_offset[0] || viewport.xy_offset[1] || viewport.xy_extent[0] % sx ||
++      viewport.xy_extent[1] % sy)
++    return;
++  const uint32_t width = viewport.xy_extent[0] / sx;
++  const uint32_t height = viewport.xy_extent[1] / sy;
++  const auto pass = IdentifySsxPass(ssx_title_id_, vs, ps, width, height);
++  if (pass == SsxPass::kNone)
++    return;
++  if (ssx_input_attempt_frame_ != frame_current_) {
++    ssx_inputs_.reset();
++    ssx_input_attempt_frame_ = frame_current_;
++    ssx_inputs_ = ssx_input_pool_.Acquire(frame_current_, submission_completed_);
++  }
++  if (!ssx_inputs_)
++    return;  // Bounded pool full: skip collection, not gameplay.
++  auto& metadata = ssx_inputs_->metadata;
++  const auto scene_width = pass == SsxPass::kDepthReduction ? width * 2 : width;
++  const auto scene_height = pass == SsxPass::kDepthReduction ? height * 2 : height;
++  if (metadata.scene_width &&
++      (metadata.scene_width != scene_width || metadata.scene_height != scene_height)) {
++    metadata.failed_mask = 7;
++    return;
++  }
++  metadata.scene_width = scene_width;
++  metadata.scene_height = scene_height;
++  metadata.scale_x = sx;
++  metadata.scale_y = sy;
++  const auto& regs = *register_file_;
++  if (pass == SsxPass::kWorldTransform) {
++    std::array<float, 16> candidate;
++    std::memcpy(candidate.data(), &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 192 * 4],
++                sizeof(candidate));
++    for (float value : candidate)
++      if (!std::isfinite(value))
++        metadata.camera_conflict = true;
++    if (metadata.camera_samples++) {
++      if (metadata.world_to_clip_candidate != candidate)
++        metadata.camera_conflict = true;
++    } else {
++      metadata.world_to_clip_candidate = candidate;
++      std::memcpy(metadata.first_object_to_world.data(),
++                  &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 244 * 4], sizeof(candidate));
++      metadata.guest_viewport_z = {regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE),
++                                   regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET)};
++      metadata.guest_depth_info = regs[XE_GPU_REG_RB_DEPTH_INFO];
++    }
++  } else if (pass == SsxPass::kToneMap) {
++    CopySsxInputTexture(SsxInput::kEncodedColor, 0, DXGI_FORMAT_R16G16B16A16_FLOAT);
++    std::memcpy(metadata.tone_map_constants.data(), &regs[XE_GPU_REG_SHADER_CONSTANT_256_X],
++                9 * 4 * sizeof(float));
++    std::memcpy(metadata.tone_map_constants.data() + 36,
++                &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + 255 * 4], 4 * sizeof(float));
++    metadata.exposure_branch = (regs[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 + 4] & 1) != 0;
++    const float lod = metadata.tone_map_constants[4];
++    if (metadata.exposure_branch && std::isfinite(lod) && lod >= 0 && lod <= 15 &&
++        std::floor(lod) == lod) {
++      metadata.exposure_source_mip = uint32_t(lod);
++      CopySsxInputTexture(SsxInput::kLogExposure, 1, DXGI_FORMAT_R16_TYPELESS, uint32_t(lod));
++    } else
++      metadata.failed_mask |= 1u << size_t(SsxInput::kLogExposure);
++  } else if (pass == SsxPass::kDepthReduction) {
++    CopySsxInputTexture(SsxInput::kResolvedDepth, 0, DXGI_FORMAT_R32_FLOAT);
++  }
++}
++
++std::shared_ptr<const ui::d3d12::SsxFrameInputs> D3D12CommandProcessor::SealSsxFrameInputs(
++    uint32_t width, uint32_t height) {
++  if (!REXCVAR_GET(d3d12_ssx_frame_inputs))
++    return nullptr;
++  bool log = !ssx_last_input_log_frame_ || frame_current_ - ssx_last_input_log_frame_ >= 120;
++  if (log)
++    ssx_last_input_log_frame_ = frame_current_;
++  if (!ssx_inputs_ || ssx_inputs_->metadata.guest_frame != frame_current_) {
++    if (log)
++      REXGPU_INFO("SSX_INPUTS frame={} title={:08X} packet=missing reason={} dlss_ready=false",
++                  frame_current_, ssx_title_id_,
++                  ssx_input_attempt_frame_ == frame_current_ ? "pool_busy" : "no_matching_pass");
++    return nullptr;
++  }
++  auto& data = ssx_inputs_->metadata;
++  data.output_width = width;
++  data.output_height = height;
++  if (log) {
++    REXGPU_INFO(
++        "SSX_INPUTS frame={} scene={}x{} scale={}x{} captured={:X} failed={:X} "
++        "duplicates={:X} camera_samples={} camera_conflict={} exposure_mip={} "
++        "color_encoding=sqrt depth_convention=unverified dlss_ready=false",
++        data.guest_frame, data.scene_width, data.scene_height, data.scale_x, data.scale_y,
++        data.captured_mask, data.failed_mask, data.duplicate_mask, data.camera_samples,
++        data.camera_conflict, data.exposure_source_mip);
++    for (size_t i = 0; i < size_t(SsxInput::kCount); ++i) {
++      if (!data.Has(SsxInput(i)))
++        continue;
++      const auto& texture = ssx_inputs_->textures[i];
++      const auto& f = texture.guest_fetch;
++      REXGPU_INFO(
++          "SSX_INPUT_TEXTURE frame={} role={} size={}x{} mip={} format={} "
++          "address={:08X} swizzle={:X} signs={:X} fetch={:08X},{:08X},{:08X},{:08X},{:08X},{:08X}",
++          data.guest_frame, i, texture.width, texture.height, texture.source_mip,
++          uint32_t(texture.view_format), texture.guest_address, texture.host_swizzle,
++          texture.swizzled_signs, f[0], f[1], f[2], f[3], f[4], f[5]);
++    }
++    if (data.camera_samples) {
++      const auto& m = data.world_to_clip_candidate;
++      REXGPU_INFO(
++          "SSX_INPUT_CAMERA frame={} guest_z_scale={} guest_z_offset={} depth_info={:08X} "
++          "world_to_clip={},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
++          data.guest_frame, data.guest_viewport_z[0], data.guest_viewport_z[1],
++          data.guest_depth_info, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10],
++          m[11], m[12], m[13], m[14], m[15]);
++    }
++  }
++  return ssx_inputs_;
++}
++}  // namespace rex::graphics::d3d12
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index 2e385e4..5e00bc6 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -708,6 +708,36 @@ void D3D12TextureCache::EndFrame() {
+   }
+ }
+ 
++bool D3D12TextureCache::GetActiveTextureSnapshotSource(
++    uint32_t fetch_index, ActiveTextureSnapshotSource& out) const {
++  out = {};
++  if (fetch_index >= 32) return false;
++  const auto* binding = GetValidTextureBinding(fetch_index);
++  if (!binding || !binding->texture || binding->texture_signed ||
++      binding->key.dimension != xenos::DataDimension::k2DOrStacked ||
++      binding->key.GetDepthOrArraySize() != 1) return false;
++  const auto* texture = static_cast<const D3D12Texture*>(binding->texture);
++  const auto desc = texture->resource()->GetDesc();
++  if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
++      desc.SampleDesc.Count != 1 || desc.DepthOrArraySize != 1) return false;
++  out.resource = texture->resource();
++  out.state = texture->resource_state();
++  out.guest_width = binding->key.GetWidth();
++  out.guest_height = binding->key.GetHeight();
++  out.guest_address = binding->key.base_page << 12;
++  out.host_swizzle = binding->host_swizzle;
++  // Floating-point SSX color uses signed fetch components (0x55), even though
++  // signed and unsigned views share storage. Preserve interpretation metadata.
++  out.swizzled_signs = binding->swizzled_signs;
++  const auto fetch = register_file().GetTextureFetch(fetch_index);
++  static_assert(sizeof(fetch) == sizeof(out.guest_fetch));
++  std::memcpy(out.guest_fetch.data(), &fetch, sizeof(fetch));
++  // FindOrCreateTexture selects scaled storage on its copy of the key. The
++  // original guest binding key is not updated (see IsTextureBindingScaled).
++  out.scaled = texture->key().scaled_resolve;
++  return true;
++}
++
+ void D3D12TextureCache::RequestTextures(uint32_t used_texture_mask) {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index 324af7b..101f6d7 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -61,6 +61,7 @@ if(REXGLUE_USE_D3D12)
+         d3d12/d3d12_upload_buffer_pool.cpp
+         d3d12/d3d12_util.cpp
+         d3d12/streamline.cpp
++        d3d12/guest_frame_inputs.cpp
+     )
+ endif()
+ 
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 68dda6d..366ad11 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -538,6 +538,9 @@ bool D3D12Presenter::RefreshGuestOutputImpl(
+   }
+   D3D12GuestOutputRefreshContext context(is_8bpc_out_ref, guest_output_resource_ref.second.Get());
+   bool refresher_succeeded = refresher(context);
++  // The base presenter publishes this mailbox only on success, under its normal
++  // producer/consumer synchronization. Missing inputs explicitly replace old ones.
++  guest_frame_inputs_[mailbox_index] = refresher_succeeded ? context.frame_inputs() : nullptr;
+   // Even if the refresher has returned false, it still might have submitted
+   // some commands referencing the resource. It's better to put an excessive
+   // signal and wait slightly longer, for nothing important, while shutting down
+@@ -596,12 +599,14 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   GuestOutputProperties guest_output_properties;
+   GuestOutputPaintConfig guest_output_paint_config;
+   Microsoft::WRL::ComPtr<ID3D12Resource> guest_output_resource;
++  std::shared_ptr<const SsxFrameInputs> frame_inputs;
+   {
+     uint32_t guest_output_mailbox_index;
+     std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
+         guest_output_mailbox_index, &guest_output_properties, &guest_output_paint_config));
+     if (guest_output_mailbox_index != UINT32_MAX) {
+       guest_output_resource = guest_output_resources_[guest_output_mailbox_index].second;
++      frame_inputs = guest_frame_inputs_[guest_output_mailbox_index];
+     }
+     // Incremented the reference count of the guest output resource - safe to
+     // leave the consumer critical section now as everything here either will be
+@@ -609,6 +614,22 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+     // (and multiple threads can't paint the main target at the same time).
+   }
+ 
++  const auto inputs_completed = paint_context_.paint_submission_tracker.GetCompletedSubmission();
++  std::erase_if(paint_context_.frame_input_paint_refs,
++                [inputs_completed](const auto& ref) { return ref.first <= inputs_completed; });
++  if (frame_inputs) {
++    auto& refs = paint_context_.frame_input_paint_refs;
++    if (!refs.empty() && refs.back().second == frame_inputs) refs.back().first = current_paint_submission;
++    else refs.emplace_back(current_paint_submission, frame_inputs);
++    const auto frame = frame_inputs->metadata.guest_frame;
++    if (frame != paint_context_.last_input_frame_logged) {
++      paint_context_.last_input_frame_logged = frame;
++      if (frame < 5 || frame % 120 == 0)
++        REXGPU_INFO("SSX_INPUTS_PRESENT guest_frame={} captured={:X} dlss_ready=false", frame,
++                    frame_inputs->metadata.captured_mask);
++    }
++  }
++
+   if (guest_output_resource) {
+     GuestOutputPaintFlow guest_output_flow = GetGuestOutputPaintFlow(
+         guest_output_properties, paint_context_.swap_chain_width, paint_context_.swap_chain_height,
+diff --git a/src/ui/d3d12/guest_frame_inputs.cpp b/src/ui/d3d12/guest_frame_inputs.cpp
+new file mode 100644
+index 0000000..f595679
+--- /dev/null
++++ b/src/ui/d3d12/guest_frame_inputs.cpp
+@@ -0,0 +1,65 @@
++#include <rex/ui/d3d12/guest_frame_inputs.h>
++
++namespace rex::ui::d3d12 {
++bool GuestInputTexture::Prepare(ID3D12Device* device, DXGI_FORMAT format, uint32_t new_width,
++                                uint32_t new_height, bool& newly_created) {
++  newly_created = false;
++  if (!device || !new_width || !new_height || new_width > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
++      new_height > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION)
++    return false;
++  if (resource && width == new_width && height == new_height &&
++      resource->GetDesc().Format == format)
++    return true;
++  // These are the three observed SSX input storage formats. Do not silently
++  // reinterpret a different resource as depth/color/exposure.
++  if (format != DXGI_FORMAT_R16G16B16A16_FLOAT && format != DXGI_FORMAT_R32_FLOAT &&
++      format != DXGI_FORMAT_R16_TYPELESS)
++    return false;
++  D3D12_RESOURCE_DESC desc{};
++  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++  desc.Width = new_width;
++  desc.Height = new_height;
++  desc.DepthOrArraySize = 1;
++  desc.MipLevels = 1;
++  desc.Format = format;
++  desc.SampleDesc.Count = 1;
++  D3D12_HEAP_PROPERTIES heap{};
++  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
++  Microsoft::WRL::ComPtr<ID3D12Resource> replacement;
++  if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
++                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
++                                             IID_PPV_ARGS(&replacement))))
++    return false;
++  resource = std::move(replacement);
++  width = new_width;
++  height = new_height;
++  newly_created = true;
++  return true;
++}
++uint32_t GuestInputTexture::GetCopyRestoreBarriers(
++    ID3D12Resource* source, D3D12_RESOURCE_STATES source_state, uint32_t mip,
++    std::array<D3D12_RESOURCE_BARRIER, 3>& out) const {
++  uint32_t count = 0;
++  auto add = [&](ID3D12Resource* texture, D3D12_RESOURCE_STATES before,
++                 D3D12_RESOURCE_STATES after) {
++    if (before == after)
++      return;
++    auto& barrier = out[count++];
++    barrier = {};
++    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    barrier.Transition = {texture, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
++  };
++  auto before = D3D12_RESOURCE_STATE_COPY_SOURCE;
++  if (mip) {
++    // The RTX 5090 probe observed later source writes leaking into a tiny mip
++    // snapshot with only COPY_SOURCE -> SRV restoration. Passing through COMMON
++    // preserves the copy under that same test, including batched barriers. Keep
++    // this path shared with the probe; do not trade correctness for fewer barriers.
++    add(source, before, D3D12_RESOURCE_STATE_COMMON);
++    before = D3D12_RESOURCE_STATE_COMMON;
++  }
++  add(source, before, source_state);
++  add(resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, kReadState);
++  return count;
++}
++}  // namespace rex::ui::d3d12
+diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
+index feccf97..92473da 100644
+--- a/tests/unit/CMakeLists.txt
++++ b/tests/unit/CMakeLists.txt
+@@ -21,6 +21,10 @@ add_executable(unit_tests
+     codegen/output_stamp_test.cpp
+ )
+ 
++if(REXGLUE_USE_D3D12)
++    target_sources(unit_tests PRIVATE graphics/ssx_frame_inputs_test.cpp)
++endif()
++
+ target_sources(unit_tests PRIVATE
+     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/ui.cpp
+     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/progress.cpp
+diff --git a/tests/unit/graphics/ssx_frame_inputs_test.cpp b/tests/unit/graphics/ssx_frame_inputs_test.cpp
+new file mode 100644
+index 0000000..9efeedd
+--- /dev/null
++++ b/tests/unit/graphics/ssx_frame_inputs_test.cpp
+@@ -0,0 +1,62 @@
++#include <catch2/catch_test_macros.hpp>
++#include <rex/ui/d3d12/guest_frame_inputs.h>
++
++using namespace rex::ui::d3d12;
++
++TEST_CASE("SSX pass selection excludes bloom and unrelated titles", "[ssx-inputs]") {
++  constexpr uint32_t title = 0x4541096D;
++  constexpr uint64_t tone_vs = 0xE857B4AF9617DC29ull, tone_ps = 0xA2CD8E82699B2C0Aull;
++  CHECK(IdentifySsxPass(title, tone_vs, tone_ps, 1120, 584) == SsxPass::kToneMap);
++  CHECK(IdentifySsxPass(title, tone_vs, tone_ps, 1280, 720) == SsxPass::kToneMap);
++  CHECK(IdentifySsxPass(title, tone_vs, tone_ps, 280, 146) == SsxPass::kNone);
++  CHECK(IdentifySsxPass(title, tone_vs, tone_ps, 3360, 1752) == SsxPass::kNone);
++  CHECK(IdentifySsxPass(0, tone_vs, tone_ps, 1120, 584) == SsxPass::kNone);
++  CHECK(IdentifySsxPass(title, tone_vs, tone_ps ^ 1, 1120, 584) == SsxPass::kNone);
++  CHECK(IdentifySsxPass(title, 0x7365E5786AD4C10Cull, 0x0E6C83314BF3FBA1ull, 560, 292) ==
++        SsxPass::kDepthReduction);
++  CHECK(IdentifySsxPass(title, 0x7365E5786AD4C10Cull, 0x0E6C83314BF3FBA1ull, 640, 360) ==
++        SsxPass::kDepthReduction);
++  CHECK(IdentifySsxPass(title, 0x7365E5786AD4C10Cull, 0x0E6C83314BF3FBA1ull, 0x80000230, 292) ==
++        SsxPass::kNone);
++  CHECK(IdentifySsxPass(title, 0xC44105DD14EFDB33ull, 0, 1120, 584) == SsxPass::kWorldTransform);
++}
++
++TEST_CASE("SSX pool never overwrites a CPU-held or GPU-pending frame", "[ssx-inputs]") {
++  SsxFrameInputPool pool;
++  std::array<std::shared_ptr<const SsxFrameInputs>, SsxFrameInputPool::kSlotCount> mailbox;
++  for (size_t i = 0; i < mailbox.size(); ++i) {
++    auto frame = pool.Acquire(100 + i, 0);
++    REQUIRE(frame);
++    frame->last_copy_submission = 20 + i;
++    frame->metadata.captured_mask = 7;
++    mailbox[i] = std::move(frame);
++  }
++  CHECK_FALSE(pool.Acquire(200, 100));  // GPU complete, but CPU consumers own every slot.
++  mailbox[0].reset();
++  CHECK_FALSE(pool.Acquire(200, 19));  // CPU released, but producer GPU still writing.
++  auto recycled = pool.Acquire(200, 20);
++  REQUIRE(recycled);
++  CHECK(recycled->metadata.guest_frame == 200);
++  CHECK(recycled->metadata.captured_mask == 0);
++  CHECK_FALSE(recycled->metadata.RawResourcesComplete());
++  CHECK(mailbox[1]->metadata.guest_frame == 101);
++  CHECK(mailbox[1]->metadata.RawResourcesComplete());
++  pool.Clear();
++  CHECK(mailbox[1]->metadata.RawResourcesComplete());  // Shutdown leaves consumers' refs intact.
++}
++
++TEST_CASE("SSX absent failed and ambiguous resources are not complete", "[ssx-inputs]") {
++  SsxFrameMetadata frame;
++  CHECK_FALSE(frame.RawResourcesComplete());
++  frame.captured_mask = 1;
++  CHECK(frame.Has(SsxInput::kEncodedColor));
++  CHECK_FALSE(frame.Has(SsxInput::kResolvedDepth));
++  CHECK_FALSE(frame.RawResourcesComplete());
++  frame.captured_mask = 7;
++  CHECK(frame.RawResourcesComplete());
++  frame.failed_mask = 2;
++  CHECK_FALSE(frame.RawResourcesComplete());
++  frame.failed_mask = 0;
++  frame.duplicate_mask = 4;
++  CHECK_FALSE(frame.RawResourcesComplete());
++}

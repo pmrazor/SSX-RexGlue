@@ -1,0 +1,2137 @@
+diff --git a/include/rex/ui/d3d12/d3d12_presenter.h b/include/rex/ui/d3d12/d3d12_presenter.h
+index 841fcd4..8cae1f5 100644
+--- a/include/rex/ui/d3d12/d3d12_presenter.h
++++ b/include/rex/ui/d3d12/d3d12_presenter.h
+@@ -25,6 +25,7 @@
+ #include <rex/ui/d3d12/ssx_scene_color.h>
+ #include <rex/ui/d3d12/ssx_fg_capture.h>
+ #include <rex/ui/d3d12/ssx_fg_color.h>
++#include <rex/ui/d3d12/ssx_hdr.h>
+ #include <rex/ui/surface.h>
+ 
+ namespace rex::ui::d3d12 {
+@@ -264,6 +265,11 @@ class D3D12Presenter final : public Presenter {
+     SsxSceneColor scene_color;
+     SsxFGCapture fg_capture;
+     SsxFGColor fg_color;
++    SsxHDR hdr;
++    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kSwapChainBufferCount> hdr_sdr_canvas;
++    bool hdr_active = false, hdr_color_space_set = false;
++    uint64_t hdr_last_scene = 0;
++    HMONITOR hdr_monitor = nullptr;
+     uint64_t fg_last_frame = 0, fg_rendered = 0, fg_presented = 0;
+     bool fg_active = false, fg_failed = false;
+     HWND fg_hwnd = nullptr;
+@@ -294,6 +300,7 @@ class D3D12Presenter final : public Presenter {
+ 
+   bool InitializeSurfaceIndependent();
+   void SuspendFrameGeneration();
++  bool UpdateHDRSurface();
+ 
+ #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+   bool EnsureTemporalUpscalerContext(uint32_t render_width, uint32_t render_height,
+diff --git a/include/rex/ui/d3d12/guest_frame_inputs.h b/include/rex/ui/d3d12/guest_frame_inputs.h
+index f415f59..4b083a2 100644
+--- a/include/rex/ui/d3d12/guest_frame_inputs.h
++++ b/include/rex/ui/d3d12/guest_frame_inputs.h
+@@ -122,10 +122,13 @@ struct GuestInputTexture {
+ // that would form a cycle through the reconstruction's frozen producer packet.
+ struct SsxFGTemporal {
+   GuestInputTexture motion;
++  // Optional DLAA output before re-encoding/tone mapping, retained for HDR.
++  GuestInputTexture hdr_color;
+   Streamline::SRCamera camera;
+   std::array<float, 2> jitter_pixels{};
+   uint64_t guest_frame = 0, submission = 0;
+   bool reset = true, depth_inverted = true;
++  bool hdr_valid = false;
+ };
+ 
+ class SsxFGTemporalPool {
+@@ -141,6 +144,7 @@ class SsxFGTemporalPool {
+       slot->camera = {};
+       slot->jitter_pixels = {};
+       slot->reset = true;
++      slot->hdr_valid = false;
+       return slot;
+     }
+     return nullptr;
+diff --git a/include/rex/ui/d3d12/ssx_hdr.h b/include/rex/ui/d3d12/ssx_hdr.h
+new file mode 100644
+index 0000000..c3b9b51
+--- /dev/null
++++ b/include/rex/ui/d3d12/ssx_hdr.h
+@@ -0,0 +1,69 @@
++#pragma once
++#include <rex/ui/d3d12/ssx_scene_color.h>
++#include <array>
++#include <algorithm>
++#include <cmath>
++
++namespace rex::ui::d3d12 {
++// Experimental native-scene preview, not the complete SSX post/HUD pipeline.
++// Nits are absolute display luminance. The user's TV may exceed this PC's EDID
++// peak; never silently cap a requested target to the attached monitor's peak.
++struct SsxHDRSettings {
++  float peak_nits = 1000, paper_white_nits = 200, ui_nits = 200, exposure_ev = 0;
++  float highlight_boost = 1;
++  bool Valid() const {
++    return std::isfinite(peak_nits) && peak_nits >= 400 && peak_nits <= 3000 &&
++           std::isfinite(paper_white_nits) && paper_white_nits >= 80 && paper_white_nits <= 500 &&
++           paper_white_nits < peak_nits && std::isfinite(ui_nits) && ui_nits >= 80 &&
++           ui_nits <= 500 && ui_nits <= peak_nits && std::isfinite(exposure_ev) &&
++           exposure_ev >= -5 && exposure_ev <= 5 && std::isfinite(highlight_boost) &&
++           highlight_boost >= 1 && highlight_boost <= 4;
++  }
++};
++// ST.2084 reference for GPU readback tests and calibration values, 0..10000 nits.
++inline double SsxPQEncode(double nits) {
++  if (nits <= 0)
++    return 0;
++  const double y = std::pow(std::clamp(nits / 10000.0, 0.0, 1.0), 2610.0 / 16384.0);
++  return std::pow((3424.0 / 4096.0 + 2413.0 / 128.0 * y) / (1 + 2392.0 / 128.0 * y), 2523.0 / 32.0);
++}
++inline double SsxPQDecode(double code) {
++  const double p = std::pow(std::clamp(code, 0.0, 1.0), 32.0 / 2523.0);
++  return 10000 *
++         std::pow(std::max(p - 3424.0 / 4096.0, 0.0) / (2413.0 / 128.0 - 2392.0 / 128.0 * p),
++                  16384.0 / 2610.0);
++}
++struct SsxHDRConstants {
++  uint32_t width = 0, height = 0, native_scene = 0, exposure_enabled = 0;
++  float peak_nits = 1000, paper_white_nits = 200, ui_nits = 200, exposure_ev = 0;
++  float exposure_scale = 1, exposure_key = 1, log_scale = 0;
++  uint32_t exposure_linear = 0;
++  uint32_t calibration = 0, hdr_output = 1;
++  float highlight_boost = 1;
++  float shadow_slope = 1;
++};
++static_assert(sizeof(SsxHDRConstants) == 64);
++// Validates exact scene identity/format, exposure fetch and sampler contract.
++bool PlanSsxHDR(const SsxFrameInputs& input, SsxHDRConstants& constants);
++SsxHDRSettings GetSsxHDRSettings();
++
++class SsxHDR {
++ public:
++  SsxHDR();
++  ~SsxHDR();
++  // Creates the output before any command recording. Failure must leave the
++  // caller in its regular SDR path; never present SDR codes in a PQ swap chain.
++  bool Prepare(const D3D12Provider& provider, uint32_t slot, uint32_t width, uint32_t height);
++  // output stays COPY_SOURCE. Inputs are restored to their original states.
++  // overlay is a premultiplied SDR UI layer in native mode, or the complete SDR
++  // image in frontend mode. The caller owns/fences the three slot resources.
++  ID3D12Resource* Record(const D3D12Provider& provider, ID3D12GraphicsCommandList* list,
++                         uint32_t slot, ID3D12Resource* overlay,
++                         const std::shared_ptr<const SsxFrameInputs>& frame,
++                         const SsxHDRConstants& constants);
++
++ private:
++  struct Impl;
++  std::unique_ptr<Impl> impl_;
++};
++}  // namespace rex::ui::d3d12
+diff --git a/include/rex/ui/d3d12/ssx_reconstruction.h b/include/rex/ui/d3d12/ssx_reconstruction.h
+index 1e9a5ac..21f518e 100644
+--- a/include/rex/ui/d3d12/ssx_reconstruction.h
++++ b/include/rex/ui/d3d12/ssx_reconstruction.h
+@@ -31,7 +31,7 @@ class SsxReconstruction {
+   Result Submit(const D3D12Provider& provider, const std::shared_ptr<const SsxFrameInputs>& frame,
+                 ID3D12Resource* destination, D3D12_RESOURCE_STATES destination_state,
+                 double seconds, Streamline::Quality quality = Streamline::Quality::kDLAA,
+-                bool profile = false, bool retain_fg_inputs = false);
++                bool profile = false, bool retain_fg_inputs = false, bool retain_hdr_color = false);
+ 
+  private:
+   struct Impl;
+diff --git a/src/graphics/d3d12/ssx_frame_inputs.cpp b/src/graphics/d3d12/ssx_frame_inputs.cpp
+index 8e68ecb..e94bab9 100644
+--- a/src/graphics/d3d12/ssx_frame_inputs.cpp
++++ b/src/graphics/d3d12/ssx_frame_inputs.cpp
+@@ -20,6 +20,7 @@ REXCVAR_DEFINE_BOOL(d3d12_ssx_jitter, false, "GPU/D3D12",
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ REXCVAR_DECLARE(bool, d3d12_ssx_dlaa);
++REXCVAR_DECLARE(bool, d3d12_ssx_hdr_preview);
+ REXCVAR_DECLARE(bool, d3d12_ssx_quality);
+ REXCVAR_DECLARE(bool, d3d12_gpu_profile);
+ REXCVAR_DEFINE_BOOL(d3d12_ssx_fg_inputs, false, "GPU/D3D12",
+@@ -453,7 +454,8 @@ bool D3D12CommandProcessor::ReconstructSsxScene(uint64_t vs, uint64_t ps,
+   const auto result = ssx_reconstruction_->Submit(
+       GetD3D12Provider(), frozen, source.resource, source.state, seconds,
+       ssx_other_render_target_cache_ ? Streamline::Quality::kQuality : Streamline::Quality::kDLAA,
+-      REXCVAR_GET(d3d12_gpu_profile), REXCVAR_GET(d3d12_ssx_fg_inputs));
++      REXCVAR_GET(d3d12_gpu_profile), REXCVAR_GET(d3d12_ssx_fg_inputs),
++      REXCVAR_GET(d3d12_ssx_hdr_preview));
+   ui::GuestFrameTiming::Get().Add(ui::GuestFrameTiming::Event::kReconstructionEnd, frame_current_,
+                                   0, result.applied);
+   ssx_inputs_->fg_temporal = result.fg_temporal;
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index 7e5c9a2..0643be1 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -73,6 +73,7 @@ if(REXGLUE_USE_D3D12)
+         d3d12/ssx_reconstruction_camera.cpp
+         d3d12/ssx_fg_capture.cpp
+         d3d12/ssx_fg_color.cpp
++        d3d12/ssx_hdr.cpp
+     )
+ endif()
+ 
+diff --git a/src/ui/d3d12/d3d12_immediate_drawer.cpp b/src/ui/d3d12/d3d12_immediate_drawer.cpp
+index ce654c8..424dc94 100644
+--- a/src/ui/d3d12/d3d12_immediate_drawer.cpp
++++ b/src/ui/d3d12/d3d12_immediate_drawer.cpp
+@@ -15,12 +15,14 @@
+ #include <vector>
+ 
+ #include <rex/assert.h>
++#include <rex/cvar.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/ui/d3d12/d3d12_immediate_drawer.h>
+ #include <rex/ui/d3d12/d3d12_presenter.h>
+ #include <rex/ui/d3d12/d3d12_util.h>
+ 
++REXCVAR_DECLARE(bool, d3d12_ssx_hdr_preview);
+ namespace rex::ui::d3d12 {
+ 
+ // Generated with `xb buildshaders`.
+@@ -132,6 +134,8 @@ bool D3D12ImmediateDrawer::Initialize() {
+   pipeline_blend_desc.BlendOp = D3D12_BLEND_OP_ADD;
+   pipeline_blend_desc.SrcBlendAlpha = D3D12_BLEND_ONE;
+   pipeline_blend_desc.DestBlendAlpha = D3D12_BLEND_ONE;
++  if (REXCVAR_GET(d3d12_ssx_hdr_preview))
++    pipeline_blend_desc.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+   pipeline_blend_desc.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+   pipeline_blend_desc.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+   pipeline_desc.SampleMask = UINT_MAX;
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index be9328b..b60e2aa 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -28,6 +28,7 @@
+ #include <rex/ui/d3d12/d3d12_provider.h>
+ #include <rex/ui/d3d12/d3d12_util.h>
+ #include <rex/ui/surface_win.h>
++#include <dxgi1_6.h>
+ 
+ #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+ #include <ffx_api/dx12/ffx_api_dx12.h>
+@@ -62,6 +63,8 @@ REXCVAR_DEFINE_BOOL(d3d12_ssx_native_motion, false, "UI/D3D12",
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ REXCVAR_DECLARE(bool, d3d12_ssx_dlaa);
+ REXCVAR_DECLARE(bool, d3d12_ssx_quality);
++REXCVAR_DECLARE(bool, d3d12_ssx_hdr_preview);
++REXCVAR_DECLARE(bool, ssx_hdr_calibration);
+ 
+ namespace rex::ui::d3d12 {
+ 
+@@ -381,6 +384,48 @@ void D3D12Presenter::SuspendFrameGeneration() {
+   paint_context_.paint_submission_tracker.NextSubmission();
+ }
+ 
++bool D3D12Presenter::UpdateHDRSurface() {
++  auto& pc = paint_context_;
++  if (!REXCVAR_GET(d3d12_ssx_hdr_preview)) return true;
++  Microsoft::WRL::ComPtr<IDXGIOutput> output;
++  Microsoft::WRL::ComPtr<IDXGIOutput6> output6;
++  DXGI_OUTPUT_DESC1 desc{};
++  UINT support = 0;
++  const bool available = SUCCEEDED(pc.swap_chain->GetContainingOutput(&output)) &&
++      SUCCEEDED(output.As(&output6)) && SUCCEEDED(output6->GetDesc1(&desc)) &&
++      desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 &&
++      SUCCEEDED(pc.swap_chain->CheckColorSpaceSupport(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, &support)) &&
++      (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT);
++  if (pc.hdr_color_space_set && available == pc.hdr_active && desc.Monitor == pc.hdr_monitor)
++    return true;
++  pc.AwaitSwapChainUsageCompletion();
++  const auto space = available ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
++  if (FAILED(pc.swap_chain->SetColorSpace1(space))) return false;
++  pc.hdr_active = available;
++  pc.hdr_monitor = desc.Monitor;
++  pc.hdr_color_space_set = true;
++  Microsoft::WRL::ComPtr<IDXGISwapChain4> chain4;
++  HRESULT metadata_result = E_NOINTERFACE;
++  const auto settings = GetSsxHDRSettings();
++  if (SUCCEEDED(pc.swap_chain.As(&chain4))) {
++    if (available) {
++      // Rec.2020/D65 mastering target. MaxFALL is unknown, not an invented average.
++      DXGI_HDR_METADATA_HDR10 metadata{};
++      metadata.RedPrimary[0] = 35400; metadata.RedPrimary[1] = 14600;
++      metadata.GreenPrimary[0] = 8500; metadata.GreenPrimary[1] = 39850;
++      metadata.BluePrimary[0] = 6550; metadata.BluePrimary[1] = 2300;
++      metadata.WhitePoint[0] = 15635; metadata.WhitePoint[1] = 16450;
++      metadata.MaxMasteringLuminance = UINT(settings.peak_nits);
++      metadata.MaxContentLightLevel = UINT16(settings.peak_nits);
++      metadata_result = chain4->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10, sizeof(metadata), &metadata);
++    } else metadata_result = chain4->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_NONE, 0, nullptr);
++  }
++  REXLOG_INFO("SSX_HDR transport={} target_nits={} paper_white={} ui_nits={} reported_peak={} metadata_hr={:08X} mode=native_scene_preview post_hud_complete=false fg=false",
++      available ? "HDR10_PQ_2020" : "SDR_fallback_enable_Windows_HDR",
++      settings.peak_nits, settings.paper_white_nits, settings.ui_nits, desc.MaxLuminance, uint32_t(metadata_result));
++  return true;
++}
++
+ Presenter::SurfacePaintConnectResult
+ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_surface,
+                                                                 uint32_t new_surface_width,
+@@ -391,6 +436,11 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+       std::min(new_surface_width, uint32_t(D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION));
+   uint32_t new_swap_chain_height =
+       std::min(new_surface_height, uint32_t(D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION));
++  const bool hdr_preview = REXCVAR_GET(d3d12_ssx_hdr_preview);
++  if (hdr_preview && !GetSsxHDRSettings().Valid()) {
++    REXLOG_ERROR("SSX_HDR invalid calibration: paper white must be below peak, UI must not exceed peak");
++    return SurfacePaintConnectResult::kFailure;
++  }
+ 
+   // ConnectOrReconnectPaintingToSurfaceFromUIThread may be called only for the
+   // surface of the current swap chain or when the old swap chain has already
+@@ -436,13 +486,13 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+   if (!paint_context_.swap_chain) {
+     // A normal DLAA launch does not need the FG proxy and its extra copy.
+     if (auto* sl = provider_.GetStreamline(); sl && sl->support().fg)
+-      sl->SetFrameGenerationLoaded(REXCVAR_GET(d3d12_ssx_frame_generation));
++      sl->SetFrameGenerationLoaded(REXCVAR_GET(d3d12_ssx_frame_generation) && !hdr_preview);
+     // Create a new swap chain.
+     Surface::TypeIndex surface_type = new_surface.GetType();
+     DXGI_SWAP_CHAIN_DESC1 swap_chain_desc;
+     swap_chain_desc.Width = UINT(new_swap_chain_width);
+     swap_chain_desc.Height = UINT(new_swap_chain_height);
+-    swap_chain_desc.Format = kSwapChainFormat;
++    swap_chain_desc.Format = hdr_preview ? DXGI_FORMAT_R10G10B10A2_UNORM : kSwapChainFormat;
+     swap_chain_desc.Stereo = FALSE;
+     swap_chain_desc.SampleDesc.Count = 1;
+     swap_chain_desc.SampleDesc.Quality = 0;
+@@ -516,6 +566,30 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+ 
+   ID3D12Device* device = provider_.GetDevice();
+ 
++  if (hdr_preview) {
++    // Leave the ordinary guest/UI PSOs in their original SDR format. The HDR
++    // scene bypasses this canvas; the host UI is composited in linear nits.
++    for (uint32_t i = 0; i < PaintContext::kSwapChainBufferCount; ++i) {
++      D3D12_RESOURCE_DESC desc{};
++      desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++      desc.Width = new_swap_chain_width; desc.Height = new_swap_chain_height;
++      desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
++      desc.Format = kSwapChainFormat; desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
++      auto& canvas = paint_context_.hdr_sdr_canvas[i];
++      canvas.Reset();
++      if (FAILED(device->CreateCommittedResource(&util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE,
++            &desc, D3D12_RESOURCE_STATE_PRESENT, nullptr, IID_PPV_ARGS(&canvas))) ||
++          !paint_context_.hdr.Prepare(provider_, i, new_swap_chain_width, new_swap_chain_height)) {
++        paint_context_.DestroySwapChain();
++        return SurfacePaintConnectResult::kFailure;
++      }
++    }
++    if (!UpdateHDRSurface()) {
++      paint_context_.DestroySwapChain();
++      return SurfacePaintConnectResult::kFailure;
++    }
++  }
++
+   // Create the RTV descriptors.
+   D3D12_CPU_DESCRIPTOR_HANDLE rtv_heap_start =
+       paint_context_.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+@@ -524,7 +598,8 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+   rtv_desc.Texture2D.MipSlice = 0;
+   rtv_desc.Texture2D.PlaneSlice = 0;
+   for (uint32_t i = 0; i < PaintContext::kSwapChainBufferCount; ++i) {
+-    ID3D12Resource* swap_chain_buffer = paint_context_.swap_chain_buffers[i].Get();
++    ID3D12Resource* swap_chain_buffer = hdr_preview ? paint_context_.hdr_sdr_canvas[i].Get() :
++                                                    paint_context_.swap_chain_buffers[i].Get();
+     rtv_desc.Format = kSwapChainFormat;
+     device->CreateRenderTargetView(
+         swap_chain_buffer, &rtv_desc,
+@@ -534,7 +609,7 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+   if (REXCVAR_GET(d3d12_log_presenter)) {
+     REXLOG_INFO("SSX_PRESENT surface={}x{} swapchain={}x{} dxgi_format={} allows_tearing={}",
+                 new_surface_width, new_surface_height, paint_context_.swap_chain_width,
+-                paint_context_.swap_chain_height, uint32_t(kSwapChainFormat),
++                paint_context_.swap_chain_height, uint32_t(paint_context_.swap_chain_buffers[0]->GetDesc().Format),
+                 paint_context_.swap_chain_allows_tearing);
+   }
+   is_vsync_implicit_out = false;
+@@ -616,6 +691,9 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
+     swap_chain_buffer_ref.Reset();
+   }
+   swap_chain.Reset();
++  hdr_sdr_canvas = {};
++  hdr_active = hdr_color_space_set = false;
++  hdr_monitor = nullptr;
+   swap_chain_allows_tearing = false;
+   swap_chain_height = 0;
+   swap_chain_width = 0;
+@@ -670,10 +748,45 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   D3D12_CPU_DESCRIPTOR_HANDLE back_buffer_rtv = provider_.OffsetRTVDescriptor(
+       rtv_heap_start, PaintContext::kRTVIndexSwapChainBuffer0 + back_buffer_index);
+   ID3D12Resource* back_buffer = paint_context_.swap_chain_buffers[back_buffer_index].Get();
++  const bool hdr_preview = REXCVAR_GET(d3d12_ssx_hdr_preview);
++  auto* display_buffer = back_buffer;
++  const uint32_t hdr_slot = uint32_t(current_paint_submission % command_allocator_count);
++  SsxHDRConstants hdr_constants;
++  if (hdr_preview) {
++    if ((current_paint_submission % 120 == 1 ||
++         MonitorFromWindow(paint_context_.fg_hwnd, MONITOR_DEFAULTTONEAREST) != paint_context_.hdr_monitor) &&
++        !UpdateHDRSurface()) {
++      command_list->Close();
++      return PaintResult::kNotPresented;
++    }
++    back_buffer = paint_context_.hdr_sdr_canvas[back_buffer_index].Get();
++    const auto settings = GetSsxHDRSettings();
++    hdr_constants.width = paint_context_.swap_chain_width;
++    hdr_constants.height = paint_context_.swap_chain_height;
++    hdr_constants.peak_nits = settings.peak_nits;
++    hdr_constants.paper_white_nits = settings.paper_white_nits;
++    hdr_constants.ui_nits = settings.ui_nits;
++    hdr_constants.exposure_ev = settings.exposure_ev;
++    hdr_constants.highlight_boost = settings.highlight_boost;
++    hdr_constants.hdr_output = paint_context_.hdr_active;
++    hdr_constants.calibration = REXCVAR_GET(ssx_hdr_calibration) && paint_context_.hdr_active;
++    uint64_t render_id = 0;
++    const auto* sl = provider_.GetStreamline();
++    if (paint_context_.hdr_active && frame_inputs && sl && sl->GetFrameRenderId(frame_token, render_id) &&
++        GuestFrameTiming::Get().FrameGenerationScene(render_id))
++      PlanSsxHDR(*frame_inputs, hdr_constants);
++    if (frame_inputs && (frame_inputs->metadata.guest_frame - paint_context_.hdr_last_scene >= 120)) {
++      paint_context_.hdr_last_scene = frame_inputs->metadata.guest_frame;
++      REXGPU_INFO("SSX_HDR_SCENE frame={} native={} retained={} exposure_branch={} calibration={} output_hdr={}",
++          frame_inputs->metadata.guest_frame, hdr_constants.native_scene,
++          frame_inputs->fg_temporal && frame_inputs->fg_temporal->hdr_valid,
++          frame_inputs->metadata.exposure_branch, hdr_constants.calibration, hdr_constants.hdr_output);
++    }
++  }
+   bool back_buffer_acquired = false;
+   bool back_buffer_bound = false;
+   bool back_buffer_clear_needed = true;
+-  const float kBackBufferClearColor[] = {0.0f, 0.0f, 0.0f, 1.0f};
++  const float kBackBufferClearColor[] = {0.0f, 0.0f, 0.0f, hdr_constants.native_scene ? 0.0f : 1.0f};
+ 
+   // Draw the guest output.
+ 
+@@ -730,7 +843,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+     }
+   }
+ 
+-  if (guest_output_resource) {
++  if (guest_output_resource && !hdr_constants.native_scene && !hdr_constants.calibration) {
+     GuestOutputPaintFlow guest_output_flow = GetGuestOutputPaintFlow(
+         guest_output_properties, paint_context_.swap_chain_width, paint_context_.swap_chain_height,
+         D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION, D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION,
+@@ -1260,7 +1373,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+ 
+   std::shared_ptr<SsxFGColorFrame> fg_color;
+   bool fg_tagged = false;
+-  if (auto* sl = provider_.GetStreamline(); sl && REXCVAR_GET(d3d12_ssx_frame_generation)) {
++  if (auto* sl = provider_.GetStreamline(); sl && REXCVAR_GET(d3d12_ssx_frame_generation) && !hdr_preview) {
+     auto& pc = paint_context_;
+     const char* reason = "inputs";
+     const auto temporal = frame_inputs ? frame_inputs->fg_temporal : nullptr;
+@@ -1334,7 +1447,24 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+     }
+   }
+ 
+-  // End drawing to the back buffer.
++  if (hdr_preview) {
++    auto* pq = paint_context_.hdr.Record(provider_, command_list, hdr_slot, back_buffer,
++                                         frame_inputs, hdr_constants);
++    if (!pq) {
++      REXGPU_ERROR("SSX_HDR output rejected; no frame presented");
++      command_list->Close();
++      return PaintResult::kNotPresented;
++    }
++    D3D12_RESOURCE_BARRIER barrier{};
++    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    barrier.Transition = {display_buffer, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
++                           D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST};
++    command_list->ResourceBarrier(1, &barrier);
++    command_list->CopyResource(display_buffer, pq);
++    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
++    command_list->ResourceBarrier(1, &barrier);
++  }
++  // End drawing to the back buffer (the offscreen SDR canvas in HDR mode).
+   D3D12_RESOURCE_BARRIER barrier_rtv_to_present;
+   barrier_rtv_to_present.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+   barrier_rtv_to_present.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+diff --git a/src/ui/d3d12/ssx_hdr.cpp b/src/ui/d3d12/ssx_hdr.cpp
+new file mode 100644
+index 0000000..0357e9e
+--- /dev/null
++++ b/src/ui/d3d12/ssx_hdr.cpp
+@@ -0,0 +1,234 @@
++#include <rex/ui/d3d12/ssx_hdr.h>
++#include <rex/ui/d3d12/d3d12_provider.h>
++#include <rex/ui/d3d12/d3d12_util.h>
++#include <rex/cvar.h>
++
++REXCVAR_DEFINE_BOOL(
++    d3d12_ssx_hdr_preview, false, "UI/HDR",
++    "Experimental HDR10 native-scene preview. Later guest effects/HUD and FG are not integrated.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_INT32(ssx_hdr_peak_nits, 1000, "UI/HDR",
++                     "HDR target peak luminance in nits; up to 3000 for a capable TV.")
++    .range(400, 3000)
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_INT32(ssx_hdr_paper_white_nits, 200, "UI/HDR",
++                     "HDR diffuse white luminance in nits.")
++    .range(80, 500)
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_INT32(ssx_hdr_ui_nits, 200, "UI/HDR",
++                     "HDR preview overlay and frontend white luminance in nits.")
++    .range(80, 500)
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_DOUBLE(ssx_hdr_exposure_ev, 0, "UI/HDR",
++                      "HDR preview exposure compensation in stops, after guest exposure.")
++    .range(-5, 5)
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(ssx_hdr_calibration, false, "UI/HDR",
++                    "Show small HDR peak/paper-white/UI calibration patches.");
++
++REXCVAR_DEFINE_DOUBLE(
++    ssx_hdr_highlight_boost, 1, "UI/HDR",
++    "Strength above paper white, retaining the calibrated peak and diffuse/UI brightness.")
++    .range(1, 4)
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++namespace rex::ui::d3d12 {
++namespace {
++#include "ui/shaders/bytecode/d3d12_5_1/ssx_hdr_cs.h"
++void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* r, D3D12_RESOURCE_STATES before,
++                D3D12_RESOURCE_STATES after) {
++  D3D12_RESOURCE_BARRIER b{};
++  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++  b.Transition = {r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
++  list->ResourceBarrier(1, &b);
++}
++}  // namespace
++SsxHDRSettings GetSsxHDRSettings() {
++  return {float(REXCVAR_GET(ssx_hdr_peak_nits)), float(REXCVAR_GET(ssx_hdr_paper_white_nits)),
++          float(REXCVAR_GET(ssx_hdr_ui_nits)), float(REXCVAR_GET(ssx_hdr_exposure_ev)),
++          float(REXCVAR_GET(ssx_hdr_highlight_boost))};
++}
++bool PlanSsxHDR(const SsxFrameInputs& input, SsxHDRConstants& k) {
++  k.native_scene = 0;
++  SsxColorConstants decode;
++  const auto& retained = input.fg_temporal;
++  if (!retained || !retained->hdr_valid || retained->guest_frame != input.metadata.guest_frame ||
++      !retained->hdr_color.resource ||
++      !IsKnownSsxScene(input.metadata.scene_width, input.metadata.scene_height) ||
++      input.metadata.scale_x != 3 || input.metadata.scale_y != 3 ||
++      !PlanSsxSceneColor(input, decode) || decode.exposure_enabled == 2)
++    return false;
++  const auto desc = retained->hdr_color.resource->GetDesc();
++  if (desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || desc.Width != decode.width ||
++      desc.Height != decode.height || desc.DepthOrArraySize != 1 || desc.MipLevels != 1 ||
++      desc.SampleDesc.Count != 1 || desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
++    return false;
++  if (decode.exposure_enabled) {
++    // The native preview bypasses the guest filmic curve. Preserve its slope
++    // at black, then smoothly join the HDR linear midtones at 0.25 scene units.
++    // f(x)=scale*((a*x*x+b*x+c)/(a*x*x+d*x+e)-offset).
++    const auto& curve = input.metadata.tone_map_constants;
++    const double b = curve[16], c = curve[20], d = curve[12], e = curve[24], scale = curve[32];
++    if (!std::isfinite(b) || !std::isfinite(c) || !std::isfinite(d) || !std::isfinite(e) ||
++        !std::isfinite(scale) || e <= 0 || scale <= 0)
++      return false;
++    const double slope = scale * (b * e - c * d) / (e * e);
++    if (!std::isfinite(slope) || slope <= 0)
++      return false;
++    k.shadow_slope = float(std::min(slope, 1.0));
++    const auto& fetch = input.textures[size_t(SsxInput::kLogExposure)].guest_fetch;
++    const uint32_t mag = (fetch[3] >> 19) & 3, min = (fetch[3] >> 21) & 3;
++    // The tone-map instruction inherits fetch filtering. Support point or
++    // linear clamp only, never silently replace an unknown guest sampler.
++    if (((fetch[0] >> 10) & 7) != 2 || ((fetch[0] >> 13) & 7) != 2 || min != mag || min > 1 ||
++        ((fetch[3] >> 25) & 7))
++      return false;
++    k.exposure_linear = min;
++  } else
++    k.shadow_slope = 1;
++  k.exposure_enabled = decode.exposure_enabled;
++  k.exposure_scale = decode.exposure_scale;
++  k.exposure_key = decode.exposure_key;
++  k.log_scale = decode.log_scale;
++  k.native_scene = 1;
++  return true;
++}
++struct SsxHDR::Impl {
++  using ComResource = Microsoft::WRL::ComPtr<ID3D12Resource>;
++  struct Slot {
++    ComResource output;
++    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;
++  };
++  std::array<Slot, 3> slots;
++  Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
++  Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;
++};
++SsxHDR::SsxHDR() : impl_(std::make_unique<Impl>()) {}
++SsxHDR::~SsxHDR() = default;
++bool SsxHDR::Prepare(const D3D12Provider& provider, uint32_t index, uint32_t width,
++                     uint32_t height) {
++  if (index >= impl_->slots.size() || !width || !height || width > 16384 || height > 16384)
++    return false;
++  auto* device = provider.GetDevice();
++  if (!impl_->pipeline) {
++    D3D12_DESCRIPTOR_RANGE ranges[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3, 0, 0, 0},
++                                       {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 3}};
++    D3D12_ROOT_PARAMETER parameters[2]{};
++    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++    parameters[0].Constants = {0, 0, sizeof(SsxHDRConstants) / 4};
++    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    parameters[1].DescriptorTable = {2, ranges};
++    D3D12_STATIC_SAMPLER_DESC samplers[2]{};
++    for (uint32_t i = 0; i < 2; ++i) {
++      auto& sampler = samplers[i];
++      sampler.ShaderRegister = i;
++      sampler.Filter = i ? D3D12_FILTER_MIN_MAG_MIP_POINT : D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
++      sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++      sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
++      sampler.MaxLOD = D3D12_FLOAT32_MAX;
++    }
++    D3D12_ROOT_SIGNATURE_DESC desc{};
++    desc.NumParameters = 2;
++    desc.pParameters = parameters;
++    desc.NumStaticSamplers = 2;
++    desc.pStaticSamplers = samplers;
++    impl_->root.Attach(util::CreateRootSignature(provider, desc));
++    if (!impl_->root)
++      return false;
++    impl_->pipeline.Attach(
++        util::CreateComputePipeline(device, ssx_hdr_cs, sizeof(ssx_hdr_cs), impl_->root.Get()));
++    if (!impl_->pipeline)
++      return false;
++  }
++  auto& slot = impl_->slots[index];
++  if (!slot.heap) {
++    D3D12_DESCRIPTOR_HEAP_DESC desc{};
++    desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
++    desc.NumDescriptors = 4;
++    desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
++    if (FAILED(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&slot.heap))))
++      return false;
++  }
++  if (slot.output && slot.output->GetDesc().Width == width &&
++      slot.output->GetDesc().Height == height)
++    return true;
++  D3D12_RESOURCE_DESC desc{};
++  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++  desc.Width = width;
++  desc.Height = height;
++  desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
++  desc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
++  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++  Impl::ComResource output;
++  if (FAILED(device->CreateCommittedResource(&util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE,
++                                             &desc, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
++                                             IID_PPV_ARGS(&output))))
++    return false;
++  output->SetName(L"SSX native scene HDR10 preview (post/HUD integration pending)");
++  slot.output = std::move(output);
++  return true;
++}
++ID3D12Resource* SsxHDR::Record(const D3D12Provider& provider, ID3D12GraphicsCommandList* list,
++                               uint32_t index, ID3D12Resource* overlay,
++                               const std::shared_ptr<const SsxFrameInputs>& frame,
++                               const SsxHDRConstants& k) {
++  if (!list || !overlay || index >= impl_->slots.size() || !impl_->pipeline)
++    return nullptr;
++  const SsxHDRSettings settings{k.peak_nits, k.paper_white_nits, k.ui_nits, k.exposure_ev,
++                                k.highlight_boost};
++  if (!settings.Valid())
++    return nullptr;
++  auto& slot = impl_->slots[index];
++  if (!slot.output || k.width != slot.output->GetDesc().Width ||
++      k.height != slot.output->GetDesc().Height || overlay->GetDesc().Width != k.width ||
++      overlay->GetDesc().Height != k.height ||
++      overlay->GetDesc().Format != DXGI_FORMAT_B8G8R8A8_UNORM)
++    return nullptr;
++  ID3D12Resource* scene = nullptr;
++  ID3D12Resource* exposure = nullptr;
++  if (k.native_scene) {
++    SsxHDRConstants checked = k;
++    if (!frame || !PlanSsxHDR(*frame, checked) || checked.exposure_enabled != k.exposure_enabled ||
++        checked.exposure_scale != k.exposure_scale || checked.exposure_key != k.exposure_key ||
++        checked.log_scale != k.log_scale || checked.exposure_linear != k.exposure_linear ||
++        checked.shadow_slope != k.shadow_slope)
++      return nullptr;
++    scene = frame->fg_temporal->hdr_color.resource.Get();
++    if (k.exposure_enabled)
++      exposure = frame->textures[size_t(SsxInput::kLogExposure)].resource.Get();
++  }
++  auto* device = provider.GetDevice();
++  auto handle = slot.heap->GetCPUDescriptorHandleForHeapStart();
++  auto srv = [&](ID3D12Resource* texture, DXGI_FORMAT format) {
++    D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
++    desc.Format = format;
++    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++    desc.Texture2D.MipLevels = 1;
++    device->CreateShaderResourceView(texture, &desc, handle);
++    handle.ptr += provider.GetViewDescriptorSize();
++  };
++  srv(scene, DXGI_FORMAT_R16G16B16A16_FLOAT);
++  srv(exposure, DXGI_FORMAT_R16_UNORM);
++  srv(overlay, DXGI_FORMAT_B8G8R8A8_UNORM);
++  D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
++  uav.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
++  uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
++  device->CreateUnorderedAccessView(slot.output.Get(), nullptr, &uav, handle);
++  Transition(list, overlay, D3D12_RESOURCE_STATE_RENDER_TARGET,
++             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++  Transition(list, slot.output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
++             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++  auto* heap = slot.heap.Get();
++  list->SetDescriptorHeaps(1, &heap);
++  list->SetComputeRootSignature(impl_->root.Get());
++  list->SetPipelineState(impl_->pipeline.Get());
++  list->SetComputeRoot32BitConstants(0, sizeof(k) / 4, &k, 0);
++  list->SetComputeRootDescriptorTable(1, heap->GetGPUDescriptorHandleForHeapStart());
++  list->Dispatch((k.width + 7) / 8, (k.height + 7) / 8, 1);
++  Transition(list, slot.output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++             D3D12_RESOURCE_STATE_COPY_SOURCE);
++  Transition(list, overlay, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++             D3D12_RESOURCE_STATE_RENDER_TARGET);
++  return slot.output.Get();
++}
++}  // namespace rex::ui::d3d12
+diff --git a/src/ui/d3d12/ssx_reconstruction.cpp b/src/ui/d3d12/ssx_reconstruction.cpp
+index f18d57d..98db8b1 100644
+--- a/src/ui/d3d12/ssx_reconstruction.cpp
++++ b/src/ui/d3d12/ssx_reconstruction.cpp
+@@ -147,7 +147,7 @@ SsxReconstruction::~SsxReconstruction() = default;
+ SsxReconstruction::Result SsxReconstruction::Submit(
+     const D3D12Provider& provider, const std::shared_ptr<const SsxFrameInputs>& frame,
+     ID3D12Resource* destination, D3D12_RESOURCE_STATES destination_state, double seconds,
+-    Streamline::Quality quality, bool profile, bool retain_fg_inputs) {
++    Streamline::Quality quality, bool profile, bool retain_fg_inputs, bool retain_hdr_color) {
+   auto& p = *impl_;
+   Result result;
+   if (!frame || !destination) {
+@@ -303,7 +303,7 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+     result.reset = evaluation.history_reset;
+     result.reason = "evaluate";
+     if (evaluation.recorded) {
+-      if (retain_fg_inputs && quality == Streamline::Quality::kDLAA) {
++      if ((retain_fg_inputs || retain_hdr_color) && quality == Streamline::Quality::kDLAA) {
+         fg_temporal = p.fg_temporal_pool.Acquire(f.guest_frame, completed);
+         bool created = false;
+         if (fg_temporal &&
+@@ -328,6 +328,22 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+         } else
+           fg_temporal.reset();
+       }
++      if (retain_hdr_color && fg_temporal) {
++        bool created = false;
++        if (fg_temporal->hdr_color.Prepare(provider.GetDevice(), DXGI_FORMAT_R16G16B16A16_FLOAT,
++                                           p.width, p.height, created)) {
++          auto* retained = fg_temporal->hdr_color.resource.Get();
++          retained->SetName(L"SSX retained native DLAA scene before SDR clipping");
++          if (!created)
++            Transition(list, retained, GuestInputTexture::kReadState, D3D12_RESOURCE_STATE_COPY_DEST);
++          Transition(list, slot.output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
++          list->CopyResource(retained, slot.output.Get());
++          Transition(list, slot.output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++          Transition(list, retained, D3D12_RESOURCE_STATE_COPY_DEST, GuestInputTexture::kReadState);
++          fg_temporal->hdr_color.view_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
++          fg_temporal->hdr_valid = true;
++        }
++      }
+       auto* device = provider.GetDevice();
+       auto handle = slot.heap->GetCPUDescriptorHandleForHeapStart();
+       const auto step =
+diff --git a/src/ui/shaders/bytecode/d3d12_5_1/ssx_hdr_cs.h b/src/ui/shaders/bytecode/d3d12_5_1/ssx_hdr_cs.h
+new file mode 100644
+index 0000000..249174d
+--- /dev/null
++++ b/src/ui/shaders/bytecode/d3d12_5_1/ssx_hdr_cs.h
+@@ -0,0 +1,1230 @@
++#if 0
++//
++// Generated by Microsoft (R) HLSL Shader Compiler 10.1
++//
++//
++// Buffer Definitions:
++//
++// cbuffer Constants
++// {
++//
++//   uint2 output_size;                 // Offset:    0 Size:     8
++//   uint native_scene;                 // Offset:    8 Size:     4
++//   uint exposure_enabled;             // Offset:   12 Size:     4
++//   float peak_nits;                   // Offset:   16 Size:     4
++//   float paper_white_nits;            // Offset:   20 Size:     4
++//   float ui_nits;                     // Offset:   24 Size:     4
++//   float exposure_ev;                 // Offset:   28 Size:     4
++//   float exposure_scale;              // Offset:   32 Size:     4
++//   float exposure_key;                // Offset:   36 Size:     4
++//   float log_scale;                   // Offset:   40 Size:     4
++//   uint exposure_linear;              // Offset:   44 Size:     4
++//   uint calibration;                  // Offset:   48 Size:     4
++//   uint hdr_output;                   // Offset:   52 Size:     4
++//   float highlight_boost;             // Offset:   56 Size:     4
++//   float shadow_slope;                // Offset:   60 Size:     4
++//
++// }
++//
++//
++// Resource Bindings:
++//
++// Name                                 Type  Format         Dim      ID      HLSL Bind  Count
++// ------------------------------ ---------- ------- ----------- ------- -------------- ------
++// linear_clamp                      sampler      NA          NA      S0             s0      1
++// point_clamp                       sampler      NA          NA      S1             s1      1
++// scene                             texture  float4          2d      T0             t0      1
++// log_exposure                      texture   float          2d      T1             t1      1
++// overlay                           texture  float4          2d      T2             t2      1
++// output_pq                             UAV  unorm4          2d      U0             u0      1
++// Constants                         cbuffer      NA          NA     CB0            cb0      1
++//
++//
++//
++// Input signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Input
++//
++// Output signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Output
++cs_5_1
++dcl_globalFlags refactoringAllowed
++dcl_constantbuffer CB0[0:0][4], immediateIndexed, space=0
++dcl_sampler S0[0:0], mode_default, space=0
++dcl_sampler S1[1:1], mode_default, space=0
++dcl_resource_texture2d (float,float,float,float) T0[0:0], space=0
++dcl_resource_texture2d (float,float,float,float) T1[1:1], space=0
++dcl_resource_texture2d (float,float,float,float) T2[2:2], space=0
++dcl_uav_typed_texture2d (unorm,unorm,unorm,unorm) U0[0:0], space=0
++dcl_input vThreadID.xy
++dcl_temps 5
++dcl_thread_group 8, 8, 1
++uge r0.xy, vThreadID.xyxx, CB0[0][0].xyxx
++or r0.x, r0.y, r0.x
++if_nz r0.x
++  ret
++endif
++if_z CB0[0][3].y
++  mov r0.xy, vThreadID.xyxx
++  mov r0.zw, l(0,0,0,0)
++  ld r0.xyz, r0.xyzw, T2[2].xyzw
++  mov r0.w, l(1.000000)
++  store_uav_typed U0[0].xyzw, vThreadID.xyyy, r0.xyzw
++  ret
++endif
++utof r0.xy, vThreadID.xyxx
++add r0.xy, r0.xyxx, l(0.500000, 0.500000, 0.000000, 0.000000)
++utof r0.zw, CB0[0][0].xxxy
++div r0.xy, r0.xyxx, r0.zwzz
++if_nz CB0[0][0].z
++  sample_l r1.xyz, r0.xyxx, T0[0].xyzw, S0[0], l(0.000000)
++  and r2.xyz, r1.xyzx, l(0x7f800000, 0x7f800000, 0x7f800000, 0)
++  ine r2.xyz, r2.xyzx, l(0x7f800000, 0x7f800000, 0x7f800000, 0)
++  and r0.z, r2.y, r2.x
++  and r0.z, r2.z, r0.z
++  max r1.xyz, r1.xyzx, l(0.000000, 0.000000, 0.000000, 0.000000)
++  and r1.xyz, r0.zzzz, r1.xyzx
++  if_nz CB0[0][0].w
++    sample_l r0.z, r0.xyxx, T1[1].yzxw, S0[0], l(0.000000)
++    sample_l r0.w, r0.xyxx, T1[1].yzwx, S1[1], l(0.000000)
++    movc r0.z, CB0[0][2].w, r0.z, r0.w
++    mul r0.z, r0.z, -CB0[0][2].z
++    mul r0.z, r0.z, CB0[0][2].x
++    exp r0.z, r0.z
++    mul r0.z, r0.z, CB0[0][2].y
++  else
++    mov r0.z, l(1.000000)
++  endif
++  exp r0.w, CB0[0][1].w
++  mul r0.z, r0.w, r0.z
++  mul r1.xyz, r0.zzzz, r1.xyzx
++  max r0.z, r1.z, r1.y
++  max r0.z, r0.z, r1.x
++  lt r0.w, r0.z, l(0.250000)
++  if_nz r0.w
++    mul_sat r0.z, r0.z, l(4.000000)
++    add r0.w, -CB0[0][3].w, l(1.000000)
++    add r0.z, -r0.z, l(1.000000)
++    mul r0.z, r0.z, r0.z
++    mad r0.z, -r0.z, r0.w, l(1.000000)
++    mul r1.xyz, r0.zzzz, r1.xyzx
++  endif
++  mul r1.xyz, r1.xyzx, CB0[0][1].yyyy
++  and r2.xyz, r1.xyzx, l(0x7f800000, 0x7f800000, 0x7f800000, 0)
++  ine r2.xyz, r2.xyzx, l(0x7f800000, 0x7f800000, 0x7f800000, 0)
++  and r0.z, r2.y, r2.x
++  and r0.z, r2.z, r0.z
++  and r1.xyz, r1.xyzx, r0.zzzz
++  max r0.z, r1.z, r1.y
++  max r0.z, r0.z, r1.x
++  lt r0.w, CB0[0][1].y, r0.z
++  if_nz r0.w
++    add r0.w, -CB0[0][1].y, CB0[0][1].x
++    add r1.w, r0.z, -CB0[0][1].y
++    div r1.w, r1.w, r0.w
++    add r2.x, CB0[0][3].z, l(-1.000000)
++    mul r2.y, r1.w, r1.w
++    mul r2.x, r2.x, r2.y
++    add r2.y, r1.w, l(1.000000)
++    div r2.x, r2.x, r2.y
++    add r1.w, r1.w, r2.x
++    mul r1.w, r1.w, l(-1.442695)
++    exp r1.w, r1.w
++    add r1.w, -r1.w, l(1.000000)
++    mad r0.w, r0.w, r1.w, CB0[0][1].y
++    div r0.z, r0.w, r0.z
++    mul r1.xyz, r0.zzzz, r1.xyzx
++  endif
++  mov r2.xy, vThreadID.xyxx
++  mov r2.zw, l(0,0,0,0)
++  ld r2.xyzw, r2.xyzw, T2[2].xyzw
++  max r0.z, r2.w, l(0.000001)
++  div_sat r2.xyz, r2.xyzx, r0.zzzz
++  ge r3.xyz, l(0.040450, 0.040450, 0.040450, 0.000000), r2.xyzx
++  mul r4.xyz, r2.xyzx, l(0.077399, 0.077399, 0.077399, 0.000000)
++  add r2.xyz, r2.xyzx, l(0.055000, 0.055000, 0.055000, 0.000000)
++  mul r2.xyz, r2.xyzx, l(0.947867, 0.947867, 0.947867, 0.000000)
++  log r2.xyz, r2.xyzx
++  mul r2.xyz, r2.xyzx, l(2.400000, 2.400000, 2.400000, 0.000000)
++  exp r2.xyz, r2.xyzx
++  movc r2.xyz, r3.xyzx, r4.xyzx, r2.xyzx
++  add r0.z, -r2.w, l(1.000000)
++  mul r2.xyz, r2.xyzx, CB0[0][1].zzzz
++  mul r2.xyz, r2.wwww, r2.xyzx
++  mad r1.xyz, r1.xyzx, r0.zzzz, r2.xyzx
++else
++  mov r2.xy, vThreadID.xyxx
++  mov r2.zw, l(0,0,0,0)
++  ld r2.xyz, r2.xyzw, T2[2].xyzw
++  mov_sat r2.xyz, r2.xyzx
++  ge r3.xyz, l(0.040450, 0.040450, 0.040450, 0.000000), r2.xyzx
++  mul r4.xyz, r2.xyzx, l(0.077399, 0.077399, 0.077399, 0.000000)
++  add r2.xyz, r2.xyzx, l(0.055000, 0.055000, 0.055000, 0.000000)
++  mul r2.xyz, r2.xyzx, l(0.947867, 0.947867, 0.947867, 0.000000)
++  log r2.xyz, r2.xyzx
++  mul r2.xyz, r2.xyzx, l(2.400000, 2.400000, 2.400000, 0.000000)
++  exp r2.xyz, r2.xyzx
++  movc r2.xyz, r3.xyzx, r4.xyzx, r2.xyzx
++  mul r1.xyz, r2.xyzx, CB0[0][1].zzzz
++endif
++if_nz CB0[0][3].x
++  add r2.xyzw, r0.xyxy, l(-0.500000, -0.350000, -0.500000, -0.500000)
++  lt r2.xyzw, |r2.xyzw|, l(0.100000, 0.050000, 0.100000, 0.025000)
++  and r0.zw, r2.yyyw, r2.xxxz
++  if_nz r0.z
++    lt r0.z, r0.x, l(0.500000)
++    movc r0.z, r0.z, l(0.900000), l(1.000000)
++    mul r1.xyz, r0.zzzz, CB0[0][1].xxxx
++  else
++    mov r1.xyz, l(0,0,0,0)
++  endif
++  if_nz r0.w
++    mov r1.xyz, CB0[0][1].yyyy
++  endif
++  add r0.xy, r0.xyxx, l(-0.500000, -0.600000, 0.000000, 0.000000)
++  lt r0.xy, |r0.xyxx|, l(0.100000, 0.025000, 0.000000, 0.000000)
++  and r0.x, r0.y, r0.x
++  if_nz r0.x
++    mov r1.xyz, CB0[0][1].zzzz
++  endif
++endif
++dp3 r0.x, l(0.627404, 0.329283, 0.043313, 0.000000), r1.xyzx
++dp3 r0.y, l(0.069097, 0.919540, 0.011362, 0.000000), r1.xyzx
++dp3 r0.z, l(0.016391, 0.088013, 0.895595, 0.000000), r1.xyzx
++mul_sat r1.xyz, r0.xyzx, l(0.000100, 0.000100, 0.000100, 0.000000)
++log r1.xyz, r1.xyzx
++mul r1.xyz, r1.xyzx, l(0.159302, 0.159302, 0.159302, 0.000000)
++exp r1.xyz, r1.xyzx
++mad r2.xyz, r1.xyzx, l(18.851562, 18.851562, 18.851562, 0.000000), l(0.835938, 0.835938, 0.835938, 0.000000)
++mad r1.xyz, r1.xyzx, l(18.687500, 18.687500, 18.687500, 0.000000), l(1.000000, 1.000000, 1.000000, 0.000000)
++div r1.xyz, r2.xyzx, r1.xyzx
++log r1.xyz, r1.xyzx
++mul r1.xyz, r1.xyzx, l(78.843750, 78.843750, 78.843750, 0.000000)
++exp r1.xyz, r1.xyzx
++ge r0.xyz, l(0.000000, 0.000000, 0.000000, 0.000000), r0.xyzx
++movc r0.xyz, r0.xyzx, l(0,0,0,0), r1.xyzx
++mov r0.w, l(1.000000)
++store_uav_typed U0[0].xyzw, vThreadID.xyyy, r0.xyzw
++ret
++// Approximately 147 instruction slots used
++#endif
++
++const BYTE ssx_hdr_cs[] =
++{
++     68,  88,  66,  67, 164,   0,
++     26, 228,  88,  65, 249, 169,
++     31, 224, 215,  79,  38, 149,
++    216, 222,   1,   0,   0,   0,
++    176,  23,   0,   0,   5,   0,
++      0,   0,  52,   0,   0,   0,
++    184,   5,   0,   0, 200,   5,
++      0,   0, 216,   5,   0,   0,
++     20,  23,   0,   0,  82,  68,
++     69,  70, 124,   5,   0,   0,
++      1,   0,   0,   0, 156,   1,
++      0,   0,   7,   0,   0,   0,
++     60,   0,   0,   0,   1,   5,
++     83,  67,   0, 133,   4,   0,
++     83,   5,   0,   0,  19,  19,
++     68,  37,  60,   0,   0,   0,
++     24,   0,   0,   0,  40,   0,
++      0,   0,  40,   0,   0,   0,
++     36,   0,   0,   0,  12,   0,
++      0,   0,   0,   0,   0,   0,
++     84,   1,   0,   0,   3,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  97,   1,
++      0,   0,   3,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,   1,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
++      0,   0, 109,   1,   0,   0,
++      2,   0,   0,   0,   5,   0,
++      0,   0,   4,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0,   1,   0,   0,   0,
++     12,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++    115,   1,   0,   0,   2,   0,
++      0,   0,   5,   0,   0,   0,
++      4,   0,   0,   0, 255, 255,
++    255, 255,   1,   0,   0,   0,
++      1,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0, 128,   1,
++      0,   0,   2,   0,   0,   0,
++      5,   0,   0,   0,   4,   0,
++      0,   0, 255, 255, 255, 255,
++      2,   0,   0,   0,   1,   0,
++      0,   0,  12,   0,   0,   0,
++      0,   0,   0,   0,   2,   0,
++      0,   0, 136,   1,   0,   0,
++      4,   0,   0,   0,   1,   0,
++      0,   0,   4,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0,   1,   0,   0,   0,
++     12,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++    146,   1,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,   1,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0, 108, 105,
++    110, 101,  97, 114,  95,  99,
++    108,  97, 109, 112,   0, 112,
++    111, 105, 110, 116,  95,  99,
++    108,  97, 109, 112,   0, 115,
++     99, 101, 110, 101,   0, 108,
++    111, 103,  95, 101, 120, 112,
++    111, 115, 117, 114, 101,   0,
++    111, 118, 101, 114, 108,  97,
++    121,   0, 111, 117, 116, 112,
++    117, 116,  95, 112, 113,   0,
++     67, 111, 110, 115, 116,  97,
++    110, 116, 115,   0, 146,   1,
++      0,   0,  15,   0,   0,   0,
++    180,   1,   0,   0,  64,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  12,   4,
++      0,   0,   0,   0,   0,   0,
++      8,   0,   0,   0,   2,   0,
++      0,   0,  32,   4,   0,   0,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0,  68,   4,   0,   0,
++      8,   0,   0,   0,   4,   0,
++      0,   0,   2,   0,   0,   0,
++     88,   4,   0,   0,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++    124,   4,   0,   0,  12,   0,
++      0,   0,   4,   0,   0,   0,
++      2,   0,   0,   0,  88,   4,
++      0,   0,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0, 141,   4,
++      0,   0,  16,   0,   0,   0,
++      4,   0,   0,   0,   2,   0,
++      0,   0, 160,   4,   0,   0,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0, 196,   4,   0,   0,
++     20,   0,   0,   0,   4,   0,
++      0,   0,   2,   0,   0,   0,
++    160,   4,   0,   0,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++    213,   4,   0,   0,  24,   0,
++      0,   0,   4,   0,   0,   0,
++      2,   0,   0,   0, 160,   4,
++      0,   0,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0, 221,   4,
++      0,   0,  28,   0,   0,   0,
++      4,   0,   0,   0,   2,   0,
++      0,   0, 160,   4,   0,   0,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0, 233,   4,   0,   0,
++     32,   0,   0,   0,   4,   0,
++      0,   0,   2,   0,   0,   0,
++    160,   4,   0,   0,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++    248,   4,   0,   0,  36,   0,
++      0,   0,   4,   0,   0,   0,
++      2,   0,   0,   0, 160,   4,
++      0,   0,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0,   5,   5,
++      0,   0,  40,   0,   0,   0,
++      4,   0,   0,   0,   2,   0,
++      0,   0, 160,   4,   0,   0,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0,  15,   5,   0,   0,
++     44,   0,   0,   0,   4,   0,
++      0,   0,   2,   0,   0,   0,
++     88,   4,   0,   0,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++     31,   5,   0,   0,  48,   0,
++      0,   0,   4,   0,   0,   0,
++      2,   0,   0,   0,  88,   4,
++      0,   0,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0,  43,   5,
++      0,   0,  52,   0,   0,   0,
++      4,   0,   0,   0,   2,   0,
++      0,   0,  88,   4,   0,   0,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0,  54,   5,   0,   0,
++     56,   0,   0,   0,   4,   0,
++      0,   0,   2,   0,   0,   0,
++    160,   4,   0,   0,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0, 255, 255,
++    255, 255,   0,   0,   0,   0,
++     70,   5,   0,   0,  60,   0,
++      0,   0,   4,   0,   0,   0,
++      2,   0,   0,   0, 160,   4,
++      0,   0,   0,   0,   0,   0,
++    255, 255, 255, 255,   0,   0,
++      0,   0, 255, 255, 255, 255,
++      0,   0,   0,   0, 111, 117,
++    116, 112, 117, 116,  95, 115,
++    105, 122, 101,   0, 117, 105,
++    110, 116,  50,   0, 171, 171,
++      1,   0,  19,   0,   1,   0,
++      2,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  24,   4,   0,   0,
++    110,  97, 116, 105, 118, 101,
++     95, 115,  99, 101, 110, 101,
++      0, 100, 119, 111, 114, 100,
++      0, 171,   0,   0,  19,   0,
++      1,   0,   1,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  81,   4,
++      0,   0, 101, 120, 112, 111,
++    115, 117, 114, 101,  95, 101,
++    110,  97,  98, 108, 101, 100,
++      0, 112, 101,  97, 107,  95,
++    110, 105, 116, 115,   0, 102,
++    108, 111,  97, 116,   0, 171,
++    171, 171,   0,   0,   3,   0,
++      1,   0,   1,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0, 151,   4,
++      0,   0, 112,  97, 112, 101,
++    114,  95, 119, 104, 105, 116,
++    101,  95, 110, 105, 116, 115,
++      0, 117, 105,  95, 110, 105,
++    116, 115,   0, 101, 120, 112,
++    111, 115, 117, 114, 101,  95,
++    101, 118,   0, 101, 120, 112,
++    111, 115, 117, 114, 101,  95,
++    115,  99,  97, 108, 101,   0,
++    101, 120, 112, 111, 115, 117,
++    114, 101,  95, 107, 101, 121,
++      0, 108, 111, 103,  95, 115,
++     99,  97, 108, 101,   0, 101,
++    120, 112, 111, 115, 117, 114,
++    101,  95, 108, 105, 110, 101,
++     97, 114,   0,  99,  97, 108,
++    105,  98, 114,  97, 116, 105,
++    111, 110,   0, 104, 100, 114,
++     95, 111, 117, 116, 112, 117,
++    116,   0, 104, 105, 103, 104,
++    108, 105, 103, 104, 116,  95,
++     98, 111, 111, 115, 116,   0,
++    115, 104,  97, 100, 111, 119,
++     95, 115, 108, 111, 112, 101,
++      0,  77, 105,  99, 114, 111,
++    115, 111, 102, 116,  32,  40,
++     82,  41,  32,  72,  76,  83,
++     76,  32,  83, 104,  97, 100,
++    101, 114,  32,  67, 111, 109,
++    112, 105, 108, 101, 114,  32,
++     49,  48,  46,  49,   0, 171,
++     73,  83,  71,  78,   8,   0,
++      0,   0,   0,   0,   0,   0,
++      8,   0,   0,   0,  79,  83,
++     71,  78,   8,   0,   0,   0,
++      0,   0,   0,   0,   8,   0,
++      0,   0,  83,  72,  69,  88,
++     52,  17,   0,   0,  81,   0,
++      5,   0,  77,   4,   0,   0,
++    106,   8,   0,   1,  89,   0,
++      0,   7,  70, 142,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      4,   0,   0,   0,   0,   0,
++      0,   0,  90,   0,   0,   6,
++     70, 110,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  90,   0,   0,   6,
++     70, 110,  48,   0,   1,   0,
++      0,   0,   1,   0,   0,   0,
++      1,   0,   0,   0,   0,   0,
++      0,   0,  88,  24,   0,   7,
++     70, 126,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  85,  85,
++      0,   0,   0,   0,   0,   0,
++     88,  24,   0,   7,  70, 126,
++     48,   0,   1,   0,   0,   0,
++      1,   0,   0,   0,   1,   0,
++      0,   0,  85,  85,   0,   0,
++      0,   0,   0,   0,  88,  24,
++      0,   7,  70, 126,  48,   0,
++      2,   0,   0,   0,   2,   0,
++      0,   0,   2,   0,   0,   0,
++     85,  85,   0,   0,   0,   0,
++      0,   0, 156,  24,   0,   7,
++     70, 238,  49,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  17,  17,
++      0,   0,   0,   0,   0,   0,
++     95,   0,   0,   2,  50,   0,
++      2,   0, 104,   0,   0,   2,
++      5,   0,   0,   0, 155,   0,
++      0,   4,   8,   0,   0,   0,
++      8,   0,   0,   0,   1,   0,
++      0,   0,  80,   0,   0,   8,
++     50,   0,  16,   0,   0,   0,
++      0,   0,  70,   0,   2,   0,
++     70, 128,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  60,   0,
++      0,   7,  18,   0,  16,   0,
++      0,   0,   0,   0,  26,   0,
++     16,   0,   0,   0,   0,   0,
++     10,   0,  16,   0,   0,   0,
++      0,   0,  31,   0,   4,   3,
++     10,   0,  16,   0,   0,   0,
++      0,   0,  62,   0,   0,   1,
++     21,   0,   0,   1,  31,   0,
++      0,   5,  26, 128,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   3,   0,   0,   0,
++     54,   0,   0,   4,  50,   0,
++     16,   0,   0,   0,   0,   0,
++     70,   0,   2,   0,  54,   0,
++      0,   8, 194,   0,  16,   0,
++      0,   0,   0,   0,   2,  64,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     45,   0,   0,   8, 114,   0,
++     16,   0,   0,   0,   0,   0,
++     70,  14,  16,   0,   0,   0,
++      0,   0,  70, 126,  32,   0,
++      2,   0,   0,   0,   2,   0,
++      0,   0,  54,   0,   0,   5,
++    130,   0,  16,   0,   0,   0,
++      0,   0,   1,  64,   0,   0,
++      0,   0, 128,  63, 164,   0,
++      0,   7, 242, 224,  33,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  70,   5,   2,   0,
++     70,  14,  16,   0,   0,   0,
++      0,   0,  62,   0,   0,   1,
++     21,   0,   0,   1,  86,   0,
++      0,   4,  50,   0,  16,   0,
++      0,   0,   0,   0,  70,   0,
++      2,   0,   0,   0,   0,  10,
++     50,   0,  16,   0,   0,   0,
++      0,   0,  70,   0,  16,   0,
++      0,   0,   0,   0,   2,  64,
++      0,   0,   0,   0,   0,  63,
++      0,   0,   0,  63,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     86,   0,   0,   7, 194,   0,
++     16,   0,   0,   0,   0,   0,
++      6, 132,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  14,   0,
++      0,   7,  50,   0,  16,   0,
++      0,   0,   0,   0,  70,   0,
++     16,   0,   0,   0,   0,   0,
++    230,  10,  16,   0,   0,   0,
++      0,   0,  31,   0,   4,   5,
++     42, 128,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  72,   0,
++      0,  13, 114,   0,  16,   0,
++      1,   0,   0,   0,  70,   0,
++     16,   0,   0,   0,   0,   0,
++     70, 126,  32,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,  96,  32,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,  64,   0,   0,   0,   0,
++      0,   0,   1,   0,   0,  10,
++    114,   0,  16,   0,   2,   0,
++      0,   0,  70,   2,  16,   0,
++      1,   0,   0,   0,   2,  64,
++      0,   0,   0,   0, 128, 127,
++      0,   0, 128, 127,   0,   0,
++    128, 127,   0,   0,   0,   0,
++     39,   0,   0,  10, 114,   0,
++     16,   0,   2,   0,   0,   0,
++     70,   2,  16,   0,   2,   0,
++      0,   0,   2,  64,   0,   0,
++      0,   0, 128, 127,   0,   0,
++    128, 127,   0,   0, 128, 127,
++      0,   0,   0,   0,   1,   0,
++      0,   7,  66,   0,  16,   0,
++      0,   0,   0,   0,  26,   0,
++     16,   0,   2,   0,   0,   0,
++     10,   0,  16,   0,   2,   0,
++      0,   0,   1,   0,   0,   7,
++     66,   0,  16,   0,   0,   0,
++      0,   0,  42,   0,  16,   0,
++      2,   0,   0,   0,  42,   0,
++     16,   0,   0,   0,   0,   0,
++     52,   0,   0,  10, 114,   0,
++     16,   0,   1,   0,   0,   0,
++     70,   2,  16,   0,   1,   0,
++      0,   0,   2,  64,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
++      0,   7, 114,   0,  16,   0,
++      1,   0,   0,   0, 166,  10,
++     16,   0,   0,   0,   0,   0,
++     70,   2,  16,   0,   1,   0,
++      0,   0,  31,   0,   4,   5,
++     58, 128,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  72,   0,
++      0,  13,  66,   0,  16,   0,
++      0,   0,   0,   0,  70,   0,
++     16,   0,   0,   0,   0,   0,
++    150, 124,  32,   0,   1,   0,
++      0,   0,   1,   0,   0,   0,
++      0,  96,  32,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,  64,   0,   0,   0,   0,
++      0,   0,  72,   0,   0,  13,
++    130,   0,  16,   0,   0,   0,
++      0,   0,  70,   0,  16,   0,
++      0,   0,   0,   0, 150, 115,
++     32,   0,   1,   0,   0,   0,
++      1,   0,   0,   0,   0,  96,
++     32,   0,   1,   0,   0,   0,
++      1,   0,   0,   0,   1,  64,
++      0,   0,   0,   0,   0,   0,
++     55,   0,   0,  11,  66,   0,
++     16,   0,   0,   0,   0,   0,
++     58, 128,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      2,   0,   0,   0,  42,   0,
++     16,   0,   0,   0,   0,   0,
++     58,   0,  16,   0,   0,   0,
++      0,   0,  56,   0,   0,  10,
++     66,   0,  16,   0,   0,   0,
++      0,   0,  42,   0,  16,   0,
++      0,   0,   0,   0,  42, 128,
++     48, 128,  65,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   2,   0,   0,   0,
++     56,   0,   0,   9,  66,   0,
++     16,   0,   0,   0,   0,   0,
++     42,   0,  16,   0,   0,   0,
++      0,   0,  10, 128,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   2,   0,   0,   0,
++     25,   0,   0,   5,  66,   0,
++     16,   0,   0,   0,   0,   0,
++     42,   0,  16,   0,   0,   0,
++      0,   0,  56,   0,   0,   9,
++     66,   0,  16,   0,   0,   0,
++      0,   0,  42,   0,  16,   0,
++      0,   0,   0,   0,  26, 128,
++     48,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   2,   0,
++      0,   0,  18,   0,   0,   1,
++     54,   0,   0,   5,  66,   0,
++     16,   0,   0,   0,   0,   0,
++      1,  64,   0,   0,   0,   0,
++    128,  63,  21,   0,   0,   1,
++     25,   0,   0,   7, 130,   0,
++     16,   0,   0,   0,   0,   0,
++     58, 128,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,  56,   0,
++      0,   7,  66,   0,  16,   0,
++      0,   0,   0,   0,  58,   0,
++     16,   0,   0,   0,   0,   0,
++     42,   0,  16,   0,   0,   0,
++      0,   0,  56,   0,   0,   7,
++    114,   0,  16,   0,   1,   0,
++      0,   0, 166,  10,  16,   0,
++      0,   0,   0,   0,  70,   2,
++     16,   0,   1,   0,   0,   0,
++     52,   0,   0,   7,  66,   0,
++     16,   0,   0,   0,   0,   0,
++     42,   0,  16,   0,   1,   0,
++      0,   0,  26,   0,  16,   0,
++      1,   0,   0,   0,  52,   0,
++      0,   7,  66,   0,  16,   0,
++      0,   0,   0,   0,  42,   0,
++     16,   0,   0,   0,   0,   0,
++     10,   0,  16,   0,   1,   0,
++      0,   0,  49,   0,   0,   7,
++    130,   0,  16,   0,   0,   0,
++      0,   0,  42,   0,  16,   0,
++      0,   0,   0,   0,   1,  64,
++      0,   0,   0,   0, 128,  62,
++     31,   0,   4,   3,  58,   0,
++     16,   0,   0,   0,   0,   0,
++     56,  32,   0,   7,  66,   0,
++     16,   0,   0,   0,   0,   0,
++     42,   0,  16,   0,   0,   0,
++      0,   0,   1,  64,   0,   0,
++      0,   0, 128,  64,   0,   0,
++      0,  10, 130,   0,  16,   0,
++      0,   0,   0,   0,  58, 128,
++     48, 128,  65,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   3,   0,   0,   0,
++      1,  64,   0,   0,   0,   0,
++    128,  63,   0,   0,   0,   8,
++     66,   0,  16,   0,   0,   0,
++      0,   0,  42,   0,  16, 128,
++     65,   0,   0,   0,   0,   0,
++      0,   0,   1,  64,   0,   0,
++      0,   0, 128,  63,  56,   0,
++      0,   7,  66,   0,  16,   0,
++      0,   0,   0,   0,  42,   0,
++     16,   0,   0,   0,   0,   0,
++     42,   0,  16,   0,   0,   0,
++      0,   0,  50,   0,   0,  10,
++     66,   0,  16,   0,   0,   0,
++      0,   0,  42,   0,  16, 128,
++     65,   0,   0,   0,   0,   0,
++      0,   0,  58,   0,  16,   0,
++      0,   0,   0,   0,   1,  64,
++      0,   0,   0,   0, 128,  63,
++     56,   0,   0,   7, 114,   0,
++     16,   0,   1,   0,   0,   0,
++    166,  10,  16,   0,   0,   0,
++      0,   0,  70,   2,  16,   0,
++      1,   0,   0,   0,  21,   0,
++      0,   1,  56,   0,   0,   9,
++    114,   0,  16,   0,   1,   0,
++      0,   0,  70,   2,  16,   0,
++      1,   0,   0,   0,  86, 133,
++     48,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
++      0,   0,   1,   0,   0,  10,
++    114,   0,  16,   0,   2,   0,
++      0,   0,  70,   2,  16,   0,
++      1,   0,   0,   0,   2,  64,
++      0,   0,   0,   0, 128, 127,
++      0,   0, 128, 127,   0,   0,
++    128, 127,   0,   0,   0,   0,
++     39,   0,   0,  10, 114,   0,
++     16,   0,   2,   0,   0,   0,
++     70,   2,  16,   0,   2,   0,
++      0,   0,   2,  64,   0,   0,
++      0,   0, 128, 127,   0,   0,
++    128, 127,   0,   0, 128, 127,
++      0,   0,   0,   0,   1,   0,
++      0,   7,  66,   0,  16,   0,
++      0,   0,   0,   0,  26,   0,
++     16,   0,   2,   0,   0,   0,
++     10,   0,  16,   0,   2,   0,
++      0,   0,   1,   0,   0,   7,
++     66,   0,  16,   0,   0,   0,
++      0,   0,  42,   0,  16,   0,
++      2,   0,   0,   0,  42,   0,
++     16,   0,   0,   0,   0,   0,
++      1,   0,   0,   7, 114,   0,
++     16,   0,   1,   0,   0,   0,
++     70,   2,  16,   0,   1,   0,
++      0,   0, 166,  10,  16,   0,
++      0,   0,   0,   0,  52,   0,
++      0,   7,  66,   0,  16,   0,
++      0,   0,   0,   0,  42,   0,
++     16,   0,   1,   0,   0,   0,
++     26,   0,  16,   0,   1,   0,
++      0,   0,  52,   0,   0,   7,
++     66,   0,  16,   0,   0,   0,
++      0,   0,  42,   0,  16,   0,
++      0,   0,   0,   0,  10,   0,
++     16,   0,   1,   0,   0,   0,
++     49,   0,   0,   9, 130,   0,
++     16,   0,   0,   0,   0,   0,
++     26, 128,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,  42,   0,
++     16,   0,   0,   0,   0,   0,
++     31,   0,   4,   3,  58,   0,
++     16,   0,   0,   0,   0,   0,
++      0,   0,   0,  12, 130,   0,
++     16,   0,   0,   0,   0,   0,
++     26, 128,  48, 128,  65,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
++      0,   0,  10, 128,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   1,   0,   0,   0,
++      0,   0,   0,  10, 130,   0,
++     16,   0,   1,   0,   0,   0,
++     42,   0,  16,   0,   0,   0,
++      0,   0,  26, 128,  48, 128,
++     65,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,  14,   0,
++      0,   7, 130,   0,  16,   0,
++      1,   0,   0,   0,  58,   0,
++     16,   0,   1,   0,   0,   0,
++     58,   0,  16,   0,   0,   0,
++      0,   0,   0,   0,   0,   9,
++     18,   0,  16,   0,   2,   0,
++      0,   0,  42, 128,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   3,   0,   0,   0,
++      1,  64,   0,   0,   0,   0,
++    128, 191,  56,   0,   0,   7,
++     34,   0,  16,   0,   2,   0,
++      0,   0,  58,   0,  16,   0,
++      1,   0,   0,   0,  58,   0,
++     16,   0,   1,   0,   0,   0,
++     56,   0,   0,   7,  18,   0,
++     16,   0,   2,   0,   0,   0,
++     10,   0,  16,   0,   2,   0,
++      0,   0,  26,   0,  16,   0,
++      2,   0,   0,   0,   0,   0,
++      0,   7,  34,   0,  16,   0,
++      2,   0,   0,   0,  58,   0,
++     16,   0,   1,   0,   0,   0,
++      1,  64,   0,   0,   0,   0,
++    128,  63,  14,   0,   0,   7,
++     18,   0,  16,   0,   2,   0,
++      0,   0,  10,   0,  16,   0,
++      2,   0,   0,   0,  26,   0,
++     16,   0,   2,   0,   0,   0,
++      0,   0,   0,   7, 130,   0,
++     16,   0,   1,   0,   0,   0,
++     58,   0,  16,   0,   1,   0,
++      0,   0,  10,   0,  16,   0,
++      2,   0,   0,   0,  56,   0,
++      0,   7, 130,   0,  16,   0,
++      1,   0,   0,   0,  58,   0,
++     16,   0,   1,   0,   0,   0,
++      1,  64,   0,   0,  59, 170,
++    184, 191,  25,   0,   0,   5,
++    130,   0,  16,   0,   1,   0,
++      0,   0,  58,   0,  16,   0,
++      1,   0,   0,   0,   0,   0,
++      0,   8, 130,   0,  16,   0,
++      1,   0,   0,   0,  58,   0,
++     16, 128,  65,   0,   0,   0,
++      1,   0,   0,   0,   1,  64,
++      0,   0,   0,   0, 128,  63,
++     50,   0,   0,  11, 130,   0,
++     16,   0,   0,   0,   0,   0,
++     58,   0,  16,   0,   0,   0,
++      0,   0,  58,   0,  16,   0,
++      1,   0,   0,   0,  26, 128,
++     48,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
++      0,   0,  14,   0,   0,   7,
++     66,   0,  16,   0,   0,   0,
++      0,   0,  58,   0,  16,   0,
++      0,   0,   0,   0,  42,   0,
++     16,   0,   0,   0,   0,   0,
++     56,   0,   0,   7, 114,   0,
++     16,   0,   1,   0,   0,   0,
++    166,  10,  16,   0,   0,   0,
++      0,   0,  70,   2,  16,   0,
++      1,   0,   0,   0,  21,   0,
++      0,   1,  54,   0,   0,   4,
++     50,   0,  16,   0,   2,   0,
++      0,   0,  70,   0,   2,   0,
++     54,   0,   0,   8, 194,   0,
++     16,   0,   2,   0,   0,   0,
++      2,  64,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  45,   0,   0,   8,
++    242,   0,  16,   0,   2,   0,
++      0,   0,  70,  14,  16,   0,
++      2,   0,   0,   0,  70, 126,
++     32,   0,   2,   0,   0,   0,
++      2,   0,   0,   0,  52,   0,
++      0,   7,  66,   0,  16,   0,
++      0,   0,   0,   0,  58,   0,
++     16,   0,   2,   0,   0,   0,
++      1,  64,   0,   0, 189,  55,
++    134,  53,  14,  32,   0,   7,
++    114,   0,  16,   0,   2,   0,
++      0,   0,  70,   2,  16,   0,
++      2,   0,   0,   0, 166,  10,
++     16,   0,   0,   0,   0,   0,
++     29,   0,   0,  10, 114,   0,
++     16,   0,   3,   0,   0,   0,
++      2,  64,   0,   0, 230, 174,
++     37,  61, 230, 174,  37,  61,
++    230, 174,  37,  61,   0,   0,
++      0,   0,  70,   2,  16,   0,
++      2,   0,   0,   0,  56,   0,
++      0,  10, 114,   0,  16,   0,
++      4,   0,   0,   0,  70,   2,
++     16,   0,   2,   0,   0,   0,
++      2,  64,   0,   0, 145, 131,
++    158,  61, 145, 131, 158,  61,
++    145, 131, 158,  61,   0,   0,
++      0,   0,   0,   0,   0,  10,
++    114,   0,  16,   0,   2,   0,
++      0,   0,  70,   2,  16,   0,
++      2,   0,   0,   0,   2,  64,
++      0,   0, 174,  71,  97,  61,
++    174,  71,  97,  61, 174,  71,
++     97,  61,   0,   0,   0,   0,
++     56,   0,   0,  10, 114,   0,
++     16,   0,   2,   0,   0,   0,
++     70,   2,  16,   0,   2,   0,
++      0,   0,   2,  64,   0,   0,
++    111, 167, 114,  63, 111, 167,
++    114,  63, 111, 167, 114,  63,
++      0,   0,   0,   0,  47,   0,
++      0,   5, 114,   0,  16,   0,
++      2,   0,   0,   0,  70,   2,
++     16,   0,   2,   0,   0,   0,
++     56,   0,   0,  10, 114,   0,
++     16,   0,   2,   0,   0,   0,
++     70,   2,  16,   0,   2,   0,
++      0,   0,   2,  64,   0,   0,
++    154, 153,  25,  64, 154, 153,
++     25,  64, 154, 153,  25,  64,
++      0,   0,   0,   0,  25,   0,
++      0,   5, 114,   0,  16,   0,
++      2,   0,   0,   0,  70,   2,
++     16,   0,   2,   0,   0,   0,
++     55,   0,   0,   9, 114,   0,
++     16,   0,   2,   0,   0,   0,
++     70,   2,  16,   0,   3,   0,
++      0,   0,  70,   2,  16,   0,
++      4,   0,   0,   0,  70,   2,
++     16,   0,   2,   0,   0,   0,
++      0,   0,   0,   8,  66,   0,
++     16,   0,   0,   0,   0,   0,
++     58,   0,  16, 128,  65,   0,
++      0,   0,   2,   0,   0,   0,
++      1,  64,   0,   0,   0,   0,
++    128,  63,  56,   0,   0,   9,
++    114,   0,  16,   0,   2,   0,
++      0,   0,  70,   2,  16,   0,
++      2,   0,   0,   0, 166, 138,
++     48,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
++      0,   0,  56,   0,   0,   7,
++    114,   0,  16,   0,   2,   0,
++      0,   0, 246,  15,  16,   0,
++      2,   0,   0,   0,  70,   2,
++     16,   0,   2,   0,   0,   0,
++     50,   0,   0,   9, 114,   0,
++     16,   0,   1,   0,   0,   0,
++     70,   2,  16,   0,   1,   0,
++      0,   0, 166,  10,  16,   0,
++      0,   0,   0,   0,  70,   2,
++     16,   0,   2,   0,   0,   0,
++     18,   0,   0,   1,  54,   0,
++      0,   4,  50,   0,  16,   0,
++      2,   0,   0,   0,  70,   0,
++      2,   0,  54,   0,   0,   8,
++    194,   0,  16,   0,   2,   0,
++      0,   0,   2,  64,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  45,   0,
++      0,   8, 114,   0,  16,   0,
++      2,   0,   0,   0,  70,  14,
++     16,   0,   2,   0,   0,   0,
++     70, 126,  32,   0,   2,   0,
++      0,   0,   2,   0,   0,   0,
++     54,  32,   0,   5, 114,   0,
++     16,   0,   2,   0,   0,   0,
++     70,   2,  16,   0,   2,   0,
++      0,   0,  29,   0,   0,  10,
++    114,   0,  16,   0,   3,   0,
++      0,   0,   2,  64,   0,   0,
++    230, 174,  37,  61, 230, 174,
++     37,  61, 230, 174,  37,  61,
++      0,   0,   0,   0,  70,   2,
++     16,   0,   2,   0,   0,   0,
++     56,   0,   0,  10, 114,   0,
++     16,   0,   4,   0,   0,   0,
++     70,   2,  16,   0,   2,   0,
++      0,   0,   2,  64,   0,   0,
++    145, 131, 158,  61, 145, 131,
++    158,  61, 145, 131, 158,  61,
++      0,   0,   0,   0,   0,   0,
++      0,  10, 114,   0,  16,   0,
++      2,   0,   0,   0,  70,   2,
++     16,   0,   2,   0,   0,   0,
++      2,  64,   0,   0, 174,  71,
++     97,  61, 174,  71,  97,  61,
++    174,  71,  97,  61,   0,   0,
++      0,   0,  56,   0,   0,  10,
++    114,   0,  16,   0,   2,   0,
++      0,   0,  70,   2,  16,   0,
++      2,   0,   0,   0,   2,  64,
++      0,   0, 111, 167, 114,  63,
++    111, 167, 114,  63, 111, 167,
++    114,  63,   0,   0,   0,   0,
++     47,   0,   0,   5, 114,   0,
++     16,   0,   2,   0,   0,   0,
++     70,   2,  16,   0,   2,   0,
++      0,   0,  56,   0,   0,  10,
++    114,   0,  16,   0,   2,   0,
++      0,   0,  70,   2,  16,   0,
++      2,   0,   0,   0,   2,  64,
++      0,   0, 154, 153,  25,  64,
++    154, 153,  25,  64, 154, 153,
++     25,  64,   0,   0,   0,   0,
++     25,   0,   0,   5, 114,   0,
++     16,   0,   2,   0,   0,   0,
++     70,   2,  16,   0,   2,   0,
++      0,   0,  55,   0,   0,   9,
++    114,   0,  16,   0,   2,   0,
++      0,   0,  70,   2,  16,   0,
++      3,   0,   0,   0,  70,   2,
++     16,   0,   4,   0,   0,   0,
++     70,   2,  16,   0,   2,   0,
++      0,   0,  56,   0,   0,   9,
++    114,   0,  16,   0,   1,   0,
++      0,   0,  70,   2,  16,   0,
++      2,   0,   0,   0, 166, 138,
++     48,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
++      0,   0,  21,   0,   0,   1,
++     31,   0,   4,   5,  10, 128,
++     48,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   3,   0,
++      0,   0,   0,   0,   0,  10,
++    242,   0,  16,   0,   2,   0,
++      0,   0,  70,   4,  16,   0,
++      0,   0,   0,   0,   2,  64,
++      0,   0,   0,   0,   0, 191,
++     51,  51, 179, 190,   0,   0,
++      0, 191,   0,   0,   0, 191,
++     49,   0,   0,  11, 242,   0,
++     16,   0,   2,   0,   0,   0,
++     70,  14,  16, 128, 129,   0,
++      0,   0,   2,   0,   0,   0,
++      2,  64,   0,   0, 205, 204,
++    204,  61, 205, 204,  76,  61,
++    205, 204, 204,  61, 205, 204,
++    204,  60,   1,   0,   0,   7,
++    194,   0,  16,   0,   0,   0,
++      0,   0,  86,  13,  16,   0,
++      2,   0,   0,   0,   6,   8,
++     16,   0,   2,   0,   0,   0,
++     31,   0,   4,   3,  42,   0,
++     16,   0,   0,   0,   0,   0,
++     49,   0,   0,   7,  66,   0,
++     16,   0,   0,   0,   0,   0,
++     10,   0,  16,   0,   0,   0,
++      0,   0,   1,  64,   0,   0,
++      0,   0,   0,  63,  55,   0,
++      0,   9,  66,   0,  16,   0,
++      0,   0,   0,   0,  42,   0,
++     16,   0,   0,   0,   0,   0,
++      1,  64,   0,   0, 102, 102,
++    102,  63,   1,  64,   0,   0,
++      0,   0, 128,  63,  56,   0,
++      0,   9, 114,   0,  16,   0,
++      1,   0,   0,   0, 166,  10,
++     16,   0,   0,   0,   0,   0,
++      6, 128,  48,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,  18,   0,
++      0,   1,  54,   0,   0,   8,
++    114,   0,  16,   0,   1,   0,
++      0,   0,   2,  64,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  21,   0,
++      0,   1,  31,   0,   4,   3,
++     58,   0,  16,   0,   0,   0,
++      0,   0,  54,   0,   0,   7,
++    114,   0,  16,   0,   1,   0,
++      0,   0,  86, 133,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   1,   0,   0,   0,
++     21,   0,   0,   1,   0,   0,
++      0,  10,  50,   0,  16,   0,
++      0,   0,   0,   0,  70,   0,
++     16,   0,   0,   0,   0,   0,
++      2,  64,   0,   0,   0,   0,
++      0, 191, 154, 153,  25, 191,
++      0,   0,   0,   0,   0,   0,
++      0,   0,  49,   0,   0,  11,
++     50,   0,  16,   0,   0,   0,
++      0,   0,  70,   0,  16, 128,
++    129,   0,   0,   0,   0,   0,
++      0,   0,   2,  64,   0,   0,
++    205, 204, 204,  61, 205, 204,
++    204,  60,   0,   0,   0,   0,
++      0,   0,   0,   0,   1,   0,
++      0,   7,  18,   0,  16,   0,
++      0,   0,   0,   0,  26,   0,
++     16,   0,   0,   0,   0,   0,
++     10,   0,  16,   0,   0,   0,
++      0,   0,  31,   0,   4,   3,
++     10,   0,  16,   0,   0,   0,
++      0,   0,  54,   0,   0,   7,
++    114,   0,  16,   0,   1,   0,
++      0,   0, 166, 138,  48,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   1,   0,   0,   0,
++     21,   0,   0,   1,  21,   0,
++      0,   1,  16,   0,   0,  10,
++     18,   0,  16,   0,   0,   0,
++      0,   0,   2,  64,   0,   0,
++    139, 157,  32,  63, 201, 151,
++    168,  62,  12, 105,  49,  61,
++      0,   0,   0,   0,  70,   2,
++     16,   0,   1,   0,   0,   0,
++     16,   0,   0,  10,  34,   0,
++     16,   0,   0,   0,   0,   0,
++      2,  64,   0,   0, 225, 130,
++    141,  61,   0, 103, 107,  63,
++      6,  41,  58,  60,   0,   0,
++      0,   0,  70,   2,  16,   0,
++      1,   0,   0,   0,  16,   0,
++      0,  10,  66,   0,  16,   0,
++      0,   0,   0,   0,   2,  64,
++      0,   0,  87,  71, 134,  60,
++     83,  64, 180,  61, 187,  69,
++    101,  63,   0,   0,   0,   0,
++     70,   2,  16,   0,   1,   0,
++      0,   0,  56,  32,   0,  10,
++    114,   0,  16,   0,   1,   0,
++      0,   0,  70,   2,  16,   0,
++      0,   0,   0,   0,   2,  64,
++      0,   0,  23, 183, 209,  56,
++     23, 183, 209,  56,  23, 183,
++    209,  56,   0,   0,   0,   0,
++     47,   0,   0,   5, 114,   0,
++     16,   0,   1,   0,   0,   0,
++     70,   2,  16,   0,   1,   0,
++      0,   0,  56,   0,   0,  10,
++    114,   0,  16,   0,   1,   0,
++      0,   0,  70,   2,  16,   0,
++      1,   0,   0,   0,   2,  64,
++      0,   0,   0,  32,  35,  62,
++      0,  32,  35,  62,   0,  32,
++     35,  62,   0,   0,   0,   0,
++     25,   0,   0,   5, 114,   0,
++     16,   0,   1,   0,   0,   0,
++     70,   2,  16,   0,   1,   0,
++      0,   0,  50,   0,   0,  15,
++    114,   0,  16,   0,   2,   0,
++      0,   0,  70,   2,  16,   0,
++      1,   0,   0,   0,   2,  64,
++      0,   0,   0, 208, 150,  65,
++      0, 208, 150,  65,   0, 208,
++    150,  65,   0,   0,   0,   0,
++      2,  64,   0,   0,   0,   0,
++     86,  63,   0,   0,  86,  63,
++      0,   0,  86,  63,   0,   0,
++      0,   0,  50,   0,   0,  15,
++    114,   0,  16,   0,   1,   0,
++      0,   0,  70,   2,  16,   0,
++      1,   0,   0,   0,   2,  64,
++      0,   0,   0, 128, 149,  65,
++      0, 128, 149,  65,   0, 128,
++    149,  65,   0,   0,   0,   0,
++      2,  64,   0,   0,   0,   0,
++    128,  63,   0,   0, 128,  63,
++      0,   0, 128,  63,   0,   0,
++      0,   0,  14,   0,   0,   7,
++    114,   0,  16,   0,   1,   0,
++      0,   0,  70,   2,  16,   0,
++      2,   0,   0,   0,  70,   2,
++     16,   0,   1,   0,   0,   0,
++     47,   0,   0,   5, 114,   0,
++     16,   0,   1,   0,   0,   0,
++     70,   2,  16,   0,   1,   0,
++      0,   0,  56,   0,   0,  10,
++    114,   0,  16,   0,   1,   0,
++      0,   0,  70,   2,  16,   0,
++      1,   0,   0,   0,   2,  64,
++      0,   0,   0, 176, 157,  66,
++      0, 176, 157,  66,   0, 176,
++    157,  66,   0,   0,   0,   0,
++     25,   0,   0,   5, 114,   0,
++     16,   0,   1,   0,   0,   0,
++     70,   2,  16,   0,   1,   0,
++      0,   0,  29,   0,   0,  10,
++    114,   0,  16,   0,   0,   0,
++      0,   0,   2,  64,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  70,   2,
++     16,   0,   0,   0,   0,   0,
++     55,   0,   0,  12, 114,   0,
++     16,   0,   0,   0,   0,   0,
++     70,   2,  16,   0,   0,   0,
++      0,   0,   2,  64,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  70,   2,
++     16,   0,   1,   0,   0,   0,
++     54,   0,   0,   5, 130,   0,
++     16,   0,   0,   0,   0,   0,
++      1,  64,   0,   0,   0,   0,
++    128,  63, 164,   0,   0,   7,
++    242, 224,  33,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++     70,   5,   2,   0,  70,  14,
++     16,   0,   0,   0,   0,   0,
++     62,   0,   0,   1,  83,  84,
++     65,  84, 148,   0,   0,   0,
++    147,   0,   0,   0,   5,   0,
++      0,   0,   0,   0,   0,   0,
++      1,   0,   0,   0,  79,   0,
++      0,   0,   2,   0,   0,   0,
++     12,   0,   0,   0,  10,   0,
++      0,   0,   6,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      6,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,  13,   0,
++      0,   0,   5,   0,   0,   0,
++      2,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      0,   0,   0,   0,   0,   0,
++      2,   0,   0,   0
++};
+diff --git a/src/ui/shaders/ssx_hdr.cs.hlsl b/src/ui/shaders/ssx_hdr.cs.hlsl
+new file mode 100644
+index 0000000..22934f6
+--- /dev/null
++++ b/src/ui/shaders/ssx_hdr.cs.hlsl
+@@ -0,0 +1,91 @@
++// Native FP16 scene -> spatial guest exposure -> HDR shoulder -> Rec.2020/PQ.
++// This scene preview intentionally precedes the game's SDR post-effects/HUD.
++cbuffer Constants : register(b0) {
++  uint2 output_size;
++  uint native_scene, exposure_enabled;
++  float peak_nits, paper_white_nits, ui_nits, exposure_ev;
++  float exposure_scale, exposure_key, log_scale;
++  uint exposure_linear;
++  uint calibration;
++  uint hdr_output;
++  float highlight_boost;
++  float shadow_slope;
++};
++Texture2D<float4> scene : register(t0);
++Texture2D<float> log_exposure : register(t1);
++Texture2D<float4> overlay : register(t2);
++SamplerState linear_clamp : register(s0);
++SamplerState point_clamp : register(s1);
++RWTexture2D<unorm float4> output_pq : register(u0);
++float3 LinearSRGB(float3 v) {
++  v = saturate(v);
++  return float3(v.r <= .04045 ? v.r / 12.92 : pow((v.r + .055) / 1.055, 2.4),
++                v.g <= .04045 ? v.g / 12.92 : pow((v.g + .055) / 1.055, 2.4),
++                v.b <= .04045 ? v.b / 12.92 : pow((v.b + .055) / 1.055, 2.4));
++}
++float3 PQ(float3 nits) {
++  float3 p = pow(saturate(nits / 10000), 2610.0 / 16384.0);
++  float3 code = pow((3424.0 / 4096.0 + (2413.0 / 128.0) * p) /
++                    (1 + (2392.0 / 128.0) * p), 2523.0 / 32.0);
++  return float3(nits.r <= 0 ? 0 : code.r, nits.g <= 0 ? 0 : code.g, nits.b <= 0 ? 0 : code.b);
++}
++[numthreads(8, 8, 1)]
++void main(uint3 id : SV_DispatchThreadID) {
++  if (any(id.xy >= output_size)) return;
++  if (!hdr_output) {
++    output_pq[id.xy] = float4(overlay.Load(int3(id.xy, 0)).rgb, 1);
++    return;
++  }
++  float2 uv = (float2(id.xy) + .5) / output_size;
++  float3 nits = 0;
++  if (native_scene) {
++    float3 rgb = scene.SampleLevel(linear_clamp, uv, 0).rgb;
++    rgb = all(isfinite(rgb)) ? max(rgb, 0) : 0;
++    float exposure = 1;
++    if (exposure_enabled) {
++      float raw = exposure_linear ? log_exposure.SampleLevel(linear_clamp, uv, 0) :
++                                    log_exposure.SampleLevel(point_clamp, uv, 0);
++      exposure = exposure_key * exp2(-log_scale * raw * exposure_scale);
++    }
++    rgb *= exposure * exp2(exposure_ev);
++    float shadow = max(rgb.r, max(rgb.g, rgb.b));
++    if (shadow < .25) {
++      // Monotonic cubic toe, matching the guest's derivative at zero and the
++      // HDR curve's value/derivative at .25. No black pedestal or hard cutoff.
++      float t = saturate(shadow / .25);
++      rgb *= 1 - (1-shadow_slope)*(1-t)*(1-t);
++    }
++    nits = rgb * paper_white_nits;
++    nits = all(isfinite(nits)) ? nits : 0;
++    // Preserve diffuse values and hue. Smoothly compress values above paper
++    // white, keeping different scene highlights distinct up to the display peak.
++    float brightest = max(nits.r, max(nits.g, nits.b));
++    if (brightest > paper_white_nits) {
++      float span = peak_nits - paper_white_nits;
++      float t = (brightest - paper_white_nits) / span;
++      // C1-continuous at paper white; boost never changes diffuse whites or peak.
++      t += (highlight_boost - 1) * t * t / (1 + t);
++      float mapped = paper_white_nits + span * (1 - exp(-t));
++      nits *= mapped / brightest;
++    }
++    float4 ui = overlay.Load(int3(id.xy, 0));
++    // UI was blended in the original SDR code space on transparent black.
++    float3 ui_linear = LinearSRGB(saturate(ui.rgb / max(ui.a, 1e-6)));
++    nits = nits * (1-ui.a) + ui_linear * ui_nits * ui.a;
++  } else {
++    nits = LinearSRGB(overlay.Load(int3(id.xy, 0)).rgb) * ui_nits;
++  }
++  if (calibration) {
++    // Small-area clipping pattern: selected peak versus 90% peak on dark gray.
++    // No large white flash. Middle bar is paper white; lower bar is UI white.
++    nits = 0;
++    if (all(abs(uv - float2(.5,.35)) < float2(.1,.05)))
++      nits = (uv.x < .5 ? .9 : 1) * peak_nits;
++    if (all(abs(uv - float2(.5,.5)) < float2(.1,.025))) nits = paper_white_nits;
++    if (all(abs(uv - float2(.5,.6)) < float2(.1,.025))) nits = ui_nits;
++  }
++  float3 rec2020 = mul(float3x3(.62740390,.32928304,.04331307,
++                               .06909729,.91954040,.01136232,
++                               .01639144,.08801331,.89559525), nits);
++  output_pq[id.xy] = float4(PQ(rec2020), 1);
++}
+diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
+index 252d8e2..70f6928 100644
+--- a/tests/unit/CMakeLists.txt
++++ b/tests/unit/CMakeLists.txt
+@@ -27,6 +27,7 @@ add_executable(unit_tests
+ if(REXGLUE_USE_D3D12)
+     target_sources(unit_tests PRIVATE graphics/ssx_frame_inputs_test.cpp)
+     target_sources(unit_tests PRIVATE graphics/ssx_motion_test.cpp)
++    target_sources(unit_tests PRIVATE graphics/ssx_hdr_test.cpp)
+ endif()
+ 
+ target_sources(unit_tests PRIVATE
+diff --git a/tests/unit/graphics/ssx_hdr_test.cpp b/tests/unit/graphics/ssx_hdr_test.cpp
+new file mode 100644
+index 0000000..6ad6340
+--- /dev/null
++++ b/tests/unit/graphics/ssx_hdr_test.cpp
+@@ -0,0 +1,44 @@
++#include <catch2/catch_test_macros.hpp>
++#include <rex/ui/d3d12/ssx_hdr.h>
++#include <limits>
++using namespace rex::ui::d3d12;
++TEST_CASE("SSX HDR PQ uses absolute nits, including 3000 nit TV target", "[SSX][HDR]") {
++  CHECK(SsxPQEncode(0) == 0);
++  CHECK(SsxPQDecode(0) == 0);
++  CHECK(std::abs(SsxPQEncode(100) - .5080784215) < 1e-9);
++  CHECK(std::abs(SsxPQEncode(1000) - .7518270962) < 1e-9);
++  CHECK(std::abs(SsxPQEncode(3000) - .8714864444) < 1e-9);
++  CHECK(std::abs(SsxPQEncode(10000) - 1) < 1e-12);
++  for (double nits : {.001, .1, 1., 80., 200., 1000., 3000., 10000.})
++    CHECK(std::abs(SsxPQDecode(SsxPQEncode(nits)) - nits) < 1e-7);
++}
++TEST_CASE("SSX HDR calibration rejects nonfinite and contradictory settings", "[SSX][HDR]") {
++  SsxHDRSettings s;
++  CHECK(s.Valid());
++  s.peak_nits = 3000;
++  CHECK(s.Valid());
++  s.peak_nits = 3001;
++  CHECK_FALSE(s.Valid());
++  s.peak_nits = 400;
++  s.paper_white_nits = 400;
++  CHECK_FALSE(s.Valid());
++  s.paper_white_nits = 200;
++  s.ui_nits = 401;
++  CHECK_FALSE(s.Valid());
++  s.ui_nits = 200;
++  s.exposure_ev = std::numeric_limits<float>::quiet_NaN();
++  CHECK_FALSE(s.Valid());
++}
++TEST_CASE("SSX retained HDR color must be marked anew on pool reuse", "[SSX][HDR]") {
++  SsxFGTemporalPool pool;
++  auto frame = pool.Acquire(1, 0);
++  frame->hdr_valid = true;
++  frame->submission = 2;
++  auto second = pool.Acquire(2, 1);
++  CHECK(second != frame);
++  frame.reset();
++  second.reset();
++  auto reused = pool.Acquire(3, 2);
++  CHECK_FALSE(reused->hdr_valid);
++  CHECK(reused->guest_frame == 3);
++}

@@ -1,0 +1,3 @@
+# Hash-pinned SDK patches must retain their exact bytes on every platform.
+patches/*.patch -text
+patches/experimental-series.json text eol=lf

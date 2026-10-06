@@ -1,0 +1,1811 @@
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index c45ad23..47c08aa 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -820,7 +820,14 @@ class D3D12CommandProcessor : public CommandProcessor {
+   uint32_t ssx_title_id_ = 0;
+   uint64_t ssx_jitter_frame_ = UINT64_MAX;
+   uint32_t ssx_jittered_draws_ = 0, ssx_jitter_skipped_draws_ = 0;
+-  void ApplySsxJitter(uint64_t vs, draw_util::ViewportInfo& viewport);
++  uint32_t ssx_scene_draw_ = 0, ssx_jitter_unknown_ = 0;
++  uint32_t ssx_jitter_fixed_ = 0, ssx_jitter_inverse_ = 0;
++  std::array<uint64_t,8> ssx_jitter_unknown_shaders_{};
++  std::array<float,2> ssx_draw_jitter_ndc_{};
++  bool ssx_inverse_vertex_ = false, ssx_inverse_pixel_ = false;
++  void ApplySsxJitter(const D3D12Shader& vs, uint64_t ps, draw_util::ViewportInfo& viewport);
++  bool SsxJitterTranslationEnabled() const;
++  void PatchSsxFloatConstant(bool vertex, uint32_t index, uint8_t* output) const;
+   uint64_t ssx_input_attempt_frame_ = 0;
+   uint64_t ssx_last_input_log_frame_ = 0;
+   ui::d3d12::SsxFrameInputPool ssx_input_pool_;
+diff --git a/include/rex/graphics/pipeline/shader/dxbc.h b/include/rex/graphics/pipeline/shader/dxbc.h
+index ed4452f..65ba5e9 100644
+--- a/include/rex/graphics/pipeline/shader/dxbc.h
++++ b/include/rex/graphics/pipeline/shader/dxbc.h
+@@ -16,6 +16,7 @@
+ 
+ #include <rex/graphics/pipeline/shader/dxbc_translator.h>
+ #include <rex/graphics/pipeline/shader/shader.h>
++#include <rex/graphics/pipeline/shader/ssx_analysis.h>
+ #include <rex/graphics/xenos.h>
+ 
+ namespace rex::graphics {
+@@ -31,6 +32,8 @@ class DxbcShader : public Shader {
+   DxbcShader(xenos::ShaderType shader_type, uint64_t ucode_data_hash, const uint32_t* ucode_dwords,
+              size_t ucode_dword_count, std::endian ucode_source_endian = std::endian::big);
+ 
++  const SsxShaderAnalysis& ssx_analysis() const { return ssx_analysis_; }
++
+   // Resource bindings are gathered after the successful translation of any
+   // modification for simplicity of translation (and they don't depend on
+   // modification bits).
+@@ -73,6 +76,8 @@ class DxbcShader : public Shader {
+  private:
+   friend class DxbcShaderTranslator;
+ 
++  SsxShaderAnalysis ssx_analysis_;
++
+   std::atomic_flag bindings_setup_entered_ = ATOMIC_FLAG_INIT;
+   std::vector<TextureBinding> texture_bindings_;
+   std::vector<SamplerBinding> sampler_bindings_;
+diff --git a/include/rex/graphics/pipeline/shader/dxbc_translator.h b/include/rex/graphics/pipeline/shader/dxbc_translator.h
+index 3b0fd61..9f0f63f 100644
+--- a/include/rex/graphics/pipeline/shader/dxbc_translator.h
++++ b/include/rex/graphics/pipeline/shader/dxbc_translator.h
+@@ -111,7 +111,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
+     // If anything in this is structure is changed in a way not compatible with
+     // the previous layout, invalidate the pipeline storages by increasing this
+     // version number (0xYYYYMMDD)!
+-    static constexpr uint32_t kVersion = 0x20260226;
++    static constexpr uint32_t kVersion = 0x20261005;
+ 
+     enum class DepthStencilMode : uint32_t {
+       kNoModifiers,
+@@ -158,6 +158,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
+       // uint32_t 1.
+       // Pipeline stage and input configuration.
+       Shader::HostVertexShaderType host_vertex_shader_type : Shader::kHostVertexShaderTypeBitCount;
++      uint32_t ssx_clip_jitter : 1;
+     } vertex;
+     struct PixelShaderModification {
+       // uint32_t 0.
+@@ -388,6 +389,10 @@ class DxbcShaderTranslator : public ShaderTranslator {
+     // The constant blend factor for the respective modes.
+     float edram_blend_constant[4];
+ 
++    // XY guest clip jitter for audited SSX screen-position interpolators.
++    // Zero outside eligible SSX draws; appended to preserve every old offset.
++    float ssx_clip_jitter[4];
++
+    private:
+     friend class DxbcShaderTranslator;
+ 
+@@ -439,6 +444,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
+       kEdramRTBlendFactorsOps,
+ 
+       kEdramBlendConstant,
++      kSsxClipJitter,
+ 
+       kCount,
+     };
+diff --git a/include/rex/graphics/pipeline/shader/ssx_analysis.h b/include/rex/graphics/pipeline/shader/ssx_analysis.h
+new file mode 100644
+index 0000000..1cf1dfa
+--- /dev/null
++++ b/include/rex/graphics/pipeline/shader/ssx_analysis.h
+@@ -0,0 +1,13 @@
++#pragma once
++#include <cstdint>
++#include <span>
++
++namespace rex::graphics {
++// Recognition of SSX's row-vector scene projection, independent of shader hash.
++// The caller still gates title, scene depth allocation, viewport and clip mode.
++struct SsxShaderAnalysis {
++  bool projected = false;
++  uint32_t clip_interpolators = 0;
++};
++SsxShaderAnalysis AnalyzeSsxVertexShader(std::span<const uint32_t> words);
++}  // namespace rex::graphics
+diff --git a/include/rex/ui/d3d12/guest_frame_inputs.h b/include/rex/ui/d3d12/guest_frame_inputs.h
+index d8802c8..92e3b80 100644
+--- a/include/rex/ui/d3d12/guest_frame_inputs.h
++++ b/include/rex/ui/d3d12/guest_frame_inputs.h
+@@ -12,7 +12,7 @@
+ namespace rex::ui::d3d12 {
+ 
+ enum class SsxInput : size_t { kEncodedColor, kResolvedDepth, kLogExposure, kCount };
+-enum class SsxPass { kNone, kWorldTransform, kToneMap, kDepthReduction, kDeformedGeometry };
++enum class SsxPass { kNone, kWorldTransform, kToneMap, kDepthReduction, kDepthBeforeLighting, kDeformedGeometry };
+ 
+ inline bool IsKnownSsxScene(uint32_t width, uint32_t height) {
+   return (width == 1120 && height == 584) || (width == 1280 && height == 720);
+@@ -25,6 +25,8 @@ inline SsxPass IdentifySsxPass(uint32_t title, uint64_t vs, uint64_t ps, uint32_
+   if (title != 0x4541096D)
+     return SsxPass::kNone;
+   if (IsKnownSsxScene(width, height)) {
++    if (vs == 0xEFEFB597BB5740F0ull && ps == 0xAA51010CD0482315ull)
++      return SsxPass::kDepthBeforeLighting;
+     if (IsSsxDeformedDraw(vs, ps))
+       return SsxPass::kDeformedGeometry;
+     if (vs == 0xC44105DD14EFDB33ull)
+@@ -67,6 +69,11 @@ struct SsxFrameMetadata {
+   std::array<float, 2> jitter_pixels{};
+   bool jitter_enabled = false;
+   uint32_t jittered_draws = 0, jitter_skipped_draws = 0;
++  uint32_t depth_draw = 0, color_draw = 0;
++  bool depth_before_lighting = false;
++  uint32_t jitter_unknown_before_color = 0;
++  uint32_t jitter_fixed_screen_draws = 0, jitter_inverse_draws = 0;
++  std::array<uint64_t,8> jitter_unknown_shaders{};
+ 
+   bool Has(SsxInput role) const { return (captured_mask & (1u << size_t(role))) != 0; }
+   bool RawResourcesComplete() const {
+diff --git a/include/rex/ui/d3d12/ssx_jitter.h b/include/rex/ui/d3d12/ssx_jitter.h
+index 2621e2e..a6a6b6a 100644
+--- a/include/rex/ui/d3d12/ssx_jitter.h
++++ b/include/rex/ui/d3d12/ssx_jitter.h
+@@ -5,11 +5,23 @@
+ 
+ namespace rex::ui::d3d12 {
+ inline bool IsSsxJitterShader(uint64_t vs) {
+-  // Audited straight-line c192..195 projection stored directly to oPos.
++  // Audited scene projection exports (c192, c156 and c160 families).
+   // Includes BOTH normal/depth and later material passes. Raster-only jitter
+   // on the former leaves the latter failing depth equality (purple corruption).
+   // See tools/jitter_shader_audit.py; no guest shader code is embedded here.
+   switch (vs) {
++    // Additional GPU-skinned objects and light volume seen in the live race.
++    case 0xD254B6DFC3681CEBull:
++    case 0x71F0FC537920A13Full:
++    case 0xA8551BE6B8A29F17ull:
++    case 0x88FEF2F38B1F726Bull:
++    case 0xC4E4816838F15D26ull:
++    // Additional audited scene geometry, and the two light-volume shaders.
++    case 0x918D665BD2A2CD18ull:
++    case 0xCD0EA161158F343Eull:
++    case 0x12FD869BF1BC123Bull:
++    case 0x834A9D8A1620BE5Dull:
++    case 0xF5B18A44617A385Eull:
+     case 0x055F9A3939313971ull:
+     case 0x0BD84EEE78FD8CBEull:
+     case 0x0F20F851EA9BECB1ull:
+@@ -70,6 +82,125 @@ inline bool IsSsxJitterShader(uint64_t vs) {
+       return false;
+   }
+ }
++
++// Exact audited clip-position exports, not arbitrary texture coordinates.
++// XY receives the same guest clip-space displacement as raster position;
++// Z/W and material UVs are unchanged. Hashes are signatures, not guest code.
++inline uint32_t SsxClipInterpolatorMask(uint64_t vs) {
++  switch (vs) {
++    case 0xD254B6DFC3681CEBull:
++      return 4;
++    case 0x71F0FC537920A13Full:
++      return 4;
++    case 0xA8551BE6B8A29F17ull:
++      return 1;
++    case 0x88FEF2F38B1F726Bull:
++      return 5;
++    case 0xC4E4816838F15D26ull:
++      return 5;
++    case 0x055F9A3939313971ull:
++      return 1;
++    case 0x1DF106D9BBC3DAB5ull:
++      return 4;
++    case 0x1E427E91787634D1ull:
++      return 1;
++    case 0x287D26954FF5AD45ull:
++      return 1;
++    case 0x295831BA96AB5C97ull:
++      return 1;
++    case 0x3B6ED07F781A3914ull:
++      return 1;
++    case 0x3B73061891C4300Cull:
++      return 1;
++    case 0x3E9EA12E5250B8C4ull:
++      return 1;
++    case 0x4349612AC66E8F15ull:
++      return 1;
++    case 0x482A43BF1FB7565Bull:
++      return 1;
++    case 0x6AC767636C7FD2DDull:
++      return 1;
++    case 0x78ECD524E5C56778ull:
++      return 1;
++    case 0x834A9D8A1620BE5Dull:
++      return 1;
++    case 0x8BD60966296E983Bull:
++      return 1;
++    case 0x8C352E246EA106D7ull:
++      return 1;
++    case 0xAAA9EF936E094D12ull:
++      return 1;
++    case 0xAF0AF0332B8F7C86ull:
++      return 1;
++    case 0xB790B088C126B95Aull:
++      return 1;
++    case 0xBC37AFB965F89696ull:
++      return 1;
++    case 0xC68B1C50089DDABEull:
++      return 5;
++    case 0xC97ADEB23DF6FD62ull:
++      return 1;
++    case 0xCD03BB2AF23FA8EAull:
++      return 1;
++    case 0xD3AFB22410B2671Eull:
++      return 1;
++    case 0xDC293B9A91E2B87Full:
++      return 1;
++    case 0xE8F989D1CB0A0054ull:
++      return 1;
++    case 0xE9A8D82250AAAE8Cull:
++      return 1;
++    case 0xEBC15D5C58BC02D6ull:
++      return 1;
++    case 0xF5B18A44617A385Eull:
++      return 1;
++    default:
++      return 0;
++  }
++}
++inline bool SsxInverseProjectionPixelShader(uint64_t ps) {
++  switch (ps) {
++    case 0x2EFD5711DDDA79C9ull:
++    case 0x36FA149A70361AD3ull:
++    case 0x37B738D02F18FC24ull:
++    case 0x3F8F28CBEC567632ull:
++    case 0x6D1044B0E3AA7781ull:
++    case 0x8456E4BF933BA551ull:
++    case 0x856F0AC1CAFB1CBEull:
++    case 0x9632ABCA64702F1Full:
++    case 0xA01CEF46D566B8EEull:
++    case 0xA095CC0CAC8428CCull:
++    case 0xA2CF2ABC8647846Full:
++    case 0xA8E146A9FE1916EDull:
++    case 0xAA51010CD0482315ull:
++    case 0xC9351DBCAFCFCB05ull:
++    case 0xDE67B002F64C539Full:
++    case 0xE9336E5FD3FF496Aull:
++      return true;
++    default:
++      return false;
++  }
++}
++inline bool SsxInverseProjectionVertexShader(uint64_t vs) {
++  return vs == 0x763F035342AB3C25ull;  // Fullscreen procedural sky ray.
++}
++inline bool SsxFixedScreenShader(uint64_t vs) {
++  return vs == 0xEFEFB597BB5740F0ull || vs == 0x4270054E680ABDB7ull ||
++         vs == 0xB33B12B75222E1D5ull || vs == 0x763F035342AB3C25ull || vs == 0xE857B4AF9617DC29ull;
++}
++// Row-vector inverse of P*J is J^-1*P^-1. Modify only row 3 of the
++// uploaded copy (guest c175). Source register file and camera metadata stay
++// unjittered. c172/c173 are the original first two rows in both shader stages.
++inline std::array<float, 4> SsxJitterInverseRow(const float* row0, const float* row1,
++                                                const float* row3,
++                                                const std::array<float, 2>& jitter_ndc) {
++  std::array<float, 4> result;
++  for (size_t i = 0; i < 4; ++i)
++    result[i] =
++        float(double(row3[i]) - double(jitter_ndc[0]) * row0[i] - double(jitter_ndc[1]) * row1[i]);
++  return result;
++}
++
+ // Pixel displacement in the host scene, +right/+down. Never advance on repaint.
+ // A fixed 16-phase sequence is for input validation, not DLSS optimal settings.
+ inline std::array<float, 2> SsxJitterPixels(uint64_t guest_frame) {
+@@ -85,9 +216,10 @@ inline std::array<float, 2> SsxJitterPixels(uint64_t guest_frame) {
+   const uint32_t phase = uint32_t(guest_frame % 16) + 1;
+   return {radical(phase, 2), radical(phase, 3)};
+ }
+-inline std::array<float, 2> SsxJitterNdc(const std::array<float, 2>& pixels,
+-                                         uint32_t width, uint32_t height) {
+-  if (!width || !height) return {};
++inline std::array<float, 2> SsxJitterNdc(const std::array<float, 2>& pixels, uint32_t width,
++                                         uint32_t height) {
++  if (!width || !height)
++    return {};
+   return {2 * pixels[0] / float(width), -2 * pixels[1] / float(height)};
+ }
+ }  // namespace rex::ui::d3d12
+diff --git a/include/rex/ui/d3d12/ssx_scene_color.h b/include/rex/ui/d3d12/ssx_scene_color.h
+index cc2fe28..fa6a32e 100644
+--- a/include/rex/ui/d3d12/ssx_scene_color.h
++++ b/include/rex/ui/d3d12/ssx_scene_color.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include <rex/ui/d3d12/guest_frame_inputs.h>
++#include <rex/ui/d3d12/ssx_temporal_alignment.h>
+ 
+ namespace rex::ui::d3d12 {
+ class D3D12Provider;
+@@ -11,8 +12,7 @@ struct SsxColorConstants {
+ static_assert(sizeof(SsxColorConstants) == 48);
+ // Reject unknown fetch semantics. Does not assert anything about GPU texel
+ // values.
+-bool PlanSsxSceneColor(const SsxFrameInputs& frame,
+-                       SsxColorConstants& constants);
++bool PlanSsxSceneColor(const SsxFrameInputs& frame, SsxColorConstants& constants);
+ 
+ // Separate decoded inputs. The original guest tone map and presentation remain.
+ // Triple buffered, paint-thread owner, resources/input references retained to
+@@ -20,24 +20,23 @@ bool PlanSsxSceneColor(const SsxFrameInputs& frame,
+ class SsxSceneColor {
+  public:
+   struct Result {
+-    ID3D12Resource* color =
+-        nullptr;  // R16G16B16A16_FLOAT, pre-tone/pre-exposure.
+-    ID3D12Resource* exposure =
+-        nullptr;  // 1x1 R32_FLOAT; 0 means invalid/nonuniform.
+-    ID3D12Resource* diagnostics =
+-        nullptr;  // float4[0]: exposure min/max/value/valid.
++    ID3D12Resource* color = nullptr;        // R16G16B16A16_FLOAT, pre-tone/pre-exposure.
++    ID3D12Resource* exposure = nullptr;     // 1x1 R32_FLOAT; 0 means invalid/nonuniform.
++    ID3D12Resource* diagnostics = nullptr;  // float4[0]: exposure min/max/value/valid.
+     bool dispatched = false, repeated = false;
++    // Explicitly never tag the diagnostic guest exposure texture for DLSS.
++    SsxReconstructionColorPolicy reconstruction_color;
++    SsxAlignmentStatus alignment = SsxAlignmentStatus::kMissing;
+     // No DLSS-ready assertion: sampled color diagnostics cannot prove full
+     // validity.
+   };
+   Result Record(const D3D12Provider& provider, ID3D12GraphicsCommandList* list,
+-                const std::shared_ptr<const SsxFrameInputs>& frame,
+-                uint64_t submission, uint64_t completed);
++                const std::shared_ptr<const SsxFrameInputs>& frame, uint64_t submission,
++                uint64_t completed);
+ 
+  private:
+   struct Slot {
+-    Microsoft::WRL::ComPtr<ID3D12Resource> color, exposure, diagnostics,
+-        readback;
++    Microsoft::WRL::ComPtr<ID3D12Resource> color, exposure, diagnostics, readback;
+     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;
+     std::shared_ptr<const SsxFrameInputs> input;
+     uint64_t submission = 0, frame = 0;
+@@ -45,8 +44,7 @@ class SsxSceneColor {
+     bool pending = false;
+   };
+   bool Initialize(const D3D12Provider& provider);
+-  bool Prepare(const D3D12Provider& provider, Slot& slot, uint32_t width,
+-               uint32_t height);
++  bool Prepare(const D3D12Provider& provider, Slot& slot, uint32_t width, uint32_t height);
+   void ReadDiagnostics(Slot& slot);
+   std::array<Slot, 3> slots_;
+   Microsoft::WRL::ComPtr<ID3D12RootSignature> root_;
+diff --git a/include/rex/ui/d3d12/ssx_temporal_alignment.h b/include/rex/ui/d3d12/ssx_temporal_alignment.h
+new file mode 100644
+index 0000000..bec8123
+--- /dev/null
++++ b/include/rex/ui/d3d12/ssx_temporal_alignment.h
+@@ -0,0 +1,79 @@
++#pragma once
++#include <rex/ui/d3d12/guest_frame_inputs.h>
++
++namespace rex::ui::d3d12 {
++enum class SsxAlignmentStatus {
++  kCompatible,
++  kMissing,
++  kCamera,
++  kPassOrder,
++  kExtent,
++  kDepthView,
++  kJitterCoverage
++};
++inline const char* SsxAlignmentName(SsxAlignmentStatus status) {
++  switch (status) {
++    case SsxAlignmentStatus::kCompatible:
++      return "compatible_metadata";
++    case SsxAlignmentStatus::kMissing:
++      return "missing_or_ambiguous";
++    case SsxAlignmentStatus::kCamera:
++      return "camera_or_origin";
++    case SsxAlignmentStatus::kPassOrder:
++      return "depth_not_before_lighting";
++    case SsxAlignmentStatus::kExtent:
++      return "extent_or_subresource";
++    case SsxAlignmentStatus::kDepthView:
++      return "unsupported_depth_view";
++    case SsxAlignmentStatus::kJitterCoverage:
++      return "unknown_scene_draws";
++  }
++  return "unknown";
++}
++// Structural gate, deliberately not a proof of pixelwise alignment or all-game
++// coverage. Exact copies have origin (0,0), and the consumer must use Load at
++// the same integer texel in color/depth/motion; no output-size resampling here.
++inline SsxAlignmentStatus CheckSsxTemporalAlignment(const SsxFrameInputs& frame) {
++  const auto& f = frame.metadata;
++  const auto& c = frame.textures[size_t(SsxInput::kEncodedColor)];
++  const auto& d = frame.textures[size_t(SsxInput::kResolvedDepth)];
++  if ((f.captured_mask & 3) != 3 || ((f.failed_mask | f.duplicate_mask) & 3) || !c.resource ||
++      !d.resource)
++    return SsxAlignmentStatus::kMissing;
++  if (!f.camera_samples || f.camera_conflict || !f.camera_viewport_valid ||
++      !IsKnownSsxScene(f.scene_width, f.scene_height) ||
++      f.guest_viewport_xy[0] != .5f * f.scene_width ||
++      f.guest_viewport_xy[1] != -.5f * f.scene_height ||
++      f.guest_viewport_xy[2] != .5f * f.scene_width ||
++      f.guest_viewport_xy[3] != .5f * f.scene_height ||
++      f.guest_viewport_z != std::array<float, 2>{-1, 1})
++    return SsxAlignmentStatus::kCamera;
++  if (!f.depth_before_lighting || !f.depth_draw || f.depth_draw >= f.color_draw)
++    return SsxAlignmentStatus::kPassOrder;
++  if (!f.scale_x || !f.scale_y || c.source_mip || d.source_mip ||
++      c.width != uint64_t(f.scene_width) * f.scale_x ||
++      c.height != uint64_t(f.scene_height) * f.scale_y || c.width != d.width ||
++      c.height != d.height)
++    return SsxAlignmentStatus::kExtent;
++  if (d.view_format != DXGI_FORMAT_R32_FLOAT || d.host_swizzle || d.swizzled_signs ||
++      (d.guest_fetch[3] & (63u << 13)))
++    return SsxAlignmentStatus::kDepthView;
++  if (f.jitter_enabled && (!f.jittered_draws || f.jitter_unknown_before_color))
++    return SsxAlignmentStatus::kJitterCoverage;
++  for (float v : f.jitter_pixels)
++    if (!std::isfinite(v) || std::abs(v) > .5f || (!f.jitter_enabled && v != 0))
++      return SsxAlignmentStatus::kJitterCoverage;
++  return SsxAlignmentStatus::kCompatible;
++}
++
++// Decoded color is submitted in its native linear units, before this host path
++// applies any exposure. DLSS meters that input itself; SSX's spatial exposure
++// is retained for SSX tone mapping, never advertised as a 1x1 DLSS texture.
++struct SsxReconstructionColorPolicy {
++  static constexpr bool hdr_linear = true;
++  static constexpr bool automatic_exposure = true;
++  static constexpr float pre_exposure = 1.0f;
++  static constexpr float exposure_scale = 1.0f;
++  static ID3D12Resource* ExposureTag() { return nullptr; }
++};
++}  // namespace rex::ui::d3d12
+diff --git a/include/rex/ui/d3d12/streamline.h b/include/rex/ui/d3d12/streamline.h
+index db772da..8237ed9 100644
+--- a/include/rex/ui/d3d12/streamline.h
++++ b/include/rex/ui/d3d12/streamline.h
+@@ -49,6 +49,10 @@ class Streamline {
+   bool GetOptimalSettings(Quality quality, uint32_t output_width, uint32_t output_height,
+                           OptimalSettings& settings);
+ 
++  // Configure the SSX decoded-linear input contract. Does not tag/evaluate a
++  // frame; callers must supply validated inputs and matching frame tokens.
++  bool ConfigureSsxSR(Quality quality, uint32_t output_width, uint32_t output_height);
++
+   // Caller must first drain GPU work. Shut down before releasing the device and
+   // factory; destroy this object only AFTER releasing every Streamline COM proxy.
+   void Shutdown();
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index 37d6e29..f0dd718 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -64,6 +64,7 @@ if(REXGLUE_USE_D3D12)
+     # DXBC shader translation (required for D3D12)
+     set(REXGPU_XENOS_DXBC_SOURCES
+         pipeline/shader/dxbc.cpp
++        pipeline/shader/ssx_analysis.cpp
+         pipeline/shader/dxbc_translator.cpp
+         pipeline/shader/dxbc_translator_alu.cpp
+         pipeline/shader/dxbc_translator_fetch.cpp
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index e6e4606..bfdb52c 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -2582,6 +2582,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   DxbcShaderTranslator::Modification vertex_shader_modification =
+       pipeline_cache_->GetCurrentVertexShaderModification(
+           *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask);
++  // Keep fallback and unrelated titles on the original shader translation.
++  vertex_shader_modification.vertex.ssx_clip_jitter =
++      SsxJitterTranslationEnabled();
+   DxbcShaderTranslator::Modification pixel_shader_modification =
+       pixel_shader
+           ? pipeline_cache_->GetCurrentPixelShaderModification(
+@@ -2700,7 +2703,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   scissor.extent[1] *= draw_resolution_scale_y;
+ 
+   // Apply after the viewport cache so repeated draws never accumulate jitter.
+-  ApplySsxJitter(vertex_shader->ucode_data_hash(), viewport_info);
++  ApplySsxJitter(*vertex_shader,
++                 pixel_shader ? pixel_shader->ucode_data_hash() : 0, viewport_info);
+ 
+   // Update viewport, scissor, blend factor and stencil reference.
+   UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control);
+@@ -4455,6 +4459,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
+             float_constants,
+             &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) + (float_constant_index << 2)],
+             4 * sizeof(float));
++        PatchSsxFloatConstant(true, (i << 6) + float_constant_index, float_constants);
+         float_constants += 4 * sizeof(float);
+       }
+     }
+@@ -4481,6 +4486,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
+               float_constants,
+               &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8) + (float_constant_index << 2)],
+               4 * sizeof(float));
++          PatchSsxFloatConstant(false, (i << 6) + float_constant_index, float_constants);
+           float_constants += 4 * sizeof(float);
+         }
+       }
+diff --git a/src/graphics/d3d12/ssx_frame_inputs.cpp b/src/graphics/d3d12/ssx_frame_inputs.cpp
+index 1292b75..e9e9a27 100644
+--- a/src/graphics/d3d12/ssx_frame_inputs.cpp
++++ b/src/graphics/d3d12/ssx_frame_inputs.cpp
+@@ -12,37 +12,112 @@ REXCVAR_DEFINE_BOOL(d3d12_ssx_frame_inputs, false, "GPU/D3D12",
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ REXCVAR_DEFINE_BOOL(d3d12_ssx_jitter, false, "GPU/D3D12",
+-    "Experimental SSX camera/rider raster jitter; incomplete scene coverage, no temporal reconstruction")
++                    "Experimental SSX camera/rider raster jitter; incomplete scene coverage, no "
++                    "temporal reconstruction")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ namespace rex::graphics::d3d12 {
+-void D3D12CommandProcessor::ApplySsxJitter(uint64_t vs, draw_util::ViewportInfo& viewport) {
+-  if (!REXCVAR_GET(d3d12_ssx_jitter) || !REXCVAR_GET(d3d12_ssx_frame_inputs) ||
+-      ssx_title_id_ != 0x4541096D) return;
+-  if (ssx_jitter_frame_ != frame_current_) {
+-    ssx_jitter_frame_ = frame_current_;
+-    ssx_jittered_draws_ = ssx_jitter_skipped_draws_ = 0;
+-  }
+-  const auto sx = texture_cache_->draw_resolution_scale_x();
+-  const auto sy = texture_cache_->draw_resolution_scale_y();
+-  if (!sx || !sy || viewport.xy_offset[0] || viewport.xy_offset[1] ||
+-      viewport.xy_extent[0] % sx || viewport.xy_extent[1] % sy ||
+-      !ui::d3d12::IsKnownSsxScene(viewport.xy_extent[0] / sx, viewport.xy_extent[1] / sy)) return;
+-  const auto& regs = *register_file_;
+-  const auto clip = regs.Get<reg::PA_CL_CLIP_CNTL>();
+-  if ((regs.Get<reg::PA_CL_VTE_CNTL>().value & 0x73F) != 0x43F ||
+-      clip.clip_disable || !clip.dx_clip_space_def ||
+-      regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE) != -1 ||
+-      regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET) != 1) return;
+-  if (!ui::d3d12::IsSsxJitterShader(vs)) {
+-    ++ssx_jitter_skipped_draws_;
+-    return;  // Fullscreen/HUD/unknown shaders never guessed to be scene geometry.
++bool D3D12CommandProcessor::SsxJitterTranslationEnabled() const {
++  return ssx_title_id_ == 0x4541096D && REXCVAR_GET(d3d12_ssx_frame_inputs) &&
++         REXCVAR_GET(d3d12_ssx_jitter);
++}
++void D3D12CommandProcessor::ApplySsxJitter(const D3D12Shader& shader, uint64_t ps,
++                                           draw_util::ViewportInfo& viewport) {
++  using namespace ui::d3d12;
++  const auto vs = shader.ucode_data_hash();
++  const auto old_ndc = ssx_draw_jitter_ndc_;
++  const bool old_vs = ssx_inverse_vertex_, old_ps = ssx_inverse_pixel_;
++  ssx_draw_jitter_ndc_ = {};
++  ssx_inverse_vertex_ = ssx_inverse_pixel_ = false;
++  std::array<float, 2> clip_jitter{};
++  [&] {
++    if (!REXCVAR_GET(d3d12_ssx_frame_inputs) || ssx_title_id_ != 0x4541096D)
++      return;
++    if (ssx_jitter_frame_ != frame_current_) {
++      ssx_jitter_frame_ = frame_current_;
++      ssx_jittered_draws_ = ssx_jitter_skipped_draws_ = 0;
++      ssx_scene_draw_ = ssx_jitter_unknown_ = ssx_jitter_fixed_ = ssx_jitter_inverse_ = 0;
++      ssx_jitter_unknown_shaders_ = {};
++    }
++    ++ssx_scene_draw_;
++    if (!REXCVAR_GET(d3d12_ssx_jitter))
++      return;
++    const auto sx = texture_cache_->draw_resolution_scale_x();
++    const auto sy = texture_cache_->draw_resolution_scale_y();
++    if (!sx || !sy || viewport.xy_offset[0] || viewport.xy_offset[1] ||
++        viewport.xy_extent[0] % sx || viewport.xy_extent[1] % sy ||
++        !IsKnownSsxScene(viewport.xy_extent[0] / sx, viewport.xy_extent[1] / sy))
++      return;
++    const auto& regs = *register_file_;
++    const auto depth = regs.Get<reg::RB_DEPTH_INFO>();
++    // The other full-size depth allocation (base 1440) is an auxiliary pass,
++    // not the scene. Never move shadows or copy/reduction rectangles.
++    if (depth.depth_base != 720 || depth.depth_base_bit_11 ||
++        depth.depth_format != xenos::DepthRenderTargetFormat::kD24FS8)
++      return;
++    const auto unknown = [&] {
++      ++ssx_jitter_unknown_;
++      for (auto& hash : ssx_jitter_unknown_shaders_) {
++        if (hash == vs)
++          break;
++        if (!hash) {
++          hash = vs;
++          break;
++        }
++      }
++    };
++    const auto clip = regs.Get<reg::PA_CL_CLIP_CNTL>();
++    if ((regs.Get<reg::PA_CL_VTE_CNTL>().value & 0x73F) != 0x43F || clip.clip_disable ||
++        !clip.dx_clip_space_def || regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE) != -1 ||
++        regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET) != 1 || viewport.ndc_scale[0] == 0 ||
++        viewport.ndc_scale[1] == 0) {
++      unknown();
++      return;
++    }
++    const bool raster = shader.ssx_analysis().projected || IsSsxJitterShader(vs);
++    if (!raster && !SsxFixedScreenShader(vs)) {
++      ++ssx_jitter_skipped_draws_;
++      unknown();
++      return;
++    }
++    const auto offset =
++        SsxJitterNdc(SsxJitterPixels(frame_current_), viewport.xy_extent[0], viewport.xy_extent[1]);
++    ssx_draw_jitter_ndc_ = {offset[0] / viewport.ndc_scale[0], offset[1] / viewport.ndc_scale[1]};
++    ssx_inverse_vertex_ = SsxInverseProjectionVertexShader(vs);
++    ssx_inverse_pixel_ = SsxInverseProjectionPixelShader(ps);
++    if (ssx_inverse_vertex_ || ssx_inverse_pixel_)
++      ++ssx_jitter_inverse_;
++    if (raster) {
++      viewport.ndc_offset[0] += offset[0];
++      viewport.ndc_offset[1] += offset[1];
++      clip_jitter = ssx_draw_jitter_ndc_;
++      ++ssx_jittered_draws_;
++    } else {
++      ++ssx_jitter_fixed_;
++    }
++  }();
++  // Always restore zeros on ineligible draws. Upload caches must distinguish
++  // jitter phase, corrected/uncorrected stages and identical guest CB layouts.
++  if (old_vs != ssx_inverse_vertex_ || (ssx_inverse_vertex_ && old_ndc != ssx_draw_jitter_ndc_))
++    cbuffer_binding_float_vertex_.up_to_date = false;
++  if (old_ps != ssx_inverse_pixel_ || (ssx_inverse_pixel_ && old_ndc != ssx_draw_jitter_ndc_))
++    cbuffer_binding_float_pixel_.up_to_date = false;
++  for (size_t i = 0; i < 2; ++i) {
++    if (system_constants_.ssx_clip_jitter[i] != clip_jitter[i]) {
++      system_constants_.ssx_clip_jitter[i] = clip_jitter[i];
++      cbuffer_binding_system_.up_to_date = false;
++    }
+   }
+-  const auto offset = ui::d3d12::SsxJitterNdc(ui::d3d12::SsxJitterPixels(frame_current_),
+-                                            viewport.xy_extent[0], viewport.xy_extent[1]);
+-  viewport.ndc_offset[0] += offset[0];
+-  viewport.ndc_offset[1] += offset[1];
+-  ++ssx_jittered_draws_;
++}
++
++void D3D12CommandProcessor::PatchSsxFloatConstant(bool vertex, uint32_t index,
++                                                  uint8_t* output) const {
++  if (index != 175 || !(vertex ? ssx_inverse_vertex_ : ssx_inverse_pixel_))
++    return;
++  const auto base = vertex ? XE_GPU_REG_SHADER_CONSTANT_000_X : XE_GPU_REG_SHADER_CONSTANT_256_X;
++  const auto* rows = reinterpret_cast<const float*>(&(*register_file_)[base + 172 * 4]);
++  const auto row = ui::d3d12::SsxJitterInverseRow(rows, rows + 4, rows + 12, ssx_draw_jitter_ndc_);
++  std::memcpy(output, row.data(), sizeof(row));
+ }
+ 
+ using ui::d3d12::GuestInputTexture;
+@@ -153,7 +228,8 @@ void D3D12CommandProcessor::CollectSsxFrameInputs(uint64_t vs, uint64_t ps,
+   metadata.scale_x = sx;
+   metadata.scale_y = sy;
+   metadata.jitter_enabled = REXCVAR_GET(d3d12_ssx_jitter);
+-  if (metadata.jitter_enabled) metadata.jitter_pixels = ui::d3d12::SsxJitterPixels(frame_current_);
++  if (metadata.jitter_enabled)
++    metadata.jitter_pixels = ui::d3d12::SsxJitterPixels(frame_current_);
+   const auto& regs = *register_file_;
+   if (pass == SsxPass::kWorldTransform) {
+     const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
+@@ -198,6 +274,11 @@ void D3D12CommandProcessor::CollectSsxFrameInputs(uint64_t vs, uint64_t ps,
+       metadata.guest_depth_info = regs[XE_GPU_REG_RB_DEPTH_INFO];
+     }
+   } else if (pass == SsxPass::kToneMap) {
++    metadata.color_draw = ssx_scene_draw_;
++    metadata.jitter_unknown_before_color = ssx_jitter_unknown_;
++    metadata.jitter_unknown_shaders = ssx_jitter_unknown_shaders_;
++    metadata.jitter_fixed_screen_draws = ssx_jitter_fixed_;
++    metadata.jitter_inverse_draws = ssx_jitter_inverse_;
+     CopySsxInputTexture(SsxInput::kEncodedColor, 0, DXGI_FORMAT_R16G16B16A16_FLOAT);
+     std::memcpy(metadata.tone_map_constants.data(), &regs[XE_GPU_REG_SHADER_CONSTANT_256_X],
+                 9 * 4 * sizeof(float));
+@@ -211,7 +292,13 @@ void D3D12CommandProcessor::CollectSsxFrameInputs(uint64_t vs, uint64_t ps,
+       CopySsxInputTexture(SsxInput::kLogExposure, 1, DXGI_FORMAT_R16_TYPELESS, uint32_t(lod));
+     } else
+       metadata.failed_mask |= 1u << size_t(SsxInput::kLogExposure);
+-  } else if (pass == SsxPass::kDepthReduction) {
++  } else if (pass == SsxPass::kDepthBeforeLighting) {
++    metadata.depth_draw = ssx_scene_draw_;
++    metadata.depth_before_lighting = true;
++    CopySsxInputTexture(SsxInput::kResolvedDepth, 0, DXGI_FORMAT_R32_FLOAT);
++  } else if (pass == SsxPass::kDepthReduction && !metadata.depth_before_lighting) {
++    // Legacy diagnostic fallback only; the temporal alignment plan rejects it.
++    metadata.depth_draw = ssx_scene_draw_;
+     CopySsxInputTexture(SsxInput::kResolvedDepth, 0, DXGI_FORMAT_R32_FLOAT);
+   }
+ }
+@@ -234,8 +321,22 @@ std::shared_ptr<const ui::d3d12::SsxFrameInputs> D3D12CommandProcessor::SealSsxF
+   data.jittered_draws = ssx_jitter_frame_ == frame_current_ ? ssx_jittered_draws_ : 0;
+   data.jitter_skipped_draws = ssx_jitter_frame_ == frame_current_ ? ssx_jitter_skipped_draws_ : 0;
+   if (log && data.jitter_enabled)
+-    REXGPU_INFO("SSX_JITTER frame={} pixels={},{} applied={} skipped_candidates={} coverage=partial",
+-      data.guest_frame, data.jitter_pixels[0], data.jitter_pixels[1], data.jittered_draws, data.jitter_skipped_draws);
++    REXGPU_INFO(
++        "SSX_JITTER frame={} pixels={},{} applied={} skipped_candidates={} coverage=partial",
++        data.guest_frame, data.jitter_pixels[0], data.jitter_pixels[1], data.jittered_draws,
++        data.jitter_skipped_draws);
++  if (log) {
++    REXGPU_INFO(
++        "SSX_ALIGNMENT frame={} depth_draw={} color_draw={} early_depth={} "
++        "unknown_before_color={} fixed_screen={} inverse_draws={} dlss_ready=false",
++        data.guest_frame, data.depth_draw, data.color_draw, data.depth_before_lighting,
++        data.jitter_unknown_before_color, data.jitter_fixed_screen_draws,
++        data.jitter_inverse_draws);
++    if (data.jitter_unknown_before_color)
++      for (auto hash : data.jitter_unknown_shaders)
++        if (hash)
++          REXGPU_INFO("SSX_JITTER_UNKNOWN frame={} VS={:016X}", data.guest_frame, hash);
++  }
+   data.output_width = width;
+   data.output_height = height;
+   if (log) {
+diff --git a/src/graphics/pipeline/shader/dxbc.cpp b/src/graphics/pipeline/shader/dxbc.cpp
+index 07e6010..9a02223 100644
+--- a/src/graphics/pipeline/shader/dxbc.cpp
++++ b/src/graphics/pipeline/shader/dxbc.cpp
+@@ -18,7 +18,10 @@ namespace rex::graphics {
+ DxbcShader::DxbcShader(xenos::ShaderType shader_type, uint64_t ucode_data_hash,
+                        const uint32_t* ucode_dwords, size_t ucode_dword_count,
+                        std::endian ucode_source_endian)
+-    : Shader(shader_type, ucode_data_hash, ucode_dwords, ucode_dword_count, ucode_source_endian) {}
++    : Shader(shader_type, ucode_data_hash, ucode_dwords, ucode_dword_count, ucode_source_endian) {
++  if (shader_type == xenos::ShaderType::kVertex)
++    ssx_analysis_ = AnalyzeSsxVertexShader(ucode_data());
++}
+ 
+ Shader::Translation* DxbcShader::CreateTranslationInstance(uint64_t modification) {
+   return new DxbcTranslation(*this, modification);
+diff --git a/src/graphics/pipeline/shader/dxbc_translator.cpp b/src/graphics/pipeline/shader/dxbc_translator.cpp
+index 2c31a0e..b117c76 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include "thirdparty/dxbc/DXBCChecksum.h"
+ 
++#include <rex/ui/d3d12/ssx_jitter.h>
++
+ #include <algorithm>
+ #include <atomic>
+ #include <cstring>
+@@ -1493,8 +1495,25 @@ void DxbcShaderTranslator::StoreResult(const InstructionResult& result, const dx
+     }
+   }
+   if (used_write_mask != constant_mask) {
+-    a_.OpMov(dest.Mask(used_write_mask & ~constant_mask),
+-             src.SwizzleSwizzled(src_additional_swizzle), is_clamped);
++    uint32_t copy_mask = used_write_mask & ~constant_mask;
++    const uint32_t clip_mask = is_vertex_shader() &&
++        Modification(current_translation().modification()).vertex.ssx_clip_jitter &&
++        result.storage_target == InstructionStorageTarget::kInterpolator && !is_clamped &&
++        ((static_cast<const DxbcShader&>(current_shader()).ssx_analysis().projected ?
++          static_cast<const DxbcShader&>(current_shader()).ssx_analysis().clip_interpolators :
++          ui::d3d12::SsxClipInterpolatorMask(current_shader().ucode_data_hash())) &
++         (1u << result.storage_index)) ? (copy_mask & 3u) : 0u;
++    if (clip_mask) {
++      // Follows FXC's output MAD form; never reads an output register.
++      a_.OpMAd(dest.Mask(clip_mask),
++               LoadSystemConstant(SystemConstants::Index::kSsxClipJitter,
++                                  offsetof(SystemConstants, ssx_clip_jitter), 0b0100),
++               dxbc::Src::R(system_temp_position_, dxbc::Src::kWWWW),
++               src.SwizzleSwizzled(src_additional_swizzle));
++      copy_mask &= ~clip_mask;
++    }
++    if (copy_mask)
++      a_.OpMov(dest.Mask(copy_mask), src.SwizzleSwizzled(src_additional_swizzle), is_clamped);
+   }
+   if (constant_mask) {
+     a_.OpMov(dest.Mask(constant_mask),
+@@ -1982,6 +2001,7 @@ const DxbcShaderTranslator::SystemConstantRdef DxbcShaderTranslator::system_cons
+     {"xe_edram_rt_blend_factors_ops", ShaderRdefTypeIndex::kUint4, sizeof(uint32_t) * 4},
+ 
+     {"xe_edram_blend_constant", ShaderRdefTypeIndex::kFloat4, sizeof(float) * 4},
++    {"xe_ssx_clip_jitter", ShaderRdefTypeIndex::kFloat4, sizeof(float) * 4},
+ };
+ 
+ void DxbcShaderTranslator::WriteResourceDefinition() {
+diff --git a/src/graphics/pipeline/shader/ssx_analysis.cpp b/src/graphics/pipeline/shader/ssx_analysis.cpp
+new file mode 100644
+index 0000000..b2ea550
+--- /dev/null
++++ b/src/graphics/pipeline/shader/ssx_analysis.cpp
+@@ -0,0 +1,257 @@
++#include <rex/graphics/pipeline/shader/ssx_analysis.h>
++#include <rex/graphics/pipeline/shader/shader.h>
++
++#include <array>
++#include <vector>
++
++namespace rex::graphics {
++namespace {
++// Symbolic identities track copies and overwrites, including component swizzles.
++// Projection terms only combine three input coordinates with distinct rows of
++// one audited matrix register family. Arbitrary math gets a fresh identity.
++struct Value {
++  uint32_t id = 0;
++  uint16_t constant = 0, base = 0;
++  uint8_t column = 0, rows = 0;
++  bool is_constant = false, clip_xy = false;
++  std::array<uint32_t, 3> coordinates{};
++};
++class Analyzer {
++ public:
++  SsxShaderAnalysis Run(std::span<const uint32_t> words) {
++    using namespace ucode;
++    if (words.size() < 3 || words.size() > 65536)
++      return {};
++    uint32_t bound = uint32_t(words.size() / 3);
++    for (uint32_t i = 0; i < bound; ++i) {
++      ControlFlowInstruction cf[2];
++      UnpackControlFlowInstructions(words.data() + i * 3, cf);
++      for (const auto& op : cf)
++        if (IsControlFlowOpcodeExec(op.opcode()))
++          bound = std::min(bound, op.exec.address());
++    }
++    for (auto& reg : registers_)
++      for (auto& v : reg)
++        v = Fresh();
++    VertexFetchInstruction previous{};
++    bool ended = false;
++    for (uint32_t i = 0; i < bound && !ended; ++i) {
++      ControlFlowInstruction pair[2];
++      UnpackControlFlowInstructions(words.data() + i * 3, pair);
++      for (auto& cf : pair) {
++        switch (cf.opcode()) {
++          case ControlFlowOpcode::kNop:
++          case ControlFlowOpcode::kAlloc:
++          case ControlFlowOpcode::kMarkVsFetchDone:
++            continue;
++          case ControlFlowOpcode::kExec:
++          case ControlFlowOpcode::kExecEnd:
++            break;
++          default:
++            return {};  // No guesses across branches, loops or calls.
++        }
++        ParsedExecInstruction exec;
++        ParseControlFlowExec(cf.exec, i * 2, exec);
++        if (uint64_t(exec.instruction_address + exec.instruction_count) * 3 > words.size())
++          return {};
++        auto sequence = exec.sequence;
++        for (uint32_t n = 0; n < exec.instruction_count; ++n, sequence >>= 2) {
++          auto* raw = words.data() + (exec.instruction_address + n) * 3;
++          if (sequence & 1) {
++            auto& fetch = *reinterpret_cast<const FetchInstruction*>(raw);
++            if (fetch.opcode() != FetchOpcode::kVertexFetch)
++              return {};
++            ParsedVertexFetchInstruction parsed;
++            if (ParseVertexFetchInstruction(fetch.vertex_fetch(), previous, parsed))
++              previous = fetch.vertex_fetch();
++            if (parsed.is_predicated)
++              return {};
++            std::array<Value, 4> values;
++            for (auto& v : values)
++              v = Fresh();
++            Store(parsed.result, values);
++          } else {
++            ParsedAluInstruction parsed;
++            ParseAluInstruction(*reinterpret_cast<const AluInstruction*>(raw),
++                                xenos::ShaderType::kVertex, parsed);
++            if (parsed.is_predicated)
++              return {};
++            std::array<Value, 4> vector, scalar;
++            bool any_clip = false;
++            for (uint32_t a = 0; a < parsed.vector_operand_count; ++a)
++              for (uint32_t c = 0; c < 4; ++c)
++                any_clip |= Read(parsed.vector_operands[a], c).clip_xy;
++            for (uint32_t c = 0; c < 4; ++c) {
++              const auto a = Read(parsed.vector_operands[0], c);
++              const auto b = Read(parsed.vector_operands[1], c);
++              const auto d = Read(parsed.vector_operands[2], c);
++              switch (parsed.vector_opcode) {
++                case AluVectorOpcode::kMax:
++                  vector[c] = a.id == b.id ? a : Fresh(any_clip);
++                  break;
++                case AluVectorOpcode::kMul:
++                  vector[c] = Multiply(a, b);
++                  break;
++                case AluVectorOpcode::kAdd:
++                  vector[c] = Add(a, b);
++                  break;
++                case AluVectorOpcode::kMad:
++                  vector[c] = Add(Multiply(a, b), d);
++                  break;
++                default:
++                  vector[c] = Fresh(any_clip);
++                  break;
++              }
++            }
++            bool scalar_clip = false;
++            for (uint32_t a = 0; a < parsed.scalar_operand_count; ++a)
++              for (uint32_t c = 0; c < parsed.scalar_operands[a].component_count; ++c)
++                scalar_clip |= Read(parsed.scalar_operands[a], c).clip_xy;
++            const auto scalar_value = Fresh(scalar_clip);
++            scalar.fill(scalar_value);
++            // Read both operations before either write, as the GPU does.
++            Store(parsed.vector_and_constant_result, vector);
++            Store(parsed.scalar_result, scalar);
++          }
++          if (invalid_)
++            return {};
++        }
++        if (cf.opcode() == ControlFlowOpcode::kExecEnd) {
++          ended = true;
++          break;
++        }
++      }
++    }
++    if (!ended || position_writes_ != 1)
++      return {};
++    for (uint32_t c = 0; c < 4; ++c)
++      if (position_[c].rows != 15 || position_[c].column != c ||
++          position_[c].base != position_[0].base ||
++          position_[c].coordinates != position_[0].coordinates)
++        return {};
++    SsxShaderAnalysis result{true, 0};
++    for (uint32_t i = 0; i < 16; ++i) {
++      const auto& varying = interpolators_[i];
++      const bool matches = varying[0].id == position_[0].id && varying[1].id == position_[1].id;
++      if (matches) {
++        if (interpolator_writes_[i][0] != 1 || interpolator_writes_[i][1] != 1 ||
++            before_position_[i])
++          return {};
++        result.clip_interpolators |= 1u << i;
++      } else if (varying[0].clip_xy || varying[1].clip_xy) {
++        return {};  // Scaled/projected UVs need a different correction.
++      }
++    }
++    return result;
++  }
++
++ private:
++  Value Fresh(bool clip = false) {
++    Value v;
++    v.id = ++serial_;
++    v.clip_xy = clip;
++    return v;
++  }
++  Value Read(const InstructionOperand& op, uint32_t component) {
++    if (op.storage_addressing_mode != InstructionStorageAddressingMode::kAbsolute)
++      return Fresh();
++    const auto c = uint32_t(op.GetComponent(component));
++    if (c >= 4)
++      return Fresh();
++    Value v;
++    if (op.storage_source == InstructionStorageSource::kRegister && op.storage_index < 64)
++      v = registers_[op.storage_index][c];
++    else if (op.storage_source == InstructionStorageSource::kConstantFloat &&
++             op.storage_index < 256) {
++      v.id = 0x100000u + op.storage_index * 4 + c;
++      v.is_constant = true;
++      v.constant = uint16_t(op.storage_index);
++      v.column = uint8_t(c);
++      for (uint16_t base : {156, 160, 192})
++        if (v.constant == base + 3) {
++          v.base = base;
++          v.rows = 8;
++        }
++    } else
++      return Fresh();
++    return op.is_negated || op.is_absolute_value ? Fresh(v.clip_xy) : v;
++  }
++  Value Multiply(Value a, Value b) {
++    auto v = Fresh(a.clip_xy || b.clip_xy);
++    if (!b.is_constant)
++      std::swap(a, b);
++    if (!b.is_constant)
++      return v;
++    for (uint16_t base : {156, 160, 192})
++      if (b.constant >= base && b.constant < base + 3) {
++        v.base = base;
++        v.column = b.column;
++        v.rows = uint8_t(1u << (b.constant - base));
++        v.coordinates[b.constant - base] = a.id;
++      }
++    return v;
++  }
++  Value Add(const Value& a, const Value& b) {
++    auto v = Fresh(a.clip_xy || b.clip_xy);
++    if (a.rows && b.rows && a.base == b.base && a.column == b.column && !(a.rows & b.rows)) {
++      v.base = a.base;
++      v.column = a.column;
++      v.rows = a.rows | b.rows;
++      for (uint32_t i = 0; i < 3; ++i)
++        v.coordinates[i] = a.coordinates[i] ? a.coordinates[i] : b.coordinates[i];
++      if (v.rows == 15 && v.column < 2)
++        v.clip_xy = true;
++    }
++    return v;
++  }
++  void Store(const InstructionResult& out, const std::array<Value, 4>& values) {
++    const uint32_t mask = out.GetUsedWriteMask();
++    if (!mask)
++      return;
++    if (out.storage_addressing_mode != InstructionStorageAddressingMode::kAbsolute) {
++      invalid_ = true;
++      return;
++    }
++    std::array<Value, 4>* dest = nullptr;
++    if (out.storage_target == InstructionStorageTarget::kRegister && out.storage_index < 64)
++      dest = &registers_[out.storage_index];
++    else if (out.storage_target == InstructionStorageTarget::kPosition) {
++      if (mask != 15 || out.is_clamped) {
++        invalid_ = true;
++        return;
++      }
++      ++position_writes_;
++      dest = &position_;
++    } else if (out.storage_target == InstructionStorageTarget::kInterpolator &&
++               out.storage_index < 16) {
++      dest = &interpolators_[out.storage_index];
++      for (uint32_t c = 0; c < 2; ++c)
++        if (mask & (1u << c))
++          ++interpolator_writes_[out.storage_index][c];
++      if (!position_writes_)
++        before_position_[out.storage_index] = true;
++    } else {
++      invalid_ = true;
++      return;
++    }
++    for (uint32_t c = 0; c < 4; ++c)
++      if (mask & (1u << c)) {
++        auto source = uint32_t(out.components[c]);
++        (*dest)[c] = source < 4 ? values[source] : Fresh();
++        if (out.is_clamped)
++          (*dest)[c] = Fresh((*dest)[c].clip_xy);
++      }
++  }
++  uint32_t serial_ = 0, position_writes_ = 0;
++  bool invalid_ = false;
++  std::array<std::array<Value, 4>, 64> registers_{};
++  std::array<Value, 4> position_{};
++  std::array<std::array<Value, 4>, 16> interpolators_{};
++  std::array<std::array<uint32_t, 2>, 16> interpolator_writes_{};
++  std::array<bool, 16> before_position_{};
++};
++}  // namespace
++SsxShaderAnalysis AnalyzeSsxVertexShader(std::span<const uint32_t> words) {
++  return Analyzer().Run(words);
++}
++}  // namespace rex::graphics
+diff --git a/src/ui/d3d12/ssx_native_motion.cpp b/src/ui/d3d12/ssx_native_motion.cpp
+index af4b3a7..9ba0a63 100644
+--- a/src/ui/d3d12/ssx_native_motion.cpp
++++ b/src/ui/d3d12/ssx_native_motion.cpp
+@@ -304,6 +304,9 @@ void SsxNativeMotion::ReadCapture(uint64_t completed) {
+       json << ",\"jitter_enabled\":" << (m.jitter_enabled ? "true" : "false")
+            << ",\"jitter_pixels\":";
+       array(m.jitter_pixels);
++      json << ",\"depth_before_lighting\":" << (m.depth_before_lighting ? "true":"false")
++           << ",\"depth_draw\":" << m.depth_draw << ",\"color_draw\":" << m.color_draw
++           << ",\"jitter_unknown_before_color\":" << m.jitter_unknown_before_color;
+       json << ",\"draws\":[";
+       for (uint32_t i = 0; i < input.geometry.count; ++i) {
+         const auto& d = input.geometry.draws[i];
+diff --git a/src/ui/d3d12/ssx_scene_color.cpp b/src/ui/d3d12/ssx_scene_color.cpp
+index 93290b3..1eaa884 100644
+--- a/src/ui/d3d12/ssx_scene_color.cpp
++++ b/src/ui/d3d12/ssx_scene_color.cpp
+@@ -13,23 +13,21 @@ void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
+                 D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+   D3D12_RESOURCE_BARRIER b{};
+   b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+-  b.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before,
+-                  after};
++  b.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
+   list->ResourceBarrier(1, &b);
+ }
+-bool Resource(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc,
+-              bool readback, D3D12_RESOURCE_STATES state,
+-              ComPtr<ID3D12Resource>& result) {
++bool Resource(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc, bool readback,
++              D3D12_RESOURCE_STATES state, ComPtr<ID3D12Resource>& result) {
+   D3D12_HEAP_PROPERTIES heap{};
+   heap.Type = readback ? D3D12_HEAP_TYPE_READBACK : D3D12_HEAP_TYPE_DEFAULT;
+-  return SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
+-                                                   &desc, state, nullptr,
+-                                                   IID_PPV_ARGS(&result)));
++  return SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state,
++                                                   nullptr, IID_PPV_ARGS(&result)));
+ }
+ 
+ float FetchScale(uint32_t word) {
+   int e = int((word >> 13) & 63);
+-  if (e & 32) e -= 64;
++  if (e & 32)
++    e -= 64;
+   return std::ldexp(1.0f, e);
+ }
+ }  // namespace
+@@ -38,46 +36,50 @@ bool PlanSsxSceneColor(const SsxFrameInputs& frame, SsxColorConstants& k) {
+   const auto& f = frame.metadata;
+   const auto& color = frame.textures[size_t(SsxInput::kEncodedColor)];
+   const auto& exposure = frame.textures[size_t(SsxInput::kLogExposure)];
+-  const uint32_t needed = f.exposure_branch ? 5 : 1;
+-  if ((f.captured_mask & needed) != needed ||
+-      ((f.failed_mask | f.duplicate_mask) & needed) || !f.scale_x ||
+-      !f.scale_y || !color.resource ||
++  const uint32_t needed = 1;
++  if ((f.captured_mask & needed) != needed || ((f.failed_mask | f.duplicate_mask) & needed) ||
++      !f.scale_x || !f.scale_y || !color.resource ||
+       color.view_format != DXGI_FORMAT_R16G16B16A16_FLOAT || color.source_mip ||
+       color.width != uint64_t(f.scene_width) * f.scale_x ||
+-      color.height != uint64_t(f.scene_height) * f.scale_y || !color.width ||
+-      !color.height || color.host_swizzle != 0x688 ||
+-      color.swizzled_signs != 0x55)
++      color.height != uint64_t(f.scene_height) * f.scale_y || !color.width || !color.height ||
++      color.host_swizzle != 0x688 || color.swizzled_signs != 0x55)
+     return false;
+   k.width = color.width;
+   k.height = color.height;
+   k.color_scale = FetchScale(color.guest_fetch[3]);
+   k.exposure_enabled = f.exposure_branch;
+-  if (!f.exposure_branch) return true;
++  if (!f.exposure_branch)
++    return true;
+   const float lod = f.tone_map_constants[4];
+   // Only the observed scalar unsigned R16 view, no bias/gamma/sign conversion.
+   // Source mip must be the explicit integer LOD. Fractional LOD or fetch LOD
+   // bias would need both mips; reject instead of silently decoding the wrong
+   // one.
+-  if (!exposure.resource || exposure.view_format != DXGI_FORMAT_R16_UNORM ||
+-      exposure.host_swizzle != 0xA00 || exposure.swizzled_signs ||
+-      !exposure.width || exposure.width > 8 || !exposure.height ||
+-      exposure.height > 8 || !std::isfinite(lod) || lod < 0 || lod > 15 ||
+-      std::floor(lod) != lod || exposure.source_mip != uint32_t(lod) ||
++  if ((f.captured_mask & 4) != 4 || ((f.failed_mask | f.duplicate_mask) & 4) ||
++      !exposure.resource || exposure.view_format != DXGI_FORMAT_R16_UNORM ||
++      exposure.host_swizzle != 0xA00 || exposure.swizzled_signs || !exposure.width ||
++      exposure.width > 8 || !exposure.height || exposure.height > 8 || !std::isfinite(lod) ||
++      lod < 0 || lod > 15 || std::floor(lod) != lod || exposure.source_mip != uint32_t(lod) ||
+       ((exposure.guest_fetch[4] >> 12) & 1023) ||
+       ((exposure.guest_fetch[4] >> 2) & 15) > uint32_t(lod) ||
+-      ((exposure.guest_fetch[4] >> 6) & 15) < uint32_t(lod))
+-    return false;
++      ((exposure.guest_fetch[4] >> 6) & 15) < uint32_t(lod)) {
++    k.exposure_enabled = 2;  // Unknown guest exposure, still decode valid color.
++    return true;
++  }
+   k.exposure_width = exposure.width;
+   k.exposure_height = exposure.height;
+   k.exposure_scale = FetchScale(exposure.guest_fetch[3]);
+   k.exposure_key = f.tone_map_constants[0];
+   k.log_scale = f.tone_map_constants[36];
+-  return std::isfinite(k.exposure_key) && k.exposure_key > 0 &&
+-         std::isfinite(k.log_scale);
++  if (!std::isfinite(k.exposure_key) || k.exposure_key <= 0 || !std::isfinite(k.log_scale))
++    k.exposure_enabled = 2;
++  return true;
+ }
+ bool SsxSceneColor::Initialize(const D3D12Provider& provider) {
+-  if (pipeline_) return true;
+-  if (unavailable_) return false;
++  if (pipeline_)
++    return true;
++  if (unavailable_)
++    return false;
+   unavailable_ = true;
+   D3D12_DESCRIPTOR_RANGE ranges[2]{};
+   ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0};
+@@ -91,19 +93,20 @@ bool SsxSceneColor::Initialize(const D3D12Provider& provider) {
+   desc.NumParameters = 2;
+   desc.pParameters = params;
+   root_.Attach(util::CreateRootSignature(provider, desc));
+-  if (!root_) return false;
+-  pipeline_.Attach(
+-      util::CreateComputePipeline(provider.GetDevice(), ssx_scene_color_cs,
+-                                  sizeof(ssx_scene_color_cs), root_.Get()));
+-  if (!pipeline_) return false;
+-  pipeline_->SetName(
+-      L"SSX scene decode before exposure and tone map (experimental)");
++  if (!root_)
++    return false;
++  pipeline_.Attach(util::CreateComputePipeline(provider.GetDevice(), ssx_scene_color_cs,
++                                               sizeof(ssx_scene_color_cs), root_.Get()));
++  if (!pipeline_)
++    return false;
++  pipeline_->SetName(L"SSX scene decode before exposure and tone map (experimental)");
+   unavailable_ = false;
+   return true;
+ }
+-bool SsxSceneColor::Prepare(const D3D12Provider& provider, Slot& slot,
+-                            uint32_t width, uint32_t height) {
+-  if (slot.color && slot.width == width && slot.height == height) return true;
++bool SsxSceneColor::Prepare(const D3D12Provider& provider, Slot& slot, uint32_t width,
++                            uint32_t height) {
++  if (slot.color && slot.width == width && slot.height == height)
++    return true;
+   Slot replacement;
+   auto* device = provider.GetDevice();
+   D3D12_RESOURCE_DESC d{};
+@@ -113,13 +116,11 @@ bool SsxSceneColor::Prepare(const D3D12Provider& provider, Slot& slot,
+   d.DepthOrArraySize = d.MipLevels = d.SampleDesc.Count = 1;
+   d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+   d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+-  if (!Resource(device, d, false, GuestInputTexture::kReadState,
+-                replacement.color))
++  if (!Resource(device, d, false, GuestInputTexture::kReadState, replacement.color))
+     return false;
+   d.Width = d.Height = 1;
+   d.Format = DXGI_FORMAT_R32_FLOAT;
+-  if (!Resource(device, d, false, GuestInputTexture::kReadState,
+-                replacement.exposure))
++  if (!Resource(device, d, false, GuestInputTexture::kReadState, replacement.exposure))
+     return false;
+   replacement.samples = 1 + ((width + 31) / 32) * ((height + 31) / 32);
+   d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+@@ -127,19 +128,16 @@ bool SsxSceneColor::Prepare(const D3D12Provider& provider, Slot& slot,
+   d.Height = 1;
+   d.Format = DXGI_FORMAT_UNKNOWN;
+   d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+-  if (!Resource(device, d, false, GuestInputTexture::kReadState,
+-                replacement.diagnostics))
++  if (!Resource(device, d, false, GuestInputTexture::kReadState, replacement.diagnostics))
+     return false;
+   d.Flags = D3D12_RESOURCE_FLAG_NONE;
+-  if (!Resource(device, d, true, D3D12_RESOURCE_STATE_COPY_DEST,
+-                replacement.readback))
++  if (!Resource(device, d, true, D3D12_RESOURCE_STATE_COPY_DEST, replacement.readback))
+     return false;
+   D3D12_DESCRIPTOR_HEAP_DESC heap{};
+   heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+   heap.NumDescriptors = 5;
+   heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+-  if (FAILED(
+-          device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&replacement.heap))))
++  if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&replacement.heap))))
+     return false;
+   replacement.width = width;
+   replacement.height = height;
+@@ -149,7 +147,8 @@ bool SsxSceneColor::Prepare(const D3D12Provider& provider, Slot& slot,
+   return true;
+ }
+ void SsxSceneColor::ReadDiagnostics(Slot& slot) {
+-  if (!slot.pending) return;
++  if (!slot.pending)
++    return;
+   slot.pending = false;
+   float* values = nullptr;
+   D3D12_RANGE range{0, size_t(slot.samples) * 16};
+@@ -165,22 +164,24 @@ void SsxSceneColor::ReadDiagnostics(Slot& slot) {
+     }
+     const auto v = std::max({p[0], p[1], p[2]});
+     peak = std::max(peak, v);
+-    if (v > 1) ++highlights;
++    if (v > 1)
++      ++highlights;
+   }
+   REXGPU_INFO(
+       "SSX_COLOR_GPU frame={} size={}x{} samples={} invalid={} above_one={} "
+       "peak={} "
+       "exposure_min={} exposure_max={} scalar={} scalar_valid={} "
+-      "pre_tone_map=true dlss_ready=false",
+-      slot.frame, slot.width, slot.height, slot.samples - 1, invalid,
+-      highlights, peak, values[0], values[1], values[2], values[3] != 0);
++      "pre_tone_map=true dlss_exposure=auto pre_exposure=1 alignment={} dlss_ready=false",
++      slot.frame, slot.width, slot.height, slot.samples - 1, invalid, highlights, peak, values[0],
++      values[1], values[2], values[3] != 0,
++      slot.input ? SsxAlignmentName(CheckSsxTemporalAlignment(*slot.input)) : "missing");
+   D3D12_RANGE empty{0, 0};
+   slot.readback->Unmap(0, &empty);
+ }
+-SsxSceneColor::Result SsxSceneColor::Record(
+-    const D3D12Provider& provider, ID3D12GraphicsCommandList* list,
+-    const std::shared_ptr<const SsxFrameInputs>& frame, uint64_t submission,
+-    uint64_t completed) {
++SsxSceneColor::Result SsxSceneColor::Record(const D3D12Provider& provider,
++                                            ID3D12GraphicsCommandList* list,
++                                            const std::shared_ptr<const SsxFrameInputs>& frame,
++                                            uint64_t submission, uint64_t completed) {
+   for (auto& slot : slots_)
+     if (slot.submission <= completed) {
+       ReadDiagnostics(slot);
+@@ -191,13 +192,17 @@ SsxSceneColor::Result SsxSceneColor::Record(
+     last_slot_ = -1;
+     return {};
+   }
+-  if (last_slot_ >= 0 &&
+-      slots_[last_slot_].frame == frame->metadata.guest_frame) {
++  if (last_slot_ >= 0 && slots_[last_slot_].frame == frame->metadata.guest_frame) {
+     auto& slot = slots_[last_slot_];
+     slot.submission = submission;
+     slot.input = frame;
+-    return {slot.color.Get(), slot.exposure.Get(), slot.diagnostics.Get(),
+-            false, true};
++    return {slot.color.Get(),
++            slot.exposure.Get(),
++            slot.diagnostics.Get(),
++            false,
++            true,
++            {},
++            CheckSsxTemporalAlignment(*frame)};
+   }
+   int chosen = -1;
+   for (int i = 0; i < int(slots_.size()); ++i)
+@@ -216,20 +221,18 @@ SsxSceneColor::Result SsxSceneColor::Record(
+   }
+   auto* device = provider.GetDevice();
+   auto handle = slot.heap->GetCPUDescriptorHandleForHeapStart();
+-  const auto increment = device->GetDescriptorHandleIncrementSize(
+-      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++  const auto increment =
++      device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+   D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+   srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+   srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+   srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+   srv.Texture2D.MipLevels = 1;
+-  device->CreateShaderResourceView(frame->textures[0].resource.Get(), &srv,
+-                                   handle);
++  device->CreateShaderResourceView(frame->textures[0].resource.Get(), &srv, handle);
+   handle.ptr += increment;
+   srv.Format = DXGI_FORMAT_R16_UNORM;
+   device->CreateShaderResourceView(
+-      k.exposure_enabled ? frame->textures[2].resource.Get() : nullptr, &srv,
+-      handle);
++      k.exposure_enabled == 1 ? frame->textures[2].resource.Get() : nullptr, &srv, handle);
+   handle.ptr += increment;
+   D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+   uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+@@ -243,10 +246,8 @@ SsxSceneColor::Result SsxSceneColor::Record(
+   uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+   uav.Buffer.NumElements = slot.samples;
+   uav.Buffer.StructureByteStride = 16;
+-  device->CreateUnorderedAccessView(slot.diagnostics.Get(), nullptr, &uav,
+-                                    handle);
+-  for (auto* resource :
+-       {slot.color.Get(), slot.exposure.Get(), slot.diagnostics.Get()})
++  device->CreateUnorderedAccessView(slot.diagnostics.Get(), nullptr, &uav, handle);
++  for (auto* resource : {slot.color.Get(), slot.exposure.Get(), slot.diagnostics.Get()})
+     Transition(list, resource, GuestInputTexture::kReadState,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+   auto* heap = slot.heap.Get();
+@@ -254,18 +255,15 @@ SsxSceneColor::Result SsxSceneColor::Record(
+   list->SetComputeRootSignature(root_.Get());
+   list->SetPipelineState(pipeline_.Get());
+   list->SetComputeRoot32BitConstants(0, sizeof(k) / 4, &k, 0);
+-  list->SetComputeRootDescriptorTable(
+-      1, heap->GetGPUDescriptorHandleForHeapStart());
++  list->SetComputeRootDescriptorTable(1, heap->GetGPUDescriptorHandleForHeapStart());
+   list->Dispatch((k.width + 7) / 8, (k.height + 7) / 8, 1);
+-  for (auto* resource :
+-       {slot.color.Get(), slot.exposure.Get(), slot.diagnostics.Get()})
++  for (auto* resource : {slot.color.Get(), slot.exposure.Get(), slot.diagnostics.Get()})
+     Transition(list, resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                GuestInputTexture::kReadState);
+   slot.input = frame;
+   slot.submission = submission;
+   slot.frame = frame->metadata.guest_frame;
+-  if (!last_log_frame_ || slot.frame < last_log_frame_ ||
+-      slot.frame - last_log_frame_ >= 120) {
++  if (!last_log_frame_ || slot.frame < last_log_frame_ || slot.frame - last_log_frame_ >= 120) {
+     Transition(list, slot.diagnostics.Get(), GuestInputTexture::kReadState,
+                D3D12_RESOURCE_STATE_COPY_SOURCE);
+     list->CopyBufferRegion(slot.readback.Get(), 0, slot.diagnostics.Get(), 0,
+@@ -276,7 +274,12 @@ SsxSceneColor::Result SsxSceneColor::Record(
+     last_log_frame_ = slot.frame;
+   }
+   last_slot_ = chosen;
+-  return {slot.color.Get(), slot.exposure.Get(), slot.diagnostics.Get(), true,
+-          false};
++  return {slot.color.Get(),
++          slot.exposure.Get(),
++          slot.diagnostics.Get(),
++          true,
++          false,
++          {},
++          CheckSsxTemporalAlignment(*frame)};
+ }
+ }  // namespace rex::ui::d3d12
+diff --git a/src/ui/d3d12/streamline.cpp b/src/ui/d3d12/streamline.cpp
+index 9c7a1a0..1cbce7a 100644
+--- a/src/ui/d3d12/streamline.cpp
++++ b/src/ui/d3d12/streamline.cpp
+@@ -1,4 +1,5 @@
+ #include <rex/ui/d3d12/streamline.h>
++#include <rex/ui/d3d12/ssx_temporal_alignment.h>
+ 
+ #include <bit>
+ #include <utility>
+@@ -38,6 +39,35 @@ bool Check(sl::Result result, const char* operation) {
+   REXGPU_WARN("Streamline {} failed: {}", operation, sl::getResultAsStr(result));
+   return false;
+ }
++sl::DLSSOptions SsxOptions(Streamline::Quality quality, uint32_t width, uint32_t height) {
++  sl::DLSSOptions options{};
++  switch (quality) {
++    case Streamline::Quality::kQuality:
++      options.mode = sl::DLSSMode::eMaxQuality;
++      break;
++    case Streamline::Quality::kBalanced:
++      options.mode = sl::DLSSMode::eBalanced;
++      break;
++    case Streamline::Quality::kPerformance:
++      options.mode = sl::DLSSMode::eMaxPerformance;
++      break;
++    case Streamline::Quality::kUltraPerformance:
++      options.mode = sl::DLSSMode::eUltraPerformance;
++      break;
++    case Streamline::Quality::kDLAA:
++      options.mode = sl::DLSSMode::eDLAA;
++      break;
++    default:
++      return {};
++  }
++  options.outputWidth = width;
++  options.outputHeight = height;
++  options.colorBuffersHDR = sl::Boolean::eTrue;
++  options.useAutoExposure = sl::Boolean::eTrue;
++  options.preExposure = SsxReconstructionColorPolicy::pre_exposure;
++  options.exposureScale = SsxReconstructionColorPolicy::exposure_scale;
++  return options;
++}
+ }  // namespace
+ 
+ struct Streamline::Impl {
+@@ -51,6 +81,7 @@ struct Streamline::Impl {
+   PFun_slIsFeatureSupported* is_supported = nullptr;
+   PFun_slGetFeatureFunction* get_function = nullptr;
+   PFun_slDLSSGetOptimalSettings* optimal = nullptr;
++  PFun_slDLSSSetOptions* sr_options = nullptr;
+   PFun_slDLSSGGetState* fg_state = nullptr;
+   PFun_slDLSSGSetOptions* fg_options = nullptr;
+   PFun_slReflexGetState* reflex_state = nullptr;
+@@ -180,7 +211,8 @@ bool Streamline::Attach(ID3D12Device*& device, IDXGIFactory2*& factory) {
+   }
+ 
+   if (support_.sr &&
+-      !impl_->ImportFeature(impl_->optimal, sl::kFeatureDLSS, "slDLSSGetOptimalSettings"))
++      (!impl_->ImportFeature(impl_->optimal, sl::kFeatureDLSS, "slDLSSGetOptimalSettings") ||
++       !impl_->ImportFeature(impl_->sr_options, sl::kFeatureDLSS, "slDLSSSetOptions")))
+     return false;
+   if (support_.fg) {
+     if (!impl_->ImportFeature(impl_->fg_options, sl::kFeatureDLSS_G, "slDLSSGSetOptions") ||
+@@ -239,28 +271,7 @@ bool Streamline::GetOptimalSettings(Quality quality, uint32_t width, uint32_t he
+ #if REX_HAS_STREAMLINE
+   if (!impl_->attached || !support_.sr || !impl_->optimal || !width || !height)
+     return false;
+-  sl::DLSSOptions options{};
+-  switch (quality) {
+-    case Quality::kQuality:
+-      options.mode = sl::DLSSMode::eMaxQuality;
+-      break;
+-    case Quality::kBalanced:
+-      options.mode = sl::DLSSMode::eBalanced;
+-      break;
+-    case Quality::kPerformance:
+-      options.mode = sl::DLSSMode::eMaxPerformance;
+-      break;
+-    case Quality::kUltraPerformance:
+-      options.mode = sl::DLSSMode::eUltraPerformance;
+-      break;
+-    case Quality::kDLAA:
+-      options.mode = sl::DLSSMode::eDLAA;
+-      break;
+-    default:
+-      return false;
+-  }
+-  options.outputWidth = width;
+-  options.outputHeight = height;
++  const auto options = SsxOptions(quality, width, height);
+   sl::DLSSOptimalSettings optimal{};
+   if (!Check(impl_->optimal(options, optimal), "DLSS optimal settings"))
+     return false;
+@@ -275,6 +286,22 @@ bool Streamline::GetOptimalSettings(Quality quality, uint32_t width, uint32_t he
+ #endif
+ }
+ 
++bool Streamline::ConfigureSsxSR(Quality quality, uint32_t width, uint32_t height) {
++#if REX_HAS_STREAMLINE
++  if (!impl_->attached || !support_.sr || !impl_->sr_options || !width || !height)
++    return false;
++  const auto options = SsxOptions(quality, width, height);
++  if (options.mode == sl::DLSSMode::eOff)
++    return false;
++  return Check(impl_->sr_options(sl::ViewportHandle(0), options), "SSX SR color/exposure options");
++#else
++  (void)quality;
++  (void)width;
++  (void)height;
++  return false;
++#endif
++}
++
+ void Streamline::Shutdown() {
+ #if REX_HAS_STREAMLINE
+   if (impl_->init_called) {
+diff --git a/src/ui/shaders/bytecode/d3d12_5_1/ssx_scene_color_cs.h b/src/ui/shaders/bytecode/d3d12_5_1/ssx_scene_color_cs.h
+index 5b5eae4..7045349 100644
+--- a/src/ui/shaders/bytecode/d3d12_5_1/ssx_scene_color_cs.h
++++ b/src/ui/shaders/bytecode/d3d12_5_1/ssx_scene_color_cs.h
+@@ -97,66 +97,73 @@ endif
+ if_nz r1.y
+   ret 
+ endif 
+-if_nz CB0[0][2].x
+-  mov r0.zw, l(0,0,0,0)
+-  mov r2.xy, l(340282346638528859811704183484516925440.000000,0,0,0)
+-  mov r1.xyz, l(1.000000,0,-1,0)
+-  mov r0.y, l(0)
+-  loop 
+-    uge r1.w, r0.y, CB0[0][0].w
+-    breakc_nz r1.w
+-    mov r1.w, r2.x
+-    mov r3.x, r2.y
+-    mov r3.yzw, r1.zzxy
+-    mov r0.x, l(0)
++ieq r0.x, CB0[0][2].x, l(2)
++if_nz r0.x
++  mov r2.xyz, l(0,0,0,0)
++  mov r0.x, l(0)
++else 
++  ieq r0.x, CB0[0][2].x, l(1)
++  if_nz r0.x
++    mov r0.zw, l(0,0,0,0)
++    mov r2.xy, l(340282346638528859811704183484516925440.000000,0,0,0)
++    mov r1.xyz, l(1.000000,0,-1,0)
++    mov r0.y, l(0)
+     loop 
+-      uge r4.x, r0.x, CB0[0][0].z
+-      breakc_nz r4.x
+-      ld r4.x, r0.xyzw, T1[1].xyzw
+-      mul r4.y, r4.x, -CB0[0][1].w
+-      mul r4.y, r4.y, CB0[0][1].y
+-      exp r4.y, r4.y
+-      mul r4.y, r4.y, CB0[0][1].z
+-      and r4.z, r4.y, l(0x7f800000)
+-      ine r4.z, r4.z, l(0x7f800000)
+-      and r4.z, r3.y, r4.z
+-      lt r4.w, l(0.000000), r4.y
+-      and r3.y, r4.w, r4.z
+-      min r1.w, r1.w, r4.y
+-      min r3.z, r3.z, r4.x
+-      max r3.xw, r3.xxxw, r4.yyyx
+-      iadd r0.x, r0.x, l(1)
++      uge r1.w, r0.y, CB0[0][0].w
++      breakc_nz r1.w
++      mov r1.w, r2.x
++      mov r3.x, r2.y
++      mov r3.yzw, r1.zzxy
++      mov r0.x, l(0)
++      loop 
++        uge r4.x, r0.x, CB0[0][0].z
++        breakc_nz r4.x
++        ld r4.x, r0.xyzw, T1[1].xyzw
++        mul r4.y, r4.x, -CB0[0][1].w
++        mul r4.y, r4.y, CB0[0][1].y
++        exp r4.y, r4.y
++        mul r4.y, r4.y, CB0[0][1].z
++        and r4.z, r4.y, l(0x7f800000)
++        ine r4.z, r4.z, l(0x7f800000)
++        and r4.z, r3.y, r4.z
++        lt r4.w, l(0.000000), r4.y
++        and r3.y, r4.w, r4.z
++        min r1.w, r1.w, r4.y
++        min r3.z, r3.z, r4.x
++        max r3.xw, r3.xxxw, r4.yyyx
++        iadd r0.x, r0.x, l(1)
++      endloop 
++      mov r2.x, r1.w
++      mov r2.y, r3.x
++      mov r1.xyz, r3.zwyz
++      iadd r0.y, r0.y, l(1)
+     endloop 
+-    mov r2.x, r1.w
+-    mov r2.y, r3.x
+-    mov r1.xyz, r3.zwyz
+-    iadd r0.y, r0.y, l(1)
+-  endloop 
+-  eq r0.x, r1.y, r1.x
+-  and r0.x, r0.x, r1.z
+-  and r2.z, r2.x, r0.x
+-else 
+-  mov r2.xyz, l(1.000000,1.000000,1.000000,0)
+-  mov r0.x, l(-1)
++    eq r0.x, r1.y, r1.x
++    and r0.x, r0.x, r1.z
++    and r2.z, r2.x, r0.x
++  else 
++    mov r2.xyz, l(1.000000,1.000000,1.000000,0)
++    mov r0.x, l(-1)
++  endif 
+ endif 
+ store_uav_typed U1[1].xyzw, l(0,0,0,0), r2.zzzz
+ and r2.w, r0.x, l(0x3f800000)
+ store_structured U2[2].xyzw, l(0), l(0), r2.xyzw
+ ret 
+-// Approximately 81 instruction slots used
++// Approximately 88 instruction slots used
+ #endif
+ 
+ const BYTE ssx_scene_color_cs[] =
+ {
+-     68,  88,  66,  67, 151, 117, 
+-     34,  93,  47, 161,  59, 108, 
+-    123, 228,  29, 215, 150,  43, 
+-     81, 243,   1,   0,   0,   0, 
+-      0,  14,   0,   0,   5,   0, 
++     68,  88,  66,  67,  16,  87, 
++      8,  42, 211,  49, 109,  99, 
++      0, 124, 102, 202,  82, 210, 
++    145,  23,   1,   0,   0,   0, 
++    136,  14,   0,   0,   5,   0, 
+       0,   0,  52,   0,   0,   0, 
+     184,   4,   0,   0, 200,   4, 
+       0,   0, 216,   4,   0,   0, 
+-    100,  13,   0,   0,  82,  68, 
++    236,  13,   0,   0,  82,  68, 
+      69,  70, 124,   4,   0,   0, 
+       2,   0,   0,   0, 116,   1, 
+       0,   0,   6,   0,   0,   0, 
+@@ -355,8 +362,8 @@ const BYTE ssx_scene_color_cs[] =
+      79,  83,  71,  78,   8,   0, 
+       0,   0,   0,   0,   0,   0, 
+       8,   0,   0,   0,  83,  72, 
+-     69,  88, 132,   8,   0,   0, 
+-     81,   0,   5,   0,  33,   2, 
++     69,  88,  12,   9,   0,   0, 
++     81,   0,   5,   0,  67,   2, 
+       0,   0, 106,   8,   0,   1, 
+      89,   0,   0,   7,  70, 142, 
+      48,   0,   0,   0,   0,   0, 
+@@ -537,10 +544,32 @@ const BYTE ssx_scene_color_cs[] =
+      31,   0,   4,   3,  26,   0, 
+      16,   0,   1,   0,   0,   0, 
+      62,   0,   0,   1,  21,   0, 
+-      0,   1,  31,   0,   4,   5, 
+-     10, 128,  48,   0,   0,   0, 
++      0,   1,  32,   0,   0,   9, 
++     18,   0,  16,   0,   0,   0, 
++      0,   0,  10, 128,  48,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   2,   0,   0,   0, 
++      1,  64,   0,   0,   2,   0, 
++      0,   0,  31,   0,   4,   3, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,  54,   0,   0,   8, 
++    114,   0,  16,   0,   2,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  54,   0, 
++      0,   5,  18,   0,  16,   0, 
++      0,   0,   0,   0,   1,  64, 
+       0,   0,   0,   0,   0,   0, 
+-      2,   0,   0,   0,  54,   0, 
++     18,   0,   0,   1,  32,   0, 
++      0,   9,  18,   0,  16,   0, 
++      0,   0,   0,   0,  10, 128, 
++     48,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   2,   0, 
++      0,   0,   1,  64,   0,   0, 
++      1,   0,   0,   0,  31,   0, 
++      4,   3,  10,   0,  16,   0, 
++      0,   0,   0,   0,  54,   0, 
+       0,   8, 194,   0,  16,   0, 
+       0,   0,   0,   0,   2,  64, 
+       0,   0,   0,   0,   0,   0, 
+@@ -700,40 +729,41 @@ const BYTE ssx_scene_color_cs[] =
+      16,   0,   0,   0,   0,   0, 
+       1,  64,   0,   0, 255, 255, 
+     255, 255,  21,   0,   0,   1, 
+-    164,   0,   0,  11, 242, 224, 
+-     33,   0,   1,   0,   0,   0, 
+-      1,   0,   0,   0,   2,  64, 
+-      0,   0,   0,   0,   0,   0, 
++     21,   0,   0,   1, 164,   0, 
++      0,  11, 242, 224,  33,   0, 
++      1,   0,   0,   0,   1,   0, 
++      0,   0,   2,  64,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-    166,  10,  16,   0,   2,   0, 
+-      0,   0,   1,   0,   0,   7, 
+-    130,   0,  16,   0,   2,   0, 
+-      0,   0,  10,   0,  16,   0, 
++      0,   0,   0,   0, 166,  10, 
++     16,   0,   2,   0,   0,   0, 
++      1,   0,   0,   7, 130,   0, 
++     16,   0,   2,   0,   0,   0, 
++     10,   0,  16,   0,   0,   0, 
++      0,   0,   1,  64,   0,   0, 
++      0,   0, 128,  63, 168,   0, 
++      0,  10, 242, 224,  33,   0, 
++      2,   0,   0,   0,   2,   0, 
++      0,   0,   1,  64,   0,   0, 
+       0,   0,   0,   0,   1,  64, 
+-      0,   0,   0,   0, 128,  63, 
+-    168,   0,   0,  10, 242, 224, 
+-     33,   0,   2,   0,   0,   0, 
+-      2,   0,   0,   0,   1,  64, 
+       0,   0,   0,   0,   0,   0, 
+-      1,  64,   0,   0,   0,   0, 
+-      0,   0,  70,  14,  16,   0, 
+-      2,   0,   0,   0,  62,   0, 
+-      0,   1,  83,  84,  65,  84, 
+-    148,   0,   0,   0,  81,   0, 
+-      0,   0,   5,   0,   0,   0, 
+-      0,   0,   0,   0,   1,   0, 
+-      0,   0,  12,   0,   0,   0, 
+-      7,   0,   0,   0,  22,   0, 
+-      0,   0,   5,   0,   0,   0, 
++     70,  14,  16,   0,   2,   0, 
++      0,   0,  62,   0,   0,   1, 
++     83,  84,  65,  84, 148,   0, 
++      0,   0,  88,   0,   0,   0, 
+       5,   0,   0,   0,   0,   0, 
++      0,   0,   1,   0,   0,   0, 
++     12,   0,   0,   0,   9,   0, 
++      0,   0,  22,   0,   0,   0, 
++      5,   0,   0,   0,   7,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   2,   0, 
+       0,   0,   0,   0,   0,   0, 
++      0,   0,   2,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,  16,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     18,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+@@ -744,6 +774,5 @@ const BYTE ssx_scene_color_cs[] =
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   4,   0, 
+-      0,   0
++      0,   0,   4,   0,   0,   0
+ };
+diff --git a/src/ui/shaders/ssx_scene_color.cs.hlsl b/src/ui/shaders/ssx_scene_color.cs.hlsl
+index 65bd455..db5aa38 100644
+--- a/src/ui/shaders/ssx_scene_color.cs.hlsl
++++ b/src/ui/shaders/ssx_scene_color.cs.hlsl
+@@ -31,7 +31,10 @@ void main(uint3 id : SV_DispatchThreadID) {
+   if (any(id.xy != 0)) return;
+   float minimum = 1, maximum = 1, value = 1;
+   bool scalar_valid = true;
+-  if (exposure_enabled) {
++  if (exposure_enabled == 2) {
++    minimum = maximum = value = 0;
++    scalar_valid = false;
++  } else if (exposure_enabled == 1) {
+     minimum = 3.402823466e+38F;
+     maximum = 0;
+     float raw_min = 1, raw_max = 0;
+diff --git a/tests/unit/graphics/ssx_frame_inputs_test.cpp b/tests/unit/graphics/ssx_frame_inputs_test.cpp
+index 3937ae9..92e60b2 100644
+--- a/tests/unit/graphics/ssx_frame_inputs_test.cpp
++++ b/tests/unit/graphics/ssx_frame_inputs_test.cpp
+@@ -84,3 +84,36 @@ TEST_CASE("SSX jitter phase is stable bounded host-pixel sized and shader gated"
+     }
+   }
+ }
++
++TEST_CASE("SSX inverse jitter restores view rays and preserves depth", "[ssx-inputs]") {
++  // Deliberately asymmetric projective inverse, not an identity-only test.
++  const std::array<float,16> inv{2,.1f,0,.02f, -.2f,3,.1f,0, .1f,0,4,.3f, 5,6,7,1};
++  for (auto size : {std::array<uint32_t,2>{3360,1752}, {3840,2160}}) {
++    for (uint64_t phase=0;phase<16;++phase) {
++      const auto j = SsxJitterNdc(SsxJitterPixels(phase),size[0],size[1]);
++      auto patched=inv;
++      auto row=SsxJitterInverseRow(inv.data(),inv.data()+4,inv.data()+12,j);
++      std::copy(row.begin(),row.end(),patched.begin()+12);
++      for(float x : {-.9f,0.f,.8f}) for(float y : {-.7f,0.f,.6f})
++        for(float z : {0.f,.3f,1.f}) for(int c=0;c<4;++c) {
++          double expected=x*double(inv[c])+y*double(inv[4+c])+z*double(inv[8+c])+inv[12+c];
++          double actual=(x+double(j[0]))*patched[c]+(y+double(j[1]))*patched[4+c]+z*double(patched[8+c])+patched[12+c];
++          CHECK(std::abs(actual-expected)<1e-6);
++        }
++    }
++  }
++}
++TEST_CASE("SSX clip varyings lighting and sky have distinct jitter rules", "[ssx-inputs]") {
++  for (auto vs : {0x918D665BD2A2CD18ull,0x12FD869BF1BC123Bull,0xCD0EA161158F343Eull})
++    CHECK(IsSsxJitterShader(vs));
++  CHECK(SsxClipInterpolatorMask(0xC68B1C50089DDABEull)==5);
++  CHECK(SsxClipInterpolatorMask(0x834A9D8A1620BE5Dull)==1);
++  CHECK(SsxClipInterpolatorMask(0x9897AE6BB3FD8C0Bull)==0);
++  CHECK(SsxClipInterpolatorMask(0xE857B4AF9617DC29ull)==0);
++  CHECK_FALSE(IsSsxJitterShader(0x763F035342AB3C25ull));
++  CHECK(SsxInverseProjectionVertexShader(0x763F035342AB3C25ull));
++  CHECK(SsxInverseProjectionPixelShader(0xAA51010CD0482315ull));
++  CHECK_FALSE(SsxInverseProjectionPixelShader(0xA2CD8E82699B2C0Aull));
++  CHECK(IdentifySsxPass(0x4541096D,0xEFEFB597BB5740F0ull,0xAA51010CD0482315ull,1120,584)==SsxPass::kDepthBeforeLighting);
++  CHECK(IdentifySsxPass(0x4541096D,0xEFEFB597BB5740F0ull,0xAA51010CD0482315ull,560,292)==SsxPass::kNone);
++}

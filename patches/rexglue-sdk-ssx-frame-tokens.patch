@@ -1,0 +1,657 @@
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index 88c3079..a6f0b44 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -135,6 +135,7 @@ class CommandProcessor {
+   uint64_t swap_timing_id_ = 0;
+   // Ordered frame-begin NOP to the following Swap; ambiguity clears identity.
+   ui::GuestRenderMarker guest_render_marker_;
++  virtual void OnGuestRenderMarker(uint64_t /* id */) {}
+   struct IndexBufferInfo {
+     xenos::IndexFormat format = xenos::IndexFormat::kInt16;
+     xenos::Endian endianness = xenos::Endian::kNone;
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index b5b6d06..4bc2120 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -841,6 +841,8 @@ class D3D12CommandProcessor : public CommandProcessor {
+   uint64_t ssx_reconstruction_frame_ = 0, ssx_reconstruction_log_frame_ = 0;
+   bool ssx_reconstruction_failed_ = false;
+   std::unique_ptr<ui::d3d12::SsxReconstruction> ssx_reconstruction_;
++  std::shared_ptr<ui::d3d12::Streamline::Frame> ssx_frame_token_;
++  void OnGuestRenderMarker(uint64_t id) override;
+   bool ReconstructSsxScene(uint64_t vs, uint64_t ps, const draw_util::ViewportInfo& viewport,
+                            bool& restarted);
+   std::array<uint64_t,8> ssx_jitter_unknown_shaders_{};
+diff --git a/include/rex/ui/d3d12/d3d12_presenter.h b/include/rex/ui/d3d12/d3d12_presenter.h
+index 954336e..580496b 100644
+--- a/include/rex/ui/d3d12/d3d12_presenter.h
++++ b/include/rex/ui/d3d12/d3d12_presenter.h
+@@ -71,6 +71,10 @@ class D3D12Presenter final : public Presenter {
+     ID3D12Resource* resource_uav_capable() const { return resource_.Get(); }
+     void SetTimingId(uint64_t id) { timing_id_ = id; }
+     uint64_t timing_id() const { return timing_id_; }
++    void SetFrameToken(std::shared_ptr<Streamline::Frame> token) {
++      frame_token_ = std::move(token);
++    }
++    const std::shared_ptr<Streamline::Frame>& frame_token() const { return frame_token_; }
+     void SetFrameInputs(std::shared_ptr<const SsxFrameInputs> inputs) { inputs_ = std::move(inputs); }
+     const std::shared_ptr<const SsxFrameInputs>& frame_inputs() const { return inputs_; }
+ 
+@@ -78,6 +82,7 @@ class D3D12Presenter final : public Presenter {
+     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
+     std::shared_ptr<const SsxFrameInputs> inputs_;
+     uint64_t timing_id_ = 0;
++    std::shared_ptr<Streamline::Frame> frame_token_;
+   };
+ 
+   static std::unique_ptr<D3D12Presenter> Create(HostGpuLossCallback host_gpu_loss_callback,
+@@ -317,6 +322,7 @@ class D3D12Presenter final : public Presenter {
+       guest_output_resources_;
+   std::array<std::shared_ptr<const SsxFrameInputs>, kGuestOutputMailboxSize> guest_frame_inputs_;
+   std::array<uint64_t, kGuestOutputMailboxSize> guest_timing_ids_{};
++  std::array<std::shared_ptr<Streamline::Frame>, kGuestOutputMailboxSize> guest_frame_tokens_;
+   // The guest output resources are protected by two submission trackers - the
+   // refresher ones (for writing to them via the guest_output_resources_
+   // references) and the paint one (for presenting it via the
+diff --git a/include/rex/ui/d3d12/guest_frame_inputs.h b/include/rex/ui/d3d12/guest_frame_inputs.h
+index e009075..f415f59 100644
+--- a/include/rex/ui/d3d12/guest_frame_inputs.h
++++ b/include/rex/ui/d3d12/guest_frame_inputs.h
+@@ -154,6 +154,7 @@ struct SsxFrameInputs {
+   // A frozen boundary packet retains its producer's pool slot as well as COM
+   // resources, preventing pool reuse while reconstruction still references it.
+   std::shared_ptr<const SsxFrameInputs> producer_owner;
++  std::shared_ptr<Streamline::Frame> frame_token;
+   SsxFrameMetadata metadata;
+   SsxGeometry geometry;
+   std::array<GuestInputTexture, size_t(SsxInput::kCount)> textures;
+@@ -175,6 +176,7 @@ class SsxFrameInputPool {
+         continue;
+       slot->metadata = {};
+       slot->fg_temporal.reset();
++      slot->frame_token.reset();
+       slot->geometry.Reset();
+       slot->metadata.guest_frame = frame;
+       return slot;
+diff --git a/include/rex/ui/d3d12/streamline.h b/include/rex/ui/d3d12/streamline.h
+index 02f22ba..2632564 100644
+--- a/include/rex/ui/d3d12/streamline.h
++++ b/include/rex/ui/d3d12/streamline.h
+@@ -4,7 +4,9 @@
+ #include <array>
+ #include <cstdint>
+ #include <filesystem>
++#include <functional>
+ #include <memory>
++#include <mutex>
+ #include <string>
+ 
+ #include <rex/ui/d3d12/d3d12_api.h>
+@@ -62,9 +64,9 @@ class Streamline {
+     float near_plane = 0, far_plane = 0, vertical_fov = 0, aspect = 0;
+   };
+   // One token follows a real frame from input/simulation to its actual Present.
+-  // Callers retain at most three frames in flight. Methods on a given frame
+-  // must be serialized; configuration, SR evaluation and FG tagging also require
+-  // external serialization across threads. FG state queries use the present thread.
++  // Callers retain at most three frames in flight. This API serializes token,
++  // configuration, evaluation and tagging calls across threads. Callers still
++  // own GPU resource lifetimes and submission order; FG queries use the present thread.
+   struct Frame;
+   enum class ReflexMode { kOff, kOn, kOnWithBoost };
+   enum class Marker {
+@@ -99,10 +101,27 @@ class Streamline {
+     bool flash_driver_controlled = false;
+     std::array<ReflexReport, 64> reports{};
+   };
+-  // Serialize with ConfigureReflex and other state queries. Missing timestamps
+-  // stay zero: they must not be interpreted as a zero-latency measurement.
++  // Missing timestamps stay zero: they must not be interpreted as a
++  // zero-latency measurement.
+   bool GetReflexState(ReflexState& state);
+ 
++  // Experimental token transport only: no invented simulation markers, Reflex
++  // sleep, or FG. A real NVIDIA token is retained from ordered GPU frame begin
++  // through SR and the first actual Present. Three slots bound pending tokens;
++  // replacing an unpresented slot explicitly retires that token.
++  std::shared_ptr<Frame> AcquireRenderToken(uint64_t render_id);
++  void RetireRenderToken(const std::shared_ptr<Frame>& frame);
++  struct TokenPresentation {
++    HRESULT result = E_FAIL;
++    bool matched = false;
++    uint64_t render_id = 0;
++    uint32_t token_id = 0;
++  };
++  // Always invokes present exactly once, including missing/stale/repeated
++  // tokens. Serializes against SL calls through the actual Present interval.
++  TokenPresentation PresentRenderToken(const std::shared_ptr<Frame>& frame,
++                                       const std::function<HRESULT()>& present);
++
+   struct SRFrame {
+     uint64_t id = 0;  // Strictly increasing, per rendered frame, not per Present.
+     std::shared_ptr<Frame> timeline;  // Required when sharing this frame with FG.
+@@ -176,6 +195,9 @@ class Streamline {
+   Streamline();
+   bool Initialize(const std::filesystem::path& binary_directory);
+   std::unique_ptr<Impl> impl_;
++  // Covers cross-thread options/evaluation/state queries and frame transitions.
++  // Recursive for public helpers called by another public operation.
++  mutable std::recursive_mutex api_mutex_;
+   Support support_;
+ };
+ 
+diff --git a/include/rex/ui/guest_frame_timing.h b/include/rex/ui/guest_frame_timing.h
+index 80247c7..d13d12b 100644
+--- a/include/rex/ui/guest_frame_timing.h
++++ b/include/rex/ui/guest_frame_timing.h
+@@ -44,7 +44,12 @@ class GuestFrameTiming {
+     kGuestRenderMarker,
+     kGuestRenderMarkerRejected,
+     kGpuRenderMarker,
+-    kGpuRenderMarkerConflict
++    kGpuRenderMarkerConflict,
++    kNvidiaTokenCreated,
++    kNvidiaTokenEvaluated,
++    kNvidiaTokenPresented,
++    kNvidiaTokenDropped,
++    kNvidiaTokenRepeated
+   };
+   struct Record {
+     uint64_t time_ns, id, related, detail;
+@@ -53,6 +58,7 @@ class GuestFrameTiming {
+   };
+   static constexpr size_t kMaxRecords = 32768;
+   static GuestFrameTiming& Get();
++  static bool ContinuousMarkersEnabled();
+   // Single control thread, normally SSX's independent input polling thread.
+   // A capture.request file starts a five-second capture. No per-frame disk IO
+   // on the renderer; this thread writes the bounded buffer on completion.
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index a1b5435..cc3cb20 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -914,6 +914,7 @@ bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32
+     const auto hi = reader->ReadAndSwap<uint32_t>();
+     if (const auto id = ui::DecodeGuestRenderMarker(signature, version, lo, hi)) {
+       const bool valid = guest_render_marker_.Begin(id);
++      OnGuestRenderMarker(valid ? id : 0);
+       ui::GuestFrameTiming::Get().Add(valid ? ui::GuestFrameTiming::Event::kGpuRenderMarker
+                                             : ui::GuestFrameTiming::Event::kGpuRenderMarkerConflict,
+                                       id);
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index f5b2188..35a9eb8 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -2111,6 +2111,15 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
+   gamma_ramp_pwl_up_to_date_ = false;
+ }
+ 
++void D3D12CommandProcessor::OnGuestRenderMarker(uint64_t id) {
++  auto* sl = GetD3D12Provider().GetStreamline();
++  if (!id && sl)
++    sl->RetireRenderToken(ssx_frame_token_);
++  ssx_frame_token_.reset();
++  if (id && sl && ui::GuestFrameTiming::ContinuousMarkersEnabled())
++    ssx_frame_token_ = sl->AcquireRenderToken(id);
++}
++
+ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                       uint32_t frontbuffer_height) {
+   SCOPE_profile_cpu_f("gpu");
+@@ -2251,6 +2260,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+       guest_output_width, guest_output_height, display_width, display_height,
+       [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource, guest_output_width,
+        guest_output_height, ssx_frame_inputs,
++       frame_token = guest_render_marker_.id() ? ssx_frame_token_ : nullptr,
+        timing_id = swap_timing_id_](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+         const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+         ID3D12Device* device = provider.GetDevice();
+@@ -2516,6 +2526,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+             .SetFrameInputs(ssx_frame_inputs);
+         static_cast<ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(context)
+             .SetTimingId(timing_id);
++        static_cast<ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(context)
++            .SetFrameToken(frame_token);
+         return true;
+       });
+ 
+diff --git a/src/graphics/d3d12/ssx_frame_inputs.cpp b/src/graphics/d3d12/ssx_frame_inputs.cpp
+index 8184bf6..b390891 100644
+--- a/src/graphics/d3d12/ssx_frame_inputs.cpp
++++ b/src/graphics/d3d12/ssx_frame_inputs.cpp
+@@ -438,6 +438,8 @@ bool D3D12CommandProcessor::ReconstructSsxScene(uint64_t vs, uint64_t ps,
+   D3D12TextureCache::ActiveTextureSnapshotSource source;
+   if (!texture_cache_->GetActiveTextureSnapshotSource(0,source)) return true;
+   auto frozen = std::make_shared<SsxFrameInputs>(*ssx_inputs_);
++  if (guest_render_marker_.id())
++    frozen->frame_token = ssx_frame_token_;
+   frozen->producer_owner = ssx_inputs_;
+   frozen->metadata.output_width = uint32_t(source.resource->GetDesc().Width);
+   frozen->metadata.output_height = source.resource->GetDesc().Height;
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 3d4fd76..45f6df0 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -555,6 +555,7 @@ bool D3D12Presenter::RefreshGuestOutputImpl(
+   // producer/consumer synchronization. Missing inputs explicitly replace old ones.
+   guest_frame_inputs_[mailbox_index] = refresher_succeeded ? context.frame_inputs() : nullptr;
+   guest_timing_ids_[mailbox_index] = refresher_succeeded ? context.timing_id() : 0;
++  guest_frame_tokens_[mailbox_index] = refresher_succeeded ? context.frame_token() : nullptr;
+   // Even if the refresher has returned false, it still might have submitted
+   // some commands referencing the resource. It's better to put an excessive
+   // signal and wait slightly longer, for nothing important, while shutting down
+@@ -617,6 +618,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   Microsoft::WRL::ComPtr<ID3D12Resource> guest_output_resource;
+   std::shared_ptr<const SsxFrameInputs> frame_inputs;
+   uint64_t timing_id = 0;
++  std::shared_ptr<Streamline::Frame> frame_token;
+   {
+     uint32_t guest_output_mailbox_index;
+     std::unique_lock<std::mutex> guest_output_consumer_lock(ConsumeGuestOutput(
+@@ -625,6 +627,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+       guest_output_resource = guest_output_resources_[guest_output_mailbox_index].second;
+       frame_inputs = guest_frame_inputs_[guest_output_mailbox_index];
+       timing_id = guest_timing_ids_[guest_output_mailbox_index];
++      frame_token = guest_frame_tokens_[guest_output_mailbox_index];
+     }
+     // Incremented the reference count of the guest output resource - safe to
+     // leave the consumer critical section now as everything here either will be
+@@ -1243,9 +1246,21 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   // presentation model used in Direct3D 12).
+   GuestFrameTiming::Get().Add(GuestFrameTiming::Event::kPresentBegin, timing_id,
+                               current_paint_submission);
+-  HRESULT present_result = paint_context_.swap_chain->Present(
+-      0, DXGI_PRESENT_RESTART |
+-             (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
++  const auto present = [&] {
++    return paint_context_.swap_chain->Present(
++        0, DXGI_PRESENT_RESTART |
++               (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
++  };
++  HRESULT present_result;
++  if (auto* sl = provider_.GetStreamline(); sl && GuestFrameTiming::ContinuousMarkersEnabled()) {
++    const auto token_result = sl->PresentRenderToken(frame_token, present);
++    present_result = token_result.result;
++    if (token_result.matched && token_result.render_id % 120 < 3)
++      REXGPU_INFO("SSX_TOKEN_PRESENT render={} nvidia={} result={:08X} reflex=false fg=false",
++                  token_result.render_id, token_result.token_id, uint32_t(present_result));
++  } else {
++    present_result = present();
++  }
+   GuestFrameTiming::Get().Add(GuestFrameTiming::Event::kPresentEnd, timing_id,
+                               current_paint_submission, uint32_t(present_result));
+   // Even if presentation has failed, work might have been enqueued anyway
+diff --git a/src/ui/d3d12/ssx_reconstruction.cpp b/src/ui/d3d12/ssx_reconstruction.cpp
+index 00a6159..a57c6af 100644
+--- a/src/ui/d3d12/ssx_reconstruction.cpp
++++ b/src/ui/d3d12/ssx_reconstruction.cpp
+@@ -271,6 +271,7 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+   bool evaluated = false;
+   std::shared_ptr<SsxFGTemporal> fg_temporal;
+   Streamline::SRFrame sr_frame;
++  sr_frame.timeline = frame->frame_token;
+   sr_frame.id = f.guest_frame;
+   sr_frame.jitter_pixels = f.jitter_pixels;
+   sr_frame.depth_inverted = true;
+diff --git a/src/ui/d3d12/streamline.cpp b/src/ui/d3d12/streamline.cpp
+index 2bd309e..648c506 100644
+--- a/src/ui/d3d12/streamline.cpp
++++ b/src/ui/d3d12/streamline.cpp
+@@ -1,3 +1,4 @@
++#include <rex/ui/guest_frame_timing.h>
+ #include <rex/ui/d3d12/streamline.h>
+ #include <rex/ui/d3d12/ssx_temporal_alignment.h>
+ 
+@@ -175,6 +176,10 @@ struct Streamline::Impl {
+   ReflexMode reflex_mode = ReflexMode::kOff;
+   bool reflex_configured = false, fg_loaded = true, fg_active = false, fg_reset = true;
+   uint32_t ping_message = 0;
++  std::array<std::shared_ptr<Frame>, 3> render_tokens{};
++  size_t render_token_slot = 0;
++  std::array<std::weak_ptr<Frame>, 3> full_tokens{};
++  size_t full_token_slot = 0;
+   bool sr_configured = false, sr_attempted = false, sr_have_frame = false;
+   bool sr_reset = true;
+   Quality sr_quality = Quality::kQuality;
+@@ -210,6 +215,8 @@ struct Streamline::Frame {
+   sl::FrameToken* token = nullptr;
+   uint32_t token_id = 0;
+   unsigned phase = 0;
++  bool render_only = false, present_attempted = false;
++  uint64_t render_id = 0;
+   bool fg_tagged = false, sr_evaluated = false, reset = false;
+   SRCamera camera;
+   std::array<float, 2> jitter{};
+@@ -234,6 +241,7 @@ std::unique_ptr<Streamline> Streamline::Create(const std::filesystem::path& dire
+ }
+ 
+ bool Streamline::Initialize(const std::filesystem::path& directory) {
++  std::lock_guard lock(api_mutex_);
+ #if REX_HAS_STREAMLINE
+   std::error_code error;
+   const auto absolute_directory = std::filesystem::absolute(directory, error);
+@@ -298,6 +306,7 @@ bool Streamline::Initialize(const std::filesystem::path& directory) {
+ }
+ 
+ bool Streamline::Attach(ID3D12Device*& device, IDXGIFactory2*& factory) {
++  std::lock_guard lock(api_mutex_);
+ #if REX_HAS_STREAMLINE
+   if (!impl_->init_called || impl_->attached || !device || !factory)
+     return false;
+@@ -386,6 +395,7 @@ bool Streamline::Attach(ID3D12Device*& device, IDXGIFactory2*& factory) {
+ 
+ bool Streamline::GetOptimalSettings(Quality quality, uint32_t width, uint32_t height,
+                                     OptimalSettings& settings) {
++  std::lock_guard lock(api_mutex_);
+   settings = {};
+ #if REX_HAS_STREAMLINE
+   if (!impl_->attached || !support_.sr || !impl_->optimal || !width || !height)
+@@ -406,6 +416,7 @@ bool Streamline::GetOptimalSettings(Quality quality, uint32_t width, uint32_t he
+ }
+ 
+ bool Streamline::ConfigureSsxSR(Quality quality, uint32_t width, uint32_t height) {
++  std::lock_guard lock(api_mutex_);
+ #if REX_HAS_STREAMLINE
+   if (!impl_->attached || !support_.sr || !impl_->sr_options || !width || !height)
+     return false;
+@@ -443,6 +454,7 @@ bool Streamline::ConfigureSsxSR(Quality quality, uint32_t width, uint32_t height
+ 
+ Streamline::SREvaluation Streamline::EvaluateSR(ID3D12GraphicsCommandList* list,
+                                                 const SRFrame& frame) {
++  std::lock_guard lock(api_mutex_);
+ #if REX_HAS_STREAMLINE
+   // Fail closed. Even rejected inputs invalidate the next temporal history.
+   const bool pending_reset = impl_->sr_reset;
+@@ -486,11 +498,19 @@ Streamline::SREvaluation Streamline::EvaluateSR(ID3D12GraphicsCommandList* list,
+   if (frame.timeline) {
+     const auto& t = *frame.timeline;
+     if (t.owner != this || t.phase != 3 || t.sr_evaluated || !t.token ||
+-        uint32_t(*t.token) != t.token_id)
++        (t.render_only && impl_->fg_active) || uint32_t(*t.token) != t.token_id)
+       return {};
+     token = t.token;
+-  } else if (!Check(impl_->frame_token(token, nullptr), "SR frame token") || !token) {
+-    return {};
++  } else {
++    // An unassociated frame (menus/alternate paths) invalidates queued token
++    // claims before advancing Streamline's bounded token ring.
++    for (auto& pending : impl_->render_tokens)
++      RetireRenderToken(pending);
++    for (auto& weak : impl_->full_tokens)
++      if (auto pending = weak.lock(); pending && pending->phase != 6)
++        return {};
++    if (!Check(impl_->frame_token(token, nullptr), "SR frame token") || !token)
++      return {};
+   }
+   if (!Check(impl_->constants(constants, *token, viewport), "SR constants"))
+     return {};
+@@ -518,6 +538,9 @@ Streamline::SREvaluation Streamline::EvaluateSR(ID3D12GraphicsCommandList* list,
+   if (frame.timeline) {
+     auto& t = *frame.timeline;
+     t.sr_evaluated = true;
++    if (t.render_only)
++      GuestFrameTiming::Get().Add(GuestFrameTiming::Event::kNvidiaTokenEvaluated, t.render_id,
++                                  t.token_id, frame.id);
+     t.camera = c;
+     t.jitter = frame.jitter_pixels;
+     t.width = width;
+@@ -539,6 +562,7 @@ Streamline::SREvaluation Streamline::EvaluateSR(ID3D12GraphicsCommandList* list,
+ }
+ 
+ bool Streamline::ReleaseSR() {
++  std::lock_guard lock(api_mutex_);
+ #if REX_HAS_STREAMLINE
+   if (impl_->sr_attempted &&
+       !Check(impl_->free_resources(sl::kFeatureDLSS, sl::ViewportHandle(0)), "SR release"))
+@@ -551,7 +575,87 @@ bool Streamline::ReleaseSR() {
+   return true;
+ }
+ 
++std::shared_ptr<Streamline::Frame> Streamline::AcquireRenderToken(uint64_t render_id) {
++  std::lock_guard lock(api_mutex_);
++#if REX_HAS_STREAMLINE
++  if (!impl_->attached || !render_id || impl_->fg_active || impl_->reflex_mode != ReflexMode::kOff)
++    return nullptr;
++  for (auto& weak : impl_->full_tokens)
++    if (auto pending = weak.lock(); pending && pending->phase != 6)
++      return nullptr;
++  auto& slot = impl_->render_tokens[impl_->render_token_slot];
++  RetireRenderToken(slot);
++  slot.reset();
++  auto frame = std::make_shared<Frame>();
++  if (!Check(impl_->frame_token(frame->token, nullptr), "SSX ordered render token") ||
++      !frame->token)
++    return nullptr;
++  frame->owner = this;
++  frame->token_id = uint32_t(*frame->token);
++  frame->phase = 3;
++  frame->render_only = true;
++  frame->render_id = render_id;
++  slot = frame;
++  impl_->render_token_slot = (impl_->render_token_slot + 1) % impl_->render_tokens.size();
++  GuestFrameTiming::Get().Add(GuestFrameTiming::Event::kNvidiaTokenCreated, render_id,
++                              frame->token_id);
++  return frame;
++#else
++  (void)render_id;
++  return nullptr;
++#endif
++}
++
++void Streamline::RetireRenderToken(const std::shared_ptr<Frame>& frame) {
++  std::lock_guard lock(api_mutex_);
++#if REX_HAS_STREAMLINE
++  if (!frame || frame->owner != this || !frame->render_only || frame->phase == 6)
++    return;
++  frame->phase = 6;
++  GuestFrameTiming::Get().Add(GuestFrameTiming::Event::kNvidiaTokenDropped, frame->render_id,
++                              frame->token_id);
++#else
++  (void)frame;
++#endif
++}
++
++Streamline::TokenPresentation Streamline::PresentRenderToken(
++    const std::shared_ptr<Frame>& frame, const std::function<HRESULT()>& present) {
++  std::lock_guard lock(api_mutex_);
++  TokenPresentation result;
++  if (!present)
++    return result;
++#if REX_HAS_STREAMLINE
++  const bool owned = impl_->attached && frame && frame->owner == this && frame->render_only;
++  if (owned) {
++    result.render_id = frame->render_id;
++    result.token_id = frame->token_id;  // cached; never dereference a retired SL slot
++    result.matched = frame->phase == 3 && frame->sr_evaluated && frame->token &&
++                     uint32_t(*frame->token) == frame->token_id;
++    if (!result.matched && frame->phase != 6)
++      RetireRenderToken(frame);
++  }
++  // Keep options, evaluation, token allocation and the actual Present serialized.
++  // No fabricated PCL simulation/render markers are issued by this adapter.
++  result.result = present();
++  if (result.matched) {
++    frame->present_attempted = true;
++    frame->phase = 6;
++    GuestFrameTiming::Get().Add(GuestFrameTiming::Event::kNvidiaTokenPresented, frame->render_id,
++                                frame->token_id, uint32_t(result.result));
++  } else if (owned && frame->present_attempted) {
++    GuestFrameTiming::Get().Add(GuestFrameTiming::Event::kNvidiaTokenRepeated, frame->render_id,
++                                frame->token_id, uint32_t(result.result));
++  }
++#else
++  (void)frame;
++  result.result = present();
++#endif
++  return result;
++}
++
+ bool Streamline::ConfigureReflex(ReflexMode mode, uint32_t frame_limit_us) {
++  std::lock_guard lock(api_mutex_);
+ #if REX_HAS_STREAMLINE
+   if (!impl_->attached || !support_.reflex || !support_.pcl ||
+       (mode == ReflexMode::kOff && impl_->fg_active))
+@@ -590,9 +694,15 @@ bool Streamline::ConfigureReflex(ReflexMode mode, uint32_t frame_limit_us) {
+ }
+ 
+ std::shared_ptr<Streamline::Frame> Streamline::BeginFrame() {
++  std::lock_guard lock(api_mutex_);
+ #if REX_HAS_STREAMLINE
+   if (!impl_->attached || !impl_->reflex_configured)
+     return nullptr;
++  auto& full_slot = impl_->full_tokens[impl_->full_token_slot];
++  if (auto pending = full_slot.lock(); pending && pending->phase != 6)
++    return nullptr;
++  for (auto& pending : impl_->render_tokens)
++    RetireRenderToken(pending);
+   auto frame = std::make_shared<Frame>();
+   if (!Check(impl_->frame_token(frame->token, nullptr), "frame token") || !frame->token ||
+       !Check(impl_->reflex_sleep(*frame->token), "Reflex sleep") ||
+@@ -601,6 +711,8 @@ std::shared_ptr<Streamline::Frame> Streamline::BeginFrame() {
+   frame->owner = this;
+   frame->token_id = uint32_t(*frame->token);
+   frame->phase = 1;
++  full_slot = frame;
++  impl_->full_token_slot = (impl_->full_token_slot + 1) % impl_->full_tokens.size();
+   return frame;
+ #else
+   return nullptr;
+@@ -608,8 +720,9 @@ std::shared_ptr<Streamline::Frame> Streamline::BeginFrame() {
+ }
+ 
+ bool Streamline::MarkFrame(const std::shared_ptr<Frame>& frame, Marker marker) {
++  std::lock_guard lock(api_mutex_);
+ #if REX_HAS_STREAMLINE
+-  if (!impl_->attached || !frame || frame->owner != this || !frame->token ||
++  if (!impl_->attached || !frame || frame->owner != this || frame->render_only || !frame->token ||
+       uint32_t(*frame->token) != frame->token_id)
+     return false;
+   sl::PCLMarker pcl;
+@@ -662,6 +775,7 @@ bool Streamline::MarkFrame(const std::shared_ptr<Frame>& frame, Marker marker) {
+ }
+ 
+ uint32_t Streamline::LatencyPingMessage() const {
++  std::lock_guard lock(api_mutex_);
+ #if REX_HAS_STREAMLINE
+   return impl_->ping_message;
+ #else
+@@ -670,6 +784,7 @@ uint32_t Streamline::LatencyPingMessage() const {
+ }
+ 
+ bool Streamline::GetFrameId(const std::shared_ptr<Frame>& frame, uint32_t& id) const {
++  std::lock_guard lock(api_mutex_);
+   id = 0;
+ #if REX_HAS_STREAMLINE
+   if (!impl_->attached || !frame || frame->owner != this || !frame->token ||
+@@ -684,6 +799,7 @@ bool Streamline::GetFrameId(const std::shared_ptr<Frame>& frame, uint32_t& id) c
+ }
+ 
+ bool Streamline::GetReflexState(ReflexState& state) {
++  std::lock_guard lock(api_mutex_);
+   state = {};
+ #if REX_HAS_STREAMLINE
+   if (!impl_->attached || !impl_->reflex_state)
+@@ -722,6 +838,7 @@ bool Streamline::GetReflexState(ReflexState& state) {
+ }
+ 
+ bool Streamline::SetFrameGenerationLoaded(bool loaded) {
++  std::lock_guard lock(api_mutex_);
+ #if REX_HAS_STREAMLINE
+   if (!impl_->attached || !support_.fg)
+     return false;
+@@ -745,6 +862,7 @@ bool Streamline::SetFrameGenerationLoaded(bool loaded) {
+ }
+ 
+ bool Streamline::SetFrameGenerationActive(bool active) {
++  std::lock_guard lock(api_mutex_);
+ #if REX_HAS_STREAMLINE
+   if (!impl_->attached || !support_.fg ||
+       (active && (!impl_->fg_loaded || !impl_->reflex_configured ||
+@@ -771,10 +889,11 @@ bool Streamline::SetFrameGenerationActive(bool active) {
+ 
+ bool Streamline::ClearFrameGenerationTags(ID3D12GraphicsCommandList* list,
+                                           const std::shared_ptr<Frame>& frame) {
++  std::lock_guard lock(api_mutex_);
+ #if REX_HAS_STREAMLINE
+   impl_->fg_reset = true;
+   if (!impl_->attached || !list || !frame || frame->owner != this || frame->phase != 3 ||
+-      !frame->token || uint32_t(*frame->token) != frame->token_id)
++      !frame->token || frame->render_only || uint32_t(*frame->token) != frame->token_id)
+     return false;
+   sl::ResourceTag tags[] = {
+       {nullptr, sl::kBufferTypeDepth, sl::eValidUntilPresent},
+@@ -799,6 +918,7 @@ bool Streamline::ClearFrameGenerationTags(ID3D12GraphicsCommandList* list,
+ bool Streamline::TagFrameGeneration(ID3D12GraphicsCommandList* list,
+                                     const std::shared_ptr<Frame>& timeline, const FGFrame& frame,
+                                     uint32_t backbuffer_width, uint32_t backbuffer_height) {
++  std::lock_guard lock(api_mutex_);
+ #if REX_HAS_STREAMLINE
+   // A rejected frame clears the old tags and resets history. The caller suspends
+   // FG before presenting that frame; rejection is never a successful dispatch.
+@@ -880,6 +1000,7 @@ bool Streamline::TagFrameGeneration(ID3D12GraphicsCommandList* list,
+ }
+ 
+ bool Streamline::GetFrameGenerationState(FGState& state) {
++  std::lock_guard lock(api_mutex_);
+   state = {};
+ #if REX_HAS_STREAMLINE
+   if (!impl_->attached || !support_.fg || !impl_->fg_loaded)
+@@ -900,8 +1021,12 @@ bool Streamline::GetFrameGenerationState(FGState& state) {
+ }
+ 
+ void Streamline::Shutdown() {
++  std::lock_guard lock(api_mutex_);
+ #if REX_HAS_STREAMLINE
+   if (impl_->init_called) {
++    for (auto& pending : impl_->render_tokens)
++      RetireRenderToken(pending);
++    impl_->render_tokens = {};
+     ReleaseSR();
+     Check(impl_->shutdown(), "slShutdown");
+     impl_->init_called = false;
+diff --git a/src/ui/guest_frame_timing.cpp b/src/ui/guest_frame_timing.cpp
+index a300e23..9958463 100644
+--- a/src/ui/guest_frame_timing.cpp
++++ b/src/ui/guest_frame_timing.cpp
+@@ -1,10 +1,16 @@
+ #include <rex/ui/guest_frame_timing.h>
+ #include <rex/logging.h>
++#include <rex/cvar.h>
+ #include <chrono>
+ #include <fstream>
+ #include <thread>
+ #include <utility>
+ 
++REXCVAR_DEFINE_BOOL(
++    ssx_frame_token_handoff, false, "SSX",
++    "Experimental NVIDIA token transport through DLAA and Present; no Reflex pacing or FG.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ namespace rex::ui {
+ namespace {
+ thread_local uint64_t render_id = 0;
+@@ -44,13 +50,21 @@ constexpr const char* names[] = {"input_begin",
+                                  "guest_render_marker",
+                                  "guest_render_marker_rejected",
+                                  "gpu_render_marker",
+-                                 "gpu_render_marker_conflict"};
+-static_assert(std::size(names) == size_t(GuestFrameTiming::Event::kGpuRenderMarkerConflict) + 1);
++                                 "gpu_render_marker_conflict",
++                                 "nvidia_token_created",
++                                 "nvidia_token_evaluated",
++                                 "nvidia_token_presented",
++                                 "nvidia_token_dropped",
++                                 "nvidia_token_repeated"};
++static_assert(std::size(names) == size_t(GuestFrameTiming::Event::kNvidiaTokenRepeated) + 1);
+ }  // namespace
+ GuestFrameTiming& GuestFrameTiming::Get() {
+   static GuestFrameTiming trace;
+   return trace;
+ }
++bool GuestFrameTiming::ContinuousMarkersEnabled() {
++  return REXCVAR_GET(ssx_frame_token_handoff);
++}
+ uint64_t GuestFrameTiming::CurrentRender() {
+   return render_id;
+ }
