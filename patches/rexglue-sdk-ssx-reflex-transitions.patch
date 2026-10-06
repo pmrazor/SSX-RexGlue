@@ -1,0 +1,278 @@
+diff --git a/include/rex/ui/guest_frame_timing.h b/include/rex/ui/guest_frame_timing.h
+index 19e65a6..d0038ce 100644
+--- a/include/rex/ui/guest_frame_timing.h
++++ b/include/rex/ui/guest_frame_timing.h
+@@ -63,7 +63,9 @@ class GuestFrameTiming {
+     kReflexInput,
+     kReflexFrameInput,
+     kReflexPhysicsBind,
+-    kReflexInputConsumed
++    kReflexInputConsumed,
++    kReflexSampleUpdate,
++    kReflexWorkerComplete
+   };
+   struct Record {
+     uint64_t time_ns, id, related, detail;
+diff --git a/include/rex/ui/guest_reflex.h b/include/rex/ui/guest_reflex.h
+index 956d832..0d7c31e 100644
+--- a/include/rex/ui/guest_reflex.h
++++ b/include/rex/ui/guest_reflex.h
+@@ -29,6 +29,7 @@ class GuestReflex {
+   // Called outside guest locks, before original worker code / controller reads.
+   bool BeginWorker(uint64_t worker);
+   void Input(uint64_t worker);
++  void BeginSamples(uint64_t worker);
+   void Published(uint64_t worker, Sample sample);
+   void EndWorker(uint64_t worker);
+   // Called before normal render job takes renderer/device locks.
+@@ -57,6 +58,7 @@ class GuestReflex {
+   uint64_t wanted_ = 0, worker_ = 0, render_ = 0;
+   uint64_t update_ = 0, pending_worker_ = 0;
+   bool frame_driven_ = false, worker_done_ = false;
++  bool samples_expected_ = false;
+   std::chrono::steady_clock::time_point last_render_request_{};
+   bool finished_ = false, input_ = false, ping_ = false, flash_ = false;
+   uint32_t ping_message_ = 0;
+diff --git a/src/ui/d3d12/streamline.cpp b/src/ui/d3d12/streamline.cpp
+index 9deb794..f726be3 100644
+--- a/src/ui/d3d12/streamline.cpp
++++ b/src/ui/d3d12/streamline.cpp
+@@ -9,6 +9,12 @@
+ #include <utility>
+ 
+ #include <rex/logging.h>
++#include <rex/cvar.h>
++
++REXCVAR_DEFINE_STRING(ssx_reflex_mode, "on", "SSX/Reflex",
++                      "NVIDIA Reflex Low Latency: off, on, boost (On + Boost). Applies live when "
++                      "the Reflex launcher is active.")
++    .allowed({"off", "on", "boost"});
+ 
+ #if REX_HAS_STREAMLINE
+ #include <sl.h>
+@@ -588,9 +594,14 @@ bool Streamline::EnableSsxReflex() {
+     return true;
+   if (mode != "off" && mode != "on" && mode != "boost")
+     return false;
+-  if (!ConfigureReflex(mode == "on"      ? ReflexMode::kOn
+-                       : mode == "boost" ? ReflexMode::kOnWithBoost
+-                                         : ReflexMode::kOff))
++  // Preserve old command lines, while allowing a saved/live mode to override
++  // the legacy integration switch. The launcher supplies the new mode explicitly.
++  if (rex::cvar::GetFlagSource("ssx_reflex_mode") == rex::cvar::Source::kDefault)
++    REXCVAR_SET(ssx_reflex_mode, mode);
++  const auto setting = REXCVAR_GET(ssx_reflex_mode);
++  if (!ConfigureReflex(setting == "on"      ? ReflexMode::kOn
++                       : setting == "boost" ? ReflexMode::kOnWithBoost
++                                            : ReflexMode::kOff))
+     return false;
+   {
+     std::lock_guard lock(api_mutex_);
+@@ -735,8 +746,8 @@ Streamline::TokenPresentation Streamline::PresentRenderToken(
+   if (owned) {
+     result.render_id = frame->render_id;
+     result.token_id = frame->token_id;  // cached; never dereference a retired SL slot
+-    result.matched = frame->phase == 3 && frame->sr_evaluated && frame->token &&
+-                     uint32_t(*frame->token) == frame->token_id;
++    result.matched = frame->phase == 3 && (frame->ssx_update_id || frame->sr_evaluated) &&
++                     frame->token && uint32_t(*frame->token) == frame->token_id;
+     if (!result.matched && frame->phase != 6)
+       RetireRenderToken(frame);
+   }
+@@ -816,14 +827,19 @@ bool Streamline::ConfigureReflex(ReflexMode mode, uint32_t frame_limit_us) {
+       return false;
+   }
+   options.frameLimitUs = frame_limit_us;
+-  sl::PCLOptions pcl{};
+-  pcl.idThread = GetCurrentThreadId();
+-  sl::PCLState state{};
+-  if (!Check(impl_->pcl_options(pcl), "PCL options") ||
+-      !Check(impl_->pcl_state(state), "PCL state") ||
+-      !Check(impl_->reflex_options(options), "Reflex options"))
++  if (!impl_->reflex_configured) {
++    // Keep the original PCL message target when changing modes on a guest
++    // frame thread. Reinitializing it here would redirect pings to that worker.
++    sl::PCLOptions pcl{};
++    pcl.idThread = GetCurrentThreadId();
++    sl::PCLState state{};
++    if (!Check(impl_->pcl_options(pcl), "PCL options") ||
++        !Check(impl_->pcl_state(state), "PCL state"))
++      return false;
++    impl_->ping_message = state.statsWindowMessage;
++  }
++  if (!Check(impl_->reflex_options(options), "Reflex options"))
+     return false;
+-  impl_->ping_message = state.statsWindowMessage;
+   impl_->reflex_mode = mode;
+   impl_->reflex_configured = true;
+   return true;
+@@ -839,6 +855,17 @@ std::shared_ptr<Streamline::Frame> Streamline::BeginFrame(uint64_t ssx_update_id
+ #if REX_HAS_STREAMLINE
+   if (!impl_->attached || !impl_->reflex_configured)
+     return nullptr;
++  if (ssx_update_id && impl_->ssx_sync_enabled) {
++    const auto setting = REXCVAR_GET(ssx_reflex_mode);
++    const auto requested = setting == "boost" ? ReflexMode::kOnWithBoost
++                           : setting == "on"  ? ReflexMode::kOn
++                                              : ReflexMode::kOff;
++    if (requested != impl_->reflex_mode) {
++      if (!ConfigureReflex(requested))
++        return nullptr;
++      REXGPU_INFO("SSX_REFLEX mode={} applied_at_update={}", setting, ssx_update_id);
++    }
++  }
+   auto& full_slot = impl_->full_tokens[impl_->full_token_slot];
+   if (auto pending = full_slot.lock(); pending && pending->phase != 6)
+     return nullptr;
+diff --git a/src/ui/guest_frame_timing.cpp b/src/ui/guest_frame_timing.cpp
+index 68b5bb6..027c6fc 100644
+--- a/src/ui/guest_frame_timing.cpp
++++ b/src/ui/guest_frame_timing.cpp
+@@ -70,8 +70,10 @@ constexpr const char* names[] = {"input_begin",
+                                  "reflex_input",
+                                  "reflex_frame_input",
+                                  "reflex_physics_bind",
+-                                 "reflex_input_consumed"};
+-static_assert(std::size(names) == size_t(GuestFrameTiming::Event::kReflexInputConsumed) + 1);
++                                 "reflex_input_consumed",
++                                 "reflex_sample_update",
++                                 "reflex_worker_complete"};
++static_assert(std::size(names) == size_t(GuestFrameTiming::Event::kReflexWorkerComplete) + 1);
+ }  // namespace
+ GuestFrameTiming& GuestFrameTiming::Get() {
+   static GuestFrameTiming trace;
+diff --git a/src/ui/guest_reflex.cpp b/src/ui/guest_reflex.cpp
+index 631d424..4279d7c 100644
+--- a/src/ui/guest_reflex.cpp
++++ b/src/ui/guest_reflex.cpp
+@@ -59,6 +59,7 @@ void GuestReflex::CancelLocked() {
+   update_ = 0;
+   worker_done_ = false;
+   consumed_users_ = 0;
++  samples_expected_ = false;
+   finished_ = input_ = false;
+   samples_ = {};
+   changed_.notify_all();
+@@ -119,11 +120,23 @@ void GuestReflex::Published(uint64_t worker, Sample sample) {
+   REXLOG_WARN("SSX_REFLEX abort=unexpected_sample_channel worker={}", worker);
+   CancelLocked();
+ }
++void GuestReflex::BeginSamples(uint64_t worker) {
++  std::lock_guard lock(mutex_);
++  if (!frame_driven_ || !worker || worker_ != worker)
++    return;
++  samples_expected_ = true;
++  GuestFrameTiming::Get().Add(GuestFrameTiming::Event::kReflexSampleUpdate, worker, update_);
++}
+ void GuestReflex::EndWorker(uint64_t worker) {
+   std::lock_guard lock(mutex_);
+   if (!worker || worker_ != worker)
+     return;
+   if (frame_driven_) {
++    const uint32_t sample_mask =
++        unsigned(bool(samples_[0].key)) | (unsigned(bool(samples_[1].key)) << 1);
++    GuestFrameTiming::Get().Add(GuestFrameTiming::Event::kReflexWorkerComplete, worker, update_,
++                                unsigned(input_) | (unsigned(samples_expected_) << 1) |
++                                    (consumed_users_ << 8) | (sample_mask << 16));
+     worker_done_ = true;
+     changed_.notify_all();
+     return;
+@@ -191,6 +204,7 @@ bool GuestReflex::BeginRenderUpdate(uint64_t render, const std::function<bool()>
+   worker_ = 0;
+   worker_done_ = input_ = finished_ = false;
+   consumed_users_ = 0;
++  samples_expected_ = false;
+   samples_ = {};
+   if (backend_.input)
+     backend_.input(update_, std::exchange(ping_, false), std::exchange(flash_, false));
+@@ -205,10 +219,20 @@ bool GuestReflex::BeginRenderUpdate(uint64_t render, const std::function<bool()>
+     worker_ = std::exchange(pending_worker_, 0);
+     GuestFrameTiming::Get().Add(GuestFrameTiming::Event::kReflexPhysicsBind, worker_, update_);
+     changed_.notify_all();
+-    if (!changed_.wait_for(lock, kWait, [&] { return !owner_ || !update_ || worker_done_; }) ||
+-        !owner_ || !update_ || !input_ || consumed_users_ != 0xF || !samples_[0].key ||
+-        !samples_[1].key) {
+-      REXLOG_WARN("SSX_REFLEX abort=physics_handoff render={}", render);
++    const bool ready =
++        changed_.wait_for(lock, kWait, [&] { return !owner_ || !update_ || worker_done_; });
++    // 823D2DF0 has a source-verified control-only branch which never enters
++    // 823D1B10. A frame update can legitimately contain no physics publication.
++    // If publication starts, both channels must finish; never accept half a pair.
++    const bool valid_samples = samples_expected_ ? (samples_[0].key && samples_[1].key)
++                                                 : (!samples_[0].key && !samples_[1].key);
++    const bool valid_input = input_ ? consumed_users_ == 0xF : consumed_users_ == 0;
++    if (!ready || !owner_ || !update_ || !worker_done_ || !valid_input || !valid_samples) {
++      REXLOG_WARN(
++          "SSX_REFLEX abort=physics_handoff render={} ready={} done={} input={} users={:X} "
++          "samples_expected={} samples={},{}",
++          render, ready, worker_done_, input_, consumed_users_, samples_expected_,
++          bool(samples_[0].key), bool(samples_[1].key));
+       CancelLocked();
+       return false;
+     }
+diff --git a/tests/unit/graphics/guest_reflex_test.cpp b/tests/unit/graphics/guest_reflex_test.cpp
+index 2dc0269..63dce6e 100644
+--- a/tests/unit/graphics/guest_reflex_test.cpp
++++ b/tests/unit/graphics/guest_reflex_test.cpp
+@@ -43,6 +43,7 @@ TEST_CASE("SSX render-driven Reflex permits extra renders between physics jobs",
+       scheduler.Input(100);
+       for (uint32_t user = 0; user < 4; ++user)
+         scheduler.ConsumedInput(100, consumed.load(), user);
++      scheduler.BeginSamples(100);
+       scheduler.Published(100, {uint64_t(1) << 32 | 10, 1, 123});
+       scheduler.Published(100, {uint64_t(2) << 32 | 20, 2, 123});
+       scheduler.EndWorker(100);
+@@ -64,6 +65,53 @@ TEST_CASE("SSX render-driven Reflex permits extra renders between physics jobs",
+   scheduler.Detach(&scheduler);
+ }
+ 
++TEST_CASE("SSX Reflex distinguishes control-only workers from incomplete physics", "[ssx-reflex]") {
++  for (unsigned scenario = 0; scenario < 7; ++scenario) {
++    CAPTURE(scenario);
++    GuestReflex scheduler;
++    unsigned cancels = 0;
++    GuestReflex::Backend backend;
++    backend.begin = [](uint64_t) { return true; };
++    backend.end = [](uint64_t) { return true; };
++    backend.bind = [](uint64_t a, uint64_t b) { return a == b; };
++    backend.cancel = [&](uint64_t) { ++cancels; };
++    scheduler.Attach(&scheduler, backend, true);
++    REQUIRE(scheduler.BeginRenderUpdate(1, [] { return true; }));
++    scheduler.Complete(1);
++    std::atomic<bool> finished{false}, begun{false};
++    std::thread worker([&] {
++      begun = scheduler.BeginWorker(1000);
++      if (begun) {
++        const auto update = scheduler.InputUpdateForWorker(1000);
++        if (scenario != 1) {
++          scheduler.Input(1000);
++          for (uint32_t user = 0; user < (scenario == 5 ? 1u : 4u); ++user)
++            scheduler.ConsumedInput(1000, update, user);
++        }
++        if (scenario >= 2 && scenario <= 4)
++          scheduler.BeginSamples(1000);
++        if (scenario == 2 || scenario == 3 || scenario == 6)
++          scheduler.Published(1000, {uint64_t(1) << 32 | 10, 1, 123});
++        if (scenario == 2)
++          scheduler.Published(1000, {uint64_t(2) << 32 | 20, 2, 123});
++        scheduler.EndWorker(1000);
++      }
++      finished = true;
++    });
++    bool valid = true;
++    for (uint64_t render = 2; render < 102 && !finished.load(); ++render) {
++      valid &= scheduler.BeginRenderUpdate(render, [] { return true; });
++      scheduler.Complete(render);
++      std::this_thread::sleep_for(1ms);
++    }
++    worker.join();
++    CHECK(begun.load());
++    CHECK(valid == (scenario < 3));
++    CHECK(cancels == (scenario < 3 ? 0 : 1));
++    scheduler.Detach(&scheduler);
++  }
++}
++
+ TEST_CASE("SSX coupled Reflex binds actual input and both published channels", "[ssx-reflex]") {
+   GuestReflex scheduler;
+   std::atomic<unsigned> begins{0}, ends{0}, binds{0}, cancels{0};

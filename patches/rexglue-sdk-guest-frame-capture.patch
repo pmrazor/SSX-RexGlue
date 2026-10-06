@@ -1,0 +1,135 @@
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index b0b5894..c14df89 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstdarg>
+ #include <cstring>
+ #include <sstream>
+@@ -42,6 +43,15 @@ REXCVAR_DEFINE_BOOL(d3d12_gpu_profile, false, "GPU/D3D12",
+                     "every 2 seconds.");
+ REXCVAR_DEFINE_BOOL(d3d12_log_swap, false, "GPU/D3D12",
+                     "Log actual swap source, active output, scale and format when they change.");
++
++namespace {
++// Console/keybind callbacks run on the UI thread; capture APIs run on the GPU
++// worker. Coalesce repeated requests without racing the cvar value storage.
++std::atomic<bool> renderdoc_guest_capture_requested{false};
++}
++REXCVAR_DEFINE_COMMAND(d3d12_capture_guest_frame,
++                       [] { renderdoc_guest_capture_requested.store(true); }, "GPU/D3D12",
++                       "Capture the next complete guest GPU frame in attached RenderDoc.");
+ REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+@@ -1794,6 +1804,14 @@ bool D3D12CommandProcessor::SetupContext() {
+ 
+ void D3D12CommandProcessor::ShutdownContext() {
+   AwaitAllQueueOperationsCompletion();
++  // Pair our own Start even if shutdown interrupts a guest frame. Never end a
++  // capture initiated by RenderDoc's UI/hotkey.
++  if (renderdoc_capture_owned_) {
++    REXGPU_WARN("SSX_CAPTURE interrupted by shutdown; capture may be incomplete");
++    EndRenderDocGuestCapture();
++  }
++  renderdoc_api_.reset();
++  renderdoc_guest_capture_requested.store(false);
+   InvalidateAllVertexBufferResidency();
+   ShutdownOcclusionQueryResources();
+ 
+@@ -3489,6 +3507,43 @@ void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HR
+   }
+ }
+ 
++void D3D12CommandProcessor::BeginRenderDocGuestCapture() {
++  if (!renderdoc_guest_capture_requested.exchange(false)) {
++    return;
++  }
++  if (!renderdoc_api_) {
++    renderdoc_api_ = ui::RenderDocAPI::CreateIfConnected();
++  }
++  if (!renderdoc_api_) {
++    REXGPU_WARN("SSX_CAPTURE unavailable; launch this build through RenderDoc first");
++    return;
++  }
++  const auto* api = renderdoc_api_->api_1_0_0();
++  if (api->IsFrameCapturing()) {
++    REXGPU_WARN("SSX_CAPTURE skipped; another RenderDoc capture is already active");
++    return;
++  }
++  // A null window deliberately selects device capture: the guest renderer
++  // produces an offscreen image, and the independent UI may present it later.
++  api->StartFrameCapture(GetD3D12Provider().GetDevice(), nullptr);
++  renderdoc_capture_owned_ = api->IsFrameCapturing() != 0;
++  if (renderdoc_capture_owned_) {
++    REXGPU_INFO("SSX_CAPTURE begin guest_frame={}", frame_current_);
++  } else {
++    REXGPU_WARN("SSX_CAPTURE RenderDoc did not start a capture");
++  }
++}
++
++void D3D12CommandProcessor::EndRenderDocGuestCapture() {
++  if (!renderdoc_capture_owned_) {
++    return;
++  }
++  renderdoc_capture_owned_ = false;
++  const auto* api = renderdoc_api_->api_1_0_0();
++  const bool saved = api->EndFrameCapture(GetD3D12Provider().GetDevice(), nullptr) != 0;
++  REXGPU_INFO("SSX_CAPTURE end guest_frame={} saved={}", frame_current_, saved);
++}
++
+ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+@@ -3537,6 +3592,11 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+     }
+   }
+ 
++  if (is_opening_frame) {
++    // An existing non-guest deferred list has not reached D3D12 yet, so this
++    // also captures frames that promote an already open submission.
++    BeginRenderDocGuestCapture();
++  }
+   if (!submission_open_) {
+     submission_open_ = true;
+ 
+@@ -3704,6 +3764,10 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+     if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
+       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
+     }
++    // All submissions through the guest swap have reached ExecuteCommandLists.
++    // RenderDoc synchronizes/readbacks when ending the capture. Waiting for a
++    // host Present instead would mix independent UI and guest frame boundaries.
++    EndRenderDocGuestCapture();
+     frame_open_ = false;
+     // Submission already closed now, so minus 1.
+     closed_frame_submissions_[(frame_current_++) % kQueueFrames] = submission_current_ - 1;
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 23ea892..1125c21 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -41,6 +41,7 @@
+ #include <rex/ui/d3d12/d3d12_provider.h>
+ #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
+ #include <rex/ui/d3d12/d3d12_util.h>
++#include <rex/ui/renderdoc_api.h>
+ 
+ namespace rex::graphics::d3d12 {
+ 
+@@ -337,6 +338,12 @@ class D3D12CommandProcessor : public CommandProcessor {
+   // opposed to simply resuming after mid-frame synchronization). Returns
+   // whether a submission is open currently and the device is not removed.
+   bool BeginSubmission(bool is_guest_command);
++
++  // Capture a complete guest frame, independent of the UI presentation cadence.
++  void BeginRenderDocGuestCapture();
++  void EndRenderDocGuestCapture();
++  std::unique_ptr<ui::RenderDocAPI> renderdoc_api_;
++  bool renderdoc_capture_owned_ = false;
+   // If is_swap is true, a full frame is closed - with, if needed, cache
+   // clearing and stopping capturing. Returns whether the submission was done
+   // successfully, if it has failed, leaves it open.

@@ -1,0 +1,119 @@
+{
+  "sdkBase": "f5337cdc947ff6d4c4196737e2c807a48f2a1fc2",
+  "upstreamFixes": "rexglue-sdk-ssx-fixes.patch",
+  "upstreamFixesSha256": "a74805931997dbe234dfbb29035e5a65a4aa6f0512b658831981c2bc400599d3",
+  "patches": [
+    {
+      "file": "rexglue-sdk-present-diagnostics.patch",
+      "sha256": "47a8d3602e932f5934b671ccdc9e013aa042b092b42c556784fdeb6f2f5f5dd9"
+    },
+    {
+      "file": "rexglue-sdk-capture-markers.patch",
+      "sha256": "47c66e262b566276b9f938964feb62247e96be369ef5d322189bb7b2fad94712"
+    },
+    {
+      "file": "rexglue-sdk-guest-frame-capture.patch",
+      "sha256": "345a5522d72b6d9a84adc03a3610b04c14adeeb822fc8d7045c99eb69ab4ae7e"
+    },
+    {
+      "file": "rexglue-sdk-streamline.patch",
+      "sha256": "513a6eb61051f52410b809a4939d3cbad78f81718a9a809c7bd4e0ca4d12f91a"
+    },
+    {
+      "file": "rexglue-sdk-test-build.patch",
+      "sha256": "6a4b5a510866d26ec032da0a643e8fe83dbcd62d2b2d3553a5a846fcc0d19021"
+    },
+    {
+      "file": "rexglue-sdk-ssx-frame-inputs.patch",
+      "sha256": "5153a53c68f296e4bc169495408be9aa944cfd4bbc4310556d52a4258592ce88"
+    },
+    {
+      "file": "rexglue-sdk-ssx-camera-motion.patch",
+      "sha256": "214c431346d07f91a63eba28bd2ee99827f2a6414a9d92ea17ddf9b28004b063"
+    },
+    {
+      "file": "rexglue-sdk-ssx-native-motion.patch",
+      "sha256": "8d30507de4ad093b9a39aabaec54f7b2ac58d386d1c8f14e615aedb58c18f4c6"
+    },
+    {
+      "file": "rexglue-sdk-ssx-temporal-inputs.patch",
+      "sha256": "6425b34bc16d7337b0fddb6a47a35118c24667e5a967334d8c008b470633269b"
+    },
+    {
+      "file": "rexglue-sdk-ssx-temporal-alignment.patch",
+      "sha256": "e68ccb450f66d7dc5e5c91a499c1718dc60fd634082957b3caeccf2c31f5086c"
+    },
+    {
+      "file": "rexglue-sdk-ssx-dlss-evaluation.patch",
+      "sha256": "fd10ad0cc1712cc1d4ab67ba135add0c900526a705e2a2245f6abd4f22f75457"
+    },
+    {
+      "file": "rexglue-sdk-ssx-dlaa.patch",
+      "sha256": "c794e584196ad505bb4d1e12b1b57451ba53cf677567757edb0c8d15855cba89"
+    },
+    {
+      "file": "rexglue-sdk-ssx-quality-preset-l.patch",
+      "sha256": "7d391d5e6bb5184d6447ce1045f97f8d1f070c93d86d28a35942f71d8fdd0589"
+    },
+    {
+      "file": "rexglue-sdk-ssx-quality-races.patch",
+      "sha256": "b83477aae2c863a3b24a06ad8a48f4c0940039586bcbea246c27e13009614380"
+    },
+    {
+      "file": "rexglue-sdk-ssx-fg-reflex.patch",
+      "sha256": "2b78c38975255620db243b1ec79d0f8f7b4f794d67ce8156e22e7e874dd54d3d"
+    },
+    {
+      "file": "rexglue-sdk-ssx-reflex-lineage.patch",
+      "sha256": "33d005fe8080f67f5ba63ab91b5c7456ccdaf096c4dc34e8483f8e5aee972b58"
+    },
+    {
+      "file": "rexglue-sdk-ssx-frame-tokens.patch",
+      "sha256": "b249daac79bf2d800996a6a527ebf6024e8f1f1d5a90dcca6e28caf656cb8279"
+    },
+    {
+      "file": "rexglue-sdk-ssx-reflex-coupled.patch",
+      "sha256": "ac461305433c72190e6fa084a2cef3b82356f9d8ac2abcd4da3ed529ca9aecbf"
+    },
+    {
+      "file": "rexglue-sdk-ssx-reflex-frame-driven.patch",
+      "sha256": "9d9749fb5d05c17b1749560cbf3b4a1c0571da3ebe178117861d2b98b066c227"
+    },
+    {
+      "file": "rexglue-sdk-ssx-reflex-transitions.patch",
+      "sha256": "7bbe8bc1e5a4b427a216ec23117021ceecba52f85419b89291ecc8447b4d7006"
+    },
+    {
+      "file": "rexglue-sdk-ssx-performance.patch",
+      "sha256": "5ecefbb5bb9aada95ec90751f108b6fdcb37e3d0c0c84bab19ab52daa320dad7"
+    },
+    {
+      "file": "rexglue-sdk-ssx-fg-gameplay.patch",
+      "sha256": "10b0c82932a0391fda8f77401c9fffdefbc17e9fe07f7189e5b1ec6c27b4df98"
+    },
+    {
+      "file": "rexglue-sdk-ssx-fg-multiframe.patch",
+      "sha256": "9c43248bfc18feddbe56b7fc6c33d284a1c3f84401a24771e711ad4c415d62c6"
+    },
+    {
+      "file": "rexglue-sdk-ssx-hdr-preview.patch",
+      "sha256": "7c4a5e23a305b5c12316d462671460e3ae31501334f2a7d1585ae8269708a63a"
+    },
+    {
+      "file": "rexglue-sdk-ssx-hdr-grading.patch",
+      "sha256": "8b1522e8939373543dfb1289cea90aa4a5ffde2ddbe72acc1686ce652c629e29"
+    },
+    {
+      "file": "rexglue-sdk-ssx-hdr-layers.patch",
+      "sha256": "e2b295bf29f2b33a1a2add181124877d81b2a62961492407e5950d98f1762b3b"
+    },
+    {
+      "file": "rexglue-sdk-ssx-hdr-fg.patch",
+      "sha256": "eb4a617051fb3e198d736b70ae4db553b9acbf25513f8911abe3302de18714b0"
+    },
+    {
+      "file": "rexglue-sdk-ssx-independent-features.patch",
+      "sha256": "86c1ce6b219364efefde3c96dfdb952651e66de87bfc40ce217c5a35f1eb84f5"
+    }
+  ]
+}

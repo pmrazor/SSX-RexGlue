@@ -1,0 +1,667 @@
+diff --git a/include/rex/ui/d3d12/d3d12_presenter.h b/include/rex/ui/d3d12/d3d12_presenter.h
+index 580496b..841fcd4 100644
+--- a/include/rex/ui/d3d12/d3d12_presenter.h
++++ b/include/rex/ui/d3d12/d3d12_presenter.h
+@@ -24,6 +24,7 @@
+ #include <rex/ui/d3d12/ssx_native_motion.h>
+ #include <rex/ui/d3d12/ssx_scene_color.h>
+ #include <rex/ui/d3d12/ssx_fg_capture.h>
++#include <rex/ui/d3d12/ssx_fg_color.h>
+ #include <rex/ui/surface.h>
+ 
+ namespace rex::ui::d3d12 {
+@@ -99,6 +100,7 @@ class D3D12Presenter final : public Presenter {
+ 
+   const D3D12Provider& provider() const { return provider_; }
+ 
++  bool RequiresSurfaceRecreationOnFullscreenChange() const override;
+   Surface::TypeFlags GetSupportedSurfaceTypes() const override;
+ 
+   bool CaptureGuestOutput(RawImage& image_out) override;
+@@ -261,6 +263,11 @@ class D3D12Presenter final : public Presenter {
+     SsxNativeMotion native_motion;
+     SsxSceneColor scene_color;
+     SsxFGCapture fg_capture;
++    SsxFGColor fg_color;
++    uint64_t fg_last_frame = 0, fg_rendered = 0, fg_presented = 0;
++    bool fg_active = false, fg_failed = false;
++    HWND fg_hwnd = nullptr;
++    const char* fg_reason = "startup";
+     uint64_t last_motion_frame_logged = 0;
+     SsxMotionReset last_motion_reason = SsxMotionReset::kFirstFrame;
+ 
+@@ -286,6 +293,7 @@ class D3D12Presenter final : public Presenter {
+   bool dxgi_supports_tearing() const { return dxgi_supports_tearing_; }
+ 
+   bool InitializeSurfaceIndependent();
++  void SuspendFrameGeneration();
+ 
+ #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+   bool EnsureTemporalUpscalerContext(uint32_t render_width, uint32_t render_height,
+diff --git a/include/rex/ui/d3d12/ssx_fg_color.h b/include/rex/ui/d3d12/ssx_fg_color.h
+index 6cb6a85..ba446fe 100644
+--- a/include/rex/ui/d3d12/ssx_fg_color.h
++++ b/include/rex/ui/d3d12/ssx_fg_color.h
+@@ -14,6 +14,7 @@ struct SsxFGColorFrame {
+   // must wait for NVIDIA's input-consumption fence as well as its own writes.
+   Microsoft::WRL::ComPtr<ID3D12Fence> fg_fence;
+   uint64_t fg_fence_value = 0;
++  bool consumption_unknown = false;
+ };
+ 
+ bool CanBuildSsxFGColor(const SsxFrameInputs& input, uint32_t width, uint32_t height);
+@@ -22,6 +23,8 @@ class SsxFGColor {
+  public:
+   SsxFGColor();
+   ~SsxFGColor();  // Caller drains presentation and FG input work first.
++  void Collect(uint64_t completed);
++  void EnqueueConsumptionWaits(ID3D12CommandQueue* queue);
+   std::shared_ptr<SsxFGColorFrame> Record(const D3D12Provider& provider,
+                                           ID3D12GraphicsCommandList* list,
+                                           const std::shared_ptr<const SsxFrameInputs>& frame,
+diff --git a/include/rex/ui/d3d12/streamline.h b/include/rex/ui/d3d12/streamline.h
+index 2c84707..5689c6f 100644
+--- a/include/rex/ui/d3d12/streamline.h
++++ b/include/rex/ui/d3d12/streamline.h
+@@ -89,6 +89,9 @@ class Streamline {
+   uint32_t LatencyPingMessage() const;
+   // The token ID is diagnostic identity, not a timestamp or a guest frame index.
+   bool GetFrameId(const std::shared_ptr<Frame>& frame, uint32_t& id) const;
++  // Exact guest render identity retained by this token, independent of the
++  // optional swap diagnostic ID. Reject foreign, missing and retired tokens.
++  bool GetFrameRenderId(const std::shared_ptr<Frame>& frame, uint64_t& id) const;
+   struct ReflexReport {
+     uint64_t frame_id = 0;
+     uint64_t simulation_start_us = 0, simulation_end_us = 0;
+@@ -160,6 +163,7 @@ class Streamline {
+   // Short-lived pause/menu/loading suspension retains allocations. Clear tags
+   // for the invalid frame as well. Resume requires valid inputs and a reset.
+   bool SetFrameGenerationActive(bool active);
++  void RequestFrameGenerationReset(bool requested = true);
+   struct FGFrame {
+     SRCamera camera;
+     std::array<float, 2> jitter_pixels{};
+@@ -169,6 +173,7 @@ class Streamline {
+     // Caller retains all resources unchanged until Present and GPU completion.
+     ID3D12Resource* hudless = nullptr;
+     ID3D12Resource* ui_alpha = nullptr;  // Optional R8_UNORM/R16_FLOAT/R32_FLOAT.
++    D3D12_RESOURCE_STATES temporal_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+     bool reset = false, depth_inverted = false;
+   };
+   // Depth/MV use NON_PIXEL_SHADER_RESOURCE, HUD/UI use the combined pixel and
+diff --git a/include/rex/ui/guest_frame_timing.h b/include/rex/ui/guest_frame_timing.h
+index d0038ce..b620017 100644
+--- a/include/rex/ui/guest_frame_timing.h
++++ b/include/rex/ui/guest_frame_timing.h
+@@ -88,8 +88,13 @@ class GuestFrameTiming {
+   // "latest render" value would silently attribute cross-thread work wrongly.
+   static uint64_t CurrentRender();
+   static uint64_t ExchangeRender(uint64_t id);
++  // Game adapter supplies an explicit per-render race/pause decision. Missing,
++  // expired and frontend entries always disable experimental frame generation.
++  void SetFrameGenerationScene(uint64_t render, bool allowed);
++  bool FrameGenerationScene(uint64_t render);
+ 
+  private:
++  std::array<std::pair<uint64_t, bool>, 64> fg_scenes_{};
+   std::atomic<bool> capturing_{false};
+   std::atomic<uint64_t> next_id_{1};
+   std::mutex mutex_;
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index afb4a30..c539828 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -331,6 +331,9 @@ class Presenter {
+ 
+   // For calling from the Window for the Presenter attached to it.
+   // May be called from the destructor of the presenter through the window.
++  // Async presentation may need to be disconnected before the OS window style
++  // changes, not merely when ResizeBuffers is eventually called.
++  virtual bool RequiresSurfaceRecreationOnFullscreenChange() const { return false; }
+   void SetWindowSurfaceFromUIThread(Window* new_window, Surface* new_surface);
+   void OnSurfaceMonitorUpdateFromUIThread(bool old_monitor_potentially_disconnected);
+   void OnSurfaceResizeFromUIThread();
+diff --git a/src/core/cvar.cpp b/src/core/cvar.cpp
+index a8e3e78..8c9bc03 100644
+--- a/src/core/cvar.cpp
++++ b/src/core/cvar.cpp
+@@ -599,8 +599,31 @@ std::vector<std::string> Init(int argc, char** argv) {
+     }
+   }
+ 
++  // CLI11 treats --string= as a missing value and consumes the next argument,
++  // including an option belonging to a plugin registered later. Preserve the
++  // explicit empty value as its own argv element; do not reinterpret unknown
++  // plugin options, non-string values or arguments after the terminator.
++  std::vector<std::string> arguments;
++  bool options = true;
++  for (int i = 0; i < argc; ++i) {
++    std::string_view argument(argv[i]);
++    if (argument == "--")
++      options = false;
++    if (i && options && argument.starts_with("--") && argument.ends_with('=')) {
++      const auto* entry = GetFlagInfo(argument.substr(2, argument.size() - 3));
++      if (entry && entry->type == FlagType::String) {
++        arguments.emplace_back(argument.substr(0, argument.size() - 1));
++        arguments.emplace_back();
++        continue;
++      }
++    }
++    arguments.emplace_back(argument);
++  }
++  std::vector<char*> argument_pointers;
++  for (auto& argument : arguments)
++    argument_pointers.push_back(argument.data());
+   try {
+-    app.parse(argc, argv);
++    app.parse(int(argument_pointers.size()), argument_pointers.data());
+   } catch (const CLI::ParseError& e) {
+     // TODO(tomc): dumb workaround for the stupid chicken and its egg.
+     //             dont call rex logging funcs here for now.
+diff --git a/src/graphics/d3d12/ssx_frame_inputs.cpp b/src/graphics/d3d12/ssx_frame_inputs.cpp
+index 598d0dc..8e68ecb 100644
+--- a/src/graphics/d3d12/ssx_frame_inputs.cpp
++++ b/src/graphics/d3d12/ssx_frame_inputs.cpp
+@@ -457,6 +457,7 @@ bool D3D12CommandProcessor::ReconstructSsxScene(uint64_t vs, uint64_t ps,
+   ui::GuestFrameTiming::Get().Add(ui::GuestFrameTiming::Event::kReconstructionEnd, frame_current_,
+                                   0, result.applied);
+   ssx_inputs_->fg_temporal = result.fg_temporal;
++  ssx_inputs_->frame_token = result.fg_temporal ? frozen->frame_token : nullptr;
+   if (result.submitted) NotifyQueueOperationsDoneDirectly();
+   if (!result.applied) ssx_reconstruction_failed_ = true;
+   if (!result.applied || !ssx_reconstruction_log_frame_ || frame_current_-ssx_reconstruction_log_frame_ >= 120) {
+@@ -491,7 +492,7 @@ std::shared_ptr<const ui::d3d12::SsxFrameInputs> D3D12CommandProcessor::SealSsxF
+     const auto& t = ssx_inputs_->fg_hudless;
+     REXGPU_INFO(
+         "SSX_FG_INPUT frame={} captured={} failed={} duplicate={} draw={} extent={}x{} "
+-        "view_format={} swizzle={:X} signs={:X} retained_motion={} fg_active=false",
++        "view_format={} swizzle={:X} signs={:X} retained_motion={}",
+         frame_current_, f.fg_hudless_captured, f.fg_hudless_failed, f.fg_hudless_duplicate,
+         f.fg_hudless_draw, f.fg_hudless_captured ? t.width : 0,
+         f.fg_hudless_captured ? t.height : 0, uint32_t(t.view_format), t.host_swizzle,
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index e08657d..9d69d14 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include <algorithm>
+ #include <climits>
++#include <cstring>
+ #include <chrono>
+ #include <cmath>
+ #include <memory>
+@@ -35,6 +36,14 @@
+ 
+ REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
+                     "Allow variable refresh rate and tearing");
++REXCVAR_DECLARE(std::string, ssx_reflex_mode);
++REXCVAR_DEFINE_BOOL(
++    d3d12_ssx_frame_generation, false, "UI/D3D12",
++    "Experimental SSX DLAA + 2x Frame Generation presentation; requires race inputs and Reflex.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(
++    d3d12_ssx_fg_enable, false, "UI/D3D12",
++    "Enable experimental gameplay FG after HUD-free color validation. Requires FG launcher.");
+ REXCVAR_DEFINE_BOOL(d3d12_log_presenter, false, "UI/D3D12",
+                     "Log swap chain dimensions and format on surface connect or resize.");
+ REXCVAR_DEFINE_BOOL(d3d12_ssx_scene_color, false, "UI/D3D12",
+@@ -71,6 +80,7 @@ D3D12Presenter::~D3D12Presenter() {
+   // Await completion of the usage of everything before destroying anything.
+   // From most likely the latest to most likely the earliest to be signaled, so
+   // just one sleep will likely be needed.
++  SuspendFrameGeneration();
+   paint_context_.AwaitSwapChainUsageCompletion();
+   guest_output_resource_refresher_submission_tracker_.Shutdown();
+   ui_submission_tracker_.Shutdown();
+@@ -349,6 +359,20 @@ bool D3D12Presenter::CaptureGuestOutput(RawImage& image_out) {
+   return true;
+ }
+ 
++bool D3D12Presenter::RequiresSurfaceRecreationOnFullscreenChange() const {
++  return provider_.GetStreamline() && REXCVAR_GET(d3d12_ssx_frame_generation);
++}
++
++void D3D12Presenter::SuspendFrameGeneration() {
++  if (auto* sl = provider_.GetStreamline(); sl && REXCVAR_GET(d3d12_ssx_frame_generation))
++    sl->SetFrameGenerationActive(false);
++  paint_context_.fg_active = false;
++  paint_context_.fg_last_frame = 0;
++  paint_context_.fg_color.EnqueueConsumptionWaits(provider_.GetDirectQueue());
++  // Signal after cross-queue waits, so resize/destruction drains FG reads too.
++  paint_context_.paint_submission_tracker.NextSubmission();
++}
++
+ Presenter::SurfacePaintConnectResult
+ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_surface,
+                                                                 uint32_t new_surface_width,
+@@ -369,6 +393,7 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+       is_vsync_implicit_out = false;
+       return SurfacePaintConnectResult::kSuccessUnchanged;
+     }
++    SuspendFrameGeneration();
+     paint_context_.AwaitSwapChainUsageCompletion();
+     // Using the current swap_chain_allows_tearing_ value that's consistent with
+     // the creation of the swap chain because ResizeBuffers can't toggle the
+@@ -401,6 +426,9 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+   }
+ 
+   if (!paint_context_.swap_chain) {
++    // A normal DLAA launch does not need the FG proxy and its extra copy.
++    if (auto* sl = provider_.GetStreamline(); sl && sl->support().fg)
++      sl->SetFrameGenerationLoaded(REXCVAR_GET(d3d12_ssx_frame_generation));
+     // Create a new swap chain.
+     Surface::TypeIndex surface_type = new_surface.GetType();
+     DXGI_SWAP_CHAIN_DESC1 swap_chain_desc;
+@@ -436,6 +464,7 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+ #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP | WINAPI_PARTITION_GAMES)
+       case Surface::kTypeIndex_Win32Hwnd: {
+         HWND surface_hwnd = static_cast<const Win32HwndSurface&>(new_surface).hwnd();
++        paint_context_.fg_hwnd = surface_hwnd;
+         if (FAILED(dxgi_factory->CreateSwapChainForHwnd(
+                 direct_queue, surface_hwnd, &swap_chain_desc, nullptr, nullptr, &swap_chain_1))) {
+           REXLOG_ERROR("D3D12Presenter: Failed to create a swap chain for the HWND");
+@@ -505,6 +534,7 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+ }
+ 
+ void D3D12Presenter::DisconnectPaintingFromSurfaceFromUIThreadImpl() {
++  SuspendFrameGeneration();
+   paint_context_.DestroySwapChain();
+ }
+ 
+@@ -640,6 +670,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   // Draw the guest output.
+ 
+   const auto inputs_completed = paint_context_.paint_submission_tracker.GetCompletedSubmission();
++  paint_context_.fg_color.Collect(inputs_completed);
+   paint_context_.fg_capture.Record(device, command_list, frame_inputs, guest_output_resource.Get(),
+                                    current_paint_submission, inputs_completed);
+   std::erase_if(paint_context_.frame_input_paint_refs,
+@@ -1219,6 +1250,78 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+     ExecuteUIDrawersFromUIThread(ui_draw_context);
+   }
+ 
++  std::shared_ptr<SsxFGColorFrame> fg_color;
++  bool fg_tagged = false;
++  if (auto* sl = provider_.GetStreamline(); sl && REXCVAR_GET(d3d12_ssx_frame_generation)) {
++    auto& pc = paint_context_;
++    const char* reason = "inputs";
++    const auto temporal = frame_inputs ? frame_inputs->fg_temporal : nullptr;
++    const bool fresh = frame_inputs && frame_inputs->metadata.guest_frame > pc.fg_last_frame;
++    uint64_t render_id = 0;
++    const bool render_known = sl->GetFrameRenderId(frame_token, render_id);
++    const bool scene = render_known && GuestFrameTiming::Get().FrameGenerationScene(render_id);
++    if (render_known && frame_inputs && frame_inputs->metadata.guest_frame % 120 == 0)
++      REXGPU_INFO("SSX_FG_SCENE render={} guest={} allowed={} temporal={} token_match={}",
++                  render_id, frame_inputs->metadata.guest_frame, scene, bool(temporal),
++                  frame_inputs->frame_token == frame_token);
++    const bool focused = pc.fg_hwnd && GetForegroundWindow() == pc.fg_hwnd && !IsIconic(pc.fg_hwnd);
++    if (!REXCVAR_GET(d3d12_ssx_fg_enable))
++      reason = "validation_disabled";
++    else if (pc.fg_failed)
++      reason = "backend_failure";
++    else if (!scene)
++      reason = "pause_or_frontend";
++    else if (!focused)
++      reason = "unfocused";
++    else if (!fresh)
++      reason = "repeated";
++    else if (REXCVAR_GET(d3d12_ssx_dlaa) && temporal && frame_token &&
++             frame_inputs->frame_token == frame_token &&
++             temporal->guest_frame == frame_inputs->metadata.guest_frame &&
++             REXCVAR_GET(ssx_reflex_mode) != "off") {
++      fg_color =
++          pc.fg_color.Record(provider_, command_list, frame_inputs, pc.swap_chain_width,
++                             pc.swap_chain_height, current_paint_submission, inputs_completed);
++      if (fg_color) {
++        // Resume may occur after DLAA has already set constants for this frame.
++        // Never overwrite those constants. Ask the next DLAA frame to reset.
++        if (!pc.fg_active && !temporal->reset) {
++          sl->RequestFrameGenerationReset();
++          reason = "await_shared_reset";
++        } else if (sl->SetFrameGenerationActive(true)) {
++          Streamline::FGFrame fg;
++          fg.camera = temporal->camera;
++          fg.jitter_pixels = temporal->jitter_pixels;
++          fg.depth = frame_inputs->textures[size_t(SsxInput::kResolvedDepth)].resource.Get();
++          fg.motion = temporal->motion.resource.Get();
++          fg.hudless = fg_color->color.Get();
++          fg.reset = temporal->reset;
++          fg.depth_inverted = temporal->depth_inverted;
++          fg.temporal_state = GuestInputTexture::kReadState;
++          fg_tagged = sl->TagFrameGeneration(command_list, frame_token, fg, pc.swap_chain_width,
++                                             pc.swap_chain_height);
++          reason = fg_tagged ? "active" : "tag_rejected";
++        } else
++          reason = "activation_rejected";
++      } else
++        reason = "color_unavailable";
++    }
++    if (!fg_tagged) {
++      sl->SetFrameGenerationActive(false);
++      if (std::strcmp(reason, "await_shared_reset") != 0)
++        sl->RequestFrameGenerationReset(false);
++      sl->ClearFrameGenerationTags(command_list, frame_token);
++    }
++    pc.fg_active = fg_tagged;
++    if (frame_inputs)
++      pc.fg_last_frame = frame_inputs->metadata.guest_frame;
++    if (reason != pc.fg_reason) {
++      REXGPU_INFO("SSX_FG active={} reason={} render={} guest={}", fg_tagged, reason, render_id,
++                  frame_inputs ? frame_inputs->metadata.guest_frame : 0);
++      pc.fg_reason = reason;
++    }
++  }
++
+   // End drawing to the back buffer.
+   D3D12_RESOURCE_BARRIER barrier_rtv_to_present;
+   barrier_rtv_to_present.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+@@ -1252,7 +1355,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+                               current_paint_submission);
+   const auto present = [&] {
+     return paint_context_.swap_chain->Present(
+-        0, DXGI_PRESENT_RESTART |
++        0, (REXCVAR_GET(d3d12_ssx_frame_generation) ? 0 : DXGI_PRESENT_RESTART) |
+                (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
+   };
+   HRESULT present_result;
+@@ -1264,11 +1367,38 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+     else if (token_result.render_id)
+       GuestReflex::Get().Abort(token_result.render_id);
+     if (token_result.matched && token_result.render_id % 120 < 3)
+-      REXGPU_INFO("SSX_TOKEN_PRESENT render={} nvidia={} result={:08X} fg=false",
+-                  token_result.render_id, token_result.token_id, uint32_t(present_result));
++      REXGPU_INFO("SSX_TOKEN_PRESENT render={} nvidia={} result={:08X} fg={}",
++                  token_result.render_id, token_result.token_id, uint32_t(present_result),
++                  fg_tagged);
+   } else {
+     present_result = present();
+   }
++  if (auto* sl = provider_.GetStreamline(); sl && REXCVAR_GET(d3d12_ssx_frame_generation)) {
++    Streamline::FGState state;
++    const bool queried = sl->GetFrameGenerationState(state);
++    if (fg_tagged && fg_color) {
++      // Keep color, depth, immutable MV, descriptors and source packet alive.
++      // Missing fence is a failure, never permission to recycle producer slots.
++      fg_color->fg_fence = state.inputs_fence;
++      fg_color->fg_fence_value = state.inputs_fence_value;
++      // Value zero with a valid fence is NVIDIA's initial reset/no-async-work
++      // result, observed in the GPU probe. Missing fence is not equivalent.
++      fg_color->consumption_unknown = !queried || !state.inputs_fence;
++      if (fg_color->consumption_unknown || state.status || FAILED(present_result)) {
++        paint_context_.fg_failed = true;
++        sl->SetFrameGenerationActive(false);
++        REXGPU_WARN("SSX_FG disabled: status={} fence={} value={} present={:08X}", state.status,
++                    bool(state.inputs_fence), state.inputs_fence_value, uint32_t(present_result));
++      }
++      ++paint_context_.fg_rendered;
++      paint_context_.fg_presented += state.frames_presented;
++      if (paint_context_.fg_rendered % 120 == 0)
++        REXGPU_INFO(
++            "SSX_FG_STATS rendered={} presented={} last_presented={} status={} input_fence={}",
++            paint_context_.fg_rendered, paint_context_.fg_presented, state.frames_presented,
++            state.status, state.inputs_fence_value);
++    }
++  }
+   GuestFrameTiming::Get().Add(GuestFrameTiming::Event::kPresentEnd, timing_id,
+                               current_paint_submission, uint32_t(present_result));
+   // Even if presentation has failed, work might have been enqueued anyway
+diff --git a/src/ui/d3d12/ssx_fg_color.cpp b/src/ui/d3d12/ssx_fg_color.cpp
+index b615099..47fcdea 100644
+--- a/src/ui/d3d12/ssx_fg_color.cpp
++++ b/src/ui/d3d12/ssx_fg_color.cpp
+@@ -110,6 +110,24 @@ struct SsxFGColor::Impl {
+ };
+ SsxFGColor::SsxFGColor() : impl_(std::make_unique<Impl>()) {}
+ SsxFGColor::~SsxFGColor() = default;
++void SsxFGColor::Collect(uint64_t completed) {
++  for (auto& slot : impl_->slots) {
++    auto& out = slot.output;
++    if (out.use_count() == 1 && !out->consumption_unknown && out->submission <= completed &&
++        (!out->fg_fence || out->fg_fence->GetCompletedValue() >= out->fg_fence_value)) {
++      out->input.reset();
++      out->fg_fence.Reset();
++      out->fg_fence_value = 0;
++    }
++  }
++}
++void SsxFGColor::EnqueueConsumptionWaits(ID3D12CommandQueue* queue) {
++  for (auto& slot : impl_->slots) {
++    const auto& out = slot.output;
++    if (out->fg_fence && out->fg_fence_value)
++      queue->Wait(out->fg_fence.Get(), out->fg_fence_value);
++  }
++}
+ std::shared_ptr<SsxFGColorFrame> SsxFGColor::Record(
+     const D3D12Provider& provider, ID3D12GraphicsCommandList* list,
+     const std::shared_ptr<const SsxFrameInputs>& frame, uint32_t width, uint32_t height,
+@@ -119,7 +137,7 @@ std::shared_ptr<SsxFGColorFrame> SsxFGColor::Record(
+   auto* device = provider.GetDevice();
+   for (auto& slot : impl_->slots) {
+     auto& out = slot.output;
+-    if (out.use_count() != 1 || out->submission > completed ||
++    if (out.use_count() != 1 || out->consumption_unknown || out->submission > completed ||
+         (out->fg_fence && out->fg_fence->GetCompletedValue() < out->fg_fence_value))
+       continue;
+     if (!impl_->Prepare(device, slot, width, height))
+diff --git a/src/ui/d3d12/streamline.cpp b/src/ui/d3d12/streamline.cpp
+index f726be3..fde05a2 100644
+--- a/src/ui/d3d12/streamline.cpp
++++ b/src/ui/d3d12/streamline.cpp
+@@ -182,6 +182,7 @@ struct Streamline::Impl {
+   PFun_slSetFeatureLoaded* feature_loaded = nullptr;
+   ReflexMode reflex_mode = ReflexMode::kOff;
+   bool reflex_configured = false, fg_loaded = true, fg_active = false, fg_reset = true;
++  bool fg_reset_requested = false;
+   uint32_t ping_message = 0;
+   std::array<std::shared_ptr<Frame>, 3> render_tokens{};
+   size_t render_token_slot = 0;
+@@ -499,10 +500,11 @@ Streamline::SREvaluation Streamline::EvaluateSR(ID3D12GraphicsCommandList* list,
+       color.Height > bounds.max_height)
+     return {};
+   const uint32_t width = uint32_t(color.Width), height = color.Height;
+-  const bool reset = pending_reset || frame.reset ||
+-                     (frame.timeline && impl_->fg_active && impl_->fg_reset) ||
+-                     !impl_->sr_have_frame || frame.id - impl_->sr_frame != 1 ||
+-                     width != impl_->sr_input_width || height != impl_->sr_input_height;
++  const bool reset =
++      pending_reset || frame.reset ||
++      (frame.timeline && (impl_->fg_reset_requested || (impl_->fg_active && impl_->fg_reset))) ||
++      !impl_->sr_have_frame || frame.id - impl_->sr_frame != 1 || width != impl_->sr_input_width ||
++      height != impl_->sr_input_height;
+   const auto constants =
+       FrameConstants(c, frame.jitter_pixels, width, height, frame.depth_inverted, reset);
+   sl::FrameToken* token = nullptr;
+@@ -861,6 +863,8 @@ std::shared_ptr<Streamline::Frame> Streamline::BeginFrame(uint64_t ssx_update_id
+                            : setting == "on"  ? ReflexMode::kOn
+                                               : ReflexMode::kOff;
+     if (requested != impl_->reflex_mode) {
++      if (requested == ReflexMode::kOff && impl_->fg_active)
++        SetFrameGenerationActive(false);
+       if (!ConfigureReflex(requested))
+         return nullptr;
+       REXGPU_INFO("SSX_REFLEX mode={} applied_at_update={}", setting, ssx_update_id);
+@@ -986,6 +990,21 @@ bool Streamline::GetFrameId(const std::shared_ptr<Frame>& frame, uint32_t& id) c
+ #endif
+ }
+ 
++bool Streamline::GetFrameRenderId(const std::shared_ptr<Frame>& frame, uint64_t& id) const {
++  std::lock_guard lock(api_mutex_);
++  id = 0;
++#if REX_HAS_STREAMLINE
++  if (!impl_->attached || !frame || frame->owner != this || frame->phase != 3 ||
++      !frame->render_id || !frame->token || uint32_t(*frame->token) != frame->token_id)
++    return false;
++  id = frame->render_id;
++  return true;
++#else
++  (void)frame;
++  return false;
++#endif
++}
++
+ bool Streamline::GetReflexState(ReflexState& state) {
+   std::lock_guard lock(api_mutex_);
+   state = {};
+@@ -1049,6 +1068,16 @@ bool Streamline::SetFrameGenerationLoaded(bool loaded) {
+ #endif
+ }
+ 
++void Streamline::RequestFrameGenerationReset(bool requested) {
++  std::lock_guard lock(api_mutex_);
++#if REX_HAS_STREAMLINE
++  impl_->fg_reset_requested = requested;
++  impl_->fg_reset = true;
++#else
++  (void)requested;
++#endif
++}
++
+ bool Streamline::SetFrameGenerationActive(bool active) {
+   std::lock_guard lock(api_mutex_);
+ #if REX_HAS_STREAMLINE
+@@ -1114,6 +1143,10 @@ bool Streamline::TagFrameGeneration(ID3D12GraphicsCommandList* list,
+   if (!ClearFrameGenerationTags(list, timeline) || !impl_->fg_active || !frame.depth ||
+       !frame.motion || !frame.hudless || !ValidCamera(frame.camera, frame.jitter_pixels))
+     return false;
++  if (frame.temporal_state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE &&
++      frame.temporal_state != (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
++                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE))
++    return false;
+   const auto depth = frame.depth->GetDesc(), motion = frame.motion->GetDesc();
+   const auto color = frame.hudless->GetDesc();
+   auto texture = [](const D3D12_RESOURCE_DESC& d) {
+@@ -1158,8 +1191,8 @@ bool Streamline::TagFrameGeneration(ID3D12GraphicsCommandList* list,
+   const auto color_state =
+       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+   sl::Resource resources[] = {
+-      {sl::ResourceType::eTex2d, frame.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE},
+-      {sl::ResourceType::eTex2d, frame.motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE},
++      {sl::ResourceType::eTex2d, frame.depth, uint32_t(frame.temporal_state)},
++      {sl::ResourceType::eTex2d, frame.motion, uint32_t(frame.temporal_state)},
+       {sl::ResourceType::eTex2d, frame.hudless, color_state},
+       {sl::ResourceType::eTex2d, frame.ui_alpha, color_state}};
+   const sl::Extent input{0, 0, uint32_t(depth.Width), depth.Height};
+@@ -1176,6 +1209,7 @@ bool Streamline::TagFrameGeneration(ID3D12GraphicsCommandList* list,
+           "FG tags"))
+     return false;
+   impl_->fg_reset = false;
++  impl_->fg_reset_requested = false;
+   return true;
+ #else
+   (void)list;
+diff --git a/src/ui/guest_frame_timing.cpp b/src/ui/guest_frame_timing.cpp
+index 027c6fc..07a61e0 100644
+--- a/src/ui/guest_frame_timing.cpp
++++ b/src/ui/guest_frame_timing.cpp
+@@ -13,6 +13,18 @@ REXCVAR_DEFINE_BOOL(
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ namespace rex::ui {
++void GuestFrameTiming::SetFrameGenerationScene(uint64_t render, bool allowed) {
++  if (!render)
++    return;
++  std::lock_guard lock(mutex_);
++  fg_scenes_[render % fg_scenes_.size()] = {render, allowed};
++}
++bool GuestFrameTiming::FrameGenerationScene(uint64_t render) {
++  std::lock_guard lock(mutex_);
++  const auto& entry = fg_scenes_[render % fg_scenes_.size()];
++  return render && entry.first == render && entry.second;
++}
++
+ namespace {
+ thread_local uint64_t render_id = 0;
+ uint64_t Now() {
+diff --git a/src/ui/window.cpp b/src/ui/window.cpp
+index b4e045f..e41a474 100644
+--- a/src/ui/window.cpp
++++ b/src/ui/window.cpp
+@@ -281,10 +281,20 @@ void Window::SetFullscreen(bool new_fullscreen) {
+     return;
+   }
+   WindowDestructionReceiver destruction_receiver(this);
++  const bool reconnect =
++      presenter_surface_ && presenter_->RequiresSurfaceRecreationOnFullscreenChange();
++  // Drains and suspends an asynchronous FG presenter before SDL/Win32 changes
++  // the actual window. Disconnect transfers paint ownership to the UI thread.
++  if (reconnect)
++    OnSurfaceChanged(false);
++  if (destruction_receiver.IsWindowDestroyedOrStateInapplicable())
++    return;
+   ApplyNewFullscreen();
+   if (destruction_receiver.IsWindowDestroyedOrStateInapplicable()) {
+     return;
+   }
++  if (reconnect)
++    OnSurfaceChanged(true);
+ }
+ 
+ void Window::SetTitle(const std::string_view new_title) {
+diff --git a/tests/unit/core/cvar_test.cpp b/tests/unit/core/cvar_test.cpp
+index 03a12cb..d9b4526 100644
+--- a/tests/unit/core/cvar_test.cpp
++++ b/tests/unit/core/cvar_test.cpp
+@@ -230,6 +230,37 @@ TEST_CASE("cvar config replays values for flags registered after loading", "[cva
+   rex::cvar::testing::ResetAllForTesting();
+ }
+ 
++TEST_CASE("cvar explicit empty strings preserve later plugin options", "[cvar][ssx-launch]") {
++  rex::cvar::testing::ResetAllForTesting();
++  char argv0[] = "cvar_test";
++  char empty[] = "--test_string_flag=";
++  char plugin[] = "--test_fg_inputs=true";
++  char known[] = "--test_int32_flag=777";
++  char* argv[] = {argv0, empty, plugin, known};
++  const auto positional = rex::cvar::Init(4, argv);
++  CHECK(positional.empty());
++  CHECK(REXCVAR_GET(test_string_flag).empty());
++  CHECK(REXCVAR_GET(test_int32_flag) == 777);
++  std::string value = "false";
++  {
++    rex::cvar::FlagRegistrar registrar({
++        .name = "test_fg_inputs",
++        .type = rex::cvar::FlagType::Boolean,
++        .category = "Test",
++        .description = "Late FG input flag",
++        .setter =
++            [&value](std::string_view input) {
++              value = input;
++              return true;
++            },
++        .getter = [&value]() { return value; },
++        .default_value = "false",
++    });
++    CHECK(value == "true");
++  }
++  rex::cvar::testing::ResetAllForTesting();
++}
++
+ namespace {
+ 
+ void SetTestEnv(const char* name, const char* value) {
+diff --git a/tests/unit/graphics/guest_frame_timing_test.cpp b/tests/unit/graphics/guest_frame_timing_test.cpp
+index bb1e611..5bcd9d7 100644
+--- a/tests/unit/graphics/guest_frame_timing_test.cpp
++++ b/tests/unit/graphics/guest_frame_timing_test.cpp
+@@ -97,3 +97,20 @@ TEST_CASE("SSX swap timing rejects unversioned payloads and preserves 64-bit IDs
+   trace.Add(Event::kGuestSwap, 1);
+   CHECK(trace.FinishCapture().empty());
+ }
++
++TEST_CASE("SSX FG scene decisions never leak across renders", "[ssx-timing]") {
++  GuestFrameTiming trace;
++  CHECK_FALSE(trace.FrameGenerationScene(0));
++  CHECK_FALSE(trace.FrameGenerationScene(17));
++  trace.SetFrameGenerationScene(17, true);
++  CHECK(trace.FrameGenerationScene(17));
++  CHECK_FALSE(trace.FrameGenerationScene(18));
++  trace.SetFrameGenerationScene(18, false);
++  CHECK_FALSE(trace.FrameGenerationScene(18));
++  trace.SetFrameGenerationScene(17, false);
++  CHECK_FALSE(trace.FrameGenerationScene(17));
++  trace.SetFrameGenerationScene(17, true);
++  trace.SetFrameGenerationScene(81, true);
++  CHECK_FALSE(trace.FrameGenerationScene(17));
++  CHECK(trace.FrameGenerationScene(81));
++}

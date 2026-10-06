@@ -1,0 +1,870 @@
+diff --git a/include/rex/ui/d3d12/ssx_reconstruction.h b/include/rex/ui/d3d12/ssx_reconstruction.h
+index 9423b60..f12473d 100644
+--- a/include/rex/ui/d3d12/ssx_reconstruction.h
++++ b/include/rex/ui/d3d12/ssx_reconstruction.h
+@@ -11,7 +11,9 @@ class D3D12Provider;
+ bool BuildSsxSRCamera(const SsxFrameMetadata& frame, const SsxMotionPlan& motion,
+                       Streamline::SRCamera& camera);
+ 
+-// Experimental same-resolution reconstruction at the guest tone-map boundary.
++// Experimental reconstruction at the guest tone-map boundary. A Quality caller
++// must own an output-sized destination and arrange its downstream consumption;
++// the existing gameplay adapter still supplies a same-resolution DLAA target.
+ // Single command-processor-thread owner. Uses separate command lists on the
+ // provider's direct queue; the caller first submits all input-producing work.
+ class SsxReconstruction {
+@@ -24,7 +26,7 @@ class SsxReconstruction {
+   ~SsxReconstruction();
+   Result Submit(const D3D12Provider& provider, const std::shared_ptr<const SsxFrameInputs>& frame,
+                 ID3D12Resource* destination, D3D12_RESOURCE_STATES destination_state,
+-                double seconds);
++                double seconds, Streamline::Quality quality = Streamline::Quality::kDLAA);
+ 
+  private:
+   struct Impl;
+diff --git a/src/ui/d3d12/ssx_reconstruction.cpp b/src/ui/d3d12/ssx_reconstruction.cpp
+index 57b8793..6baa2cc 100644
+--- a/src/ui/d3d12/ssx_reconstruction.cpp
++++ b/src/ui/d3d12/ssx_reconstruction.cpp
+@@ -46,6 +46,8 @@ struct SsxReconstruction::Impl {
+   ComPtr<ID3D12RootSignature> root;
+   ComPtr<ID3D12PipelineState> pipeline;
+   uint32_t width = 0, height = 0;
++  Streamline::Quality quality = Streamline::Quality::kDLAA;
++  Streamline::OptimalSettings optimal{};
+   uint64_t previous_frame = 0;
+   bool initialized = false;
+ 
+@@ -69,7 +71,7 @@ struct SsxReconstruction::Impl {
+                                        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 2}};
+     D3D12_ROOT_PARAMETER params[2]{};
+     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+-    params[0].Constants = {0, 0, 4};
++    params[0].Constants = {0, 0, 8};
+     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+     params[1].DescriptorTable = {2, ranges};
+     D3D12_ROOT_SIGNATURE_DESC desc{};
+@@ -121,7 +123,7 @@ struct SsxReconstruction::Impl {
+                                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                           IID_PPV_ARGS(&encoded))))
+       return false;
+-    output->SetName(L"SSX DLAA linear output before tone map");
++    output->SetName(L"SSX DLSS linear output before tone map");
+     encoded->SetName(L"SSX reconstructed color encoded for guest tone map");
+     slot.output = std::move(output);
+     slot.encoded = std::move(encoded);
+@@ -134,7 +136,8 @@ SsxReconstruction::SsxReconstruction() : impl_(std::make_unique<Impl>()) {}
+ SsxReconstruction::~SsxReconstruction() = default;
+ SsxReconstruction::Result SsxReconstruction::Submit(
+     const D3D12Provider& provider, const std::shared_ptr<const SsxFrameInputs>& frame,
+-    ID3D12Resource* destination, D3D12_RESOURCE_STATES destination_state, double seconds) {
++    ID3D12Resource* destination, D3D12_RESOURCE_STATES destination_state, double seconds,
++    Streamline::Quality quality) {
+   auto& p = *impl_;
+   Result result;
+   if (!frame || !destination) {
+@@ -157,22 +160,37 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+     return result;
+   }
+   const auto dest = destination->GetDesc();
+-  if (dest.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || dest.Width != decode.width ||
+-      dest.Height != decode.height || dest.Format != DXGI_FORMAT_R16G16B16A16_FLOAT ||
+-      dest.SampleDesc.Count != 1 || dest.DepthOrArraySize != 1) {
++  if (dest.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !dest.Width || !dest.Height ||
++      dest.Width > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
++      dest.Height > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
++      dest.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || dest.SampleDesc.Count != 1 ||
++      dest.DepthOrArraySize != 1 ||
++      (quality != Streamline::Quality::kDLAA && quality != Streamline::Quality::kQuality)) {
+     result.reason = "destination_contract";
+     return result;
+   }
+   if (!p.Initialize(provider))
+     return result;
+-  if (p.width != decode.width || p.height != decode.height) {
++  // Do not let a caller label a same-size dispatch "Quality" or accept a target
++  // that would silently crop/downsample reconstruction back to the input size.
++  const bool reconfigure = p.width != dest.Width || p.height != dest.Height || p.quality != quality;
++  auto optimal = p.optimal;
++  if ((reconfigure &&
++       !p.sr->GetOptimalSettings(quality, uint32_t(dest.Width), dest.Height, optimal)) ||
++      optimal.width != decode.width || optimal.height != decode.height) {
++    result.reason = "quality_dimensions";
++    return result;
++  }
++  if (reconfigure) {
+     if (!p.tracker.AwaitAllSubmissionsCompletion() || !p.sr->ReleaseSR() ||
+-        !p.sr->ConfigureSsxSR(Streamline::Quality::kDLAA, decode.width, decode.height)) {
++        !p.sr->ConfigureSsxSR(quality, uint32_t(dest.Width), dest.Height)) {
+       result.reason = "configuration";
+       return result;
+     }
+-    p.width = decode.width;
+-    p.height = decode.height;
++    p.width = uint32_t(dest.Width);
++    p.height = dest.Height;
++    p.quality = quality;
++    p.optimal = optimal;
+     p.camera.Reset(SsxMotionReset::kResize);
+     p.native.Reset();
+   }
+@@ -194,7 +212,7 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+   }
+   p.previous_frame = f.guest_frame;
+   auto* list = slot.list.Get();
+-  list->BeginEvent(1, "SSX DLAA before tone map", sizeof("SSX DLAA before tone map"));
++  list->BeginEvent(1, "SSX DLSS before tone map", sizeof("SSX DLSS before tone map"));
+   const auto linear = p.color.Record(provider, list, frame, submission, completed);
+   const auto motion = p.camera.Record(provider, list, frame, submission, completed, seconds);
+   const auto native = p.native.Record(provider, list, frame, motion, submission, completed);
+@@ -246,10 +264,11 @@ SsxReconstruction::Result SsxReconstruction::Submit(
+       list->SetPipelineState(p.pipeline.Get());
+       struct {
+         uint32_t width, height;
++        uint32_t input_width, input_height;
+         float inverse_scale;
+-        uint32_t unused;
+-      } k{p.width, p.height, 1 / decode.color_scale, 0};
+-      list->SetComputeRoot32BitConstants(0, 4, &k, 0);
++        uint32_t unused[3];
++      } k{p.width, p.height, decode.width, decode.height, 1 / decode.color_scale, {0, 0, 0}};
++      list->SetComputeRoot32BitConstants(0, 8, &k, 0);
+       list->SetComputeRootDescriptorTable(1, heap->GetGPUDescriptorHandleForHeapStart());
+       list->Dispatch((p.width + 7) / 8, (p.height + 7) / 8, 1);
+       Transition(list, slot.encoded.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+diff --git a/src/ui/d3d12/streamline.cpp b/src/ui/d3d12/streamline.cpp
+index ace1e0a..232e1eb 100644
+--- a/src/ui/d3d12/streamline.cpp
++++ b/src/ui/d3d12/streamline.cpp
+@@ -64,6 +64,14 @@ sl::DLSSOptions SsxOptions(Streamline::Quality quality, uint32_t width, uint32_t
+   }
+   options.outputWidth = width;
+   options.outputHeight = height;
++  // Explicit user-selected transformer model, independent of the scaling mode.
++  // In particular, Quality must not silently keep the SDK's default preset K.
++  options.dlaaPreset = sl::DLSSPreset::ePresetL;
++  options.qualityPreset = sl::DLSSPreset::ePresetL;
++  options.balancedPreset = sl::DLSSPreset::ePresetL;
++  options.performancePreset = sl::DLSSPreset::ePresetL;
++  options.ultraPerformancePreset = sl::DLSSPreset::ePresetL;
++  options.ultraQualityPreset = sl::DLSSPreset::ePresetL;
+   options.colorBuffersHDR = sl::Boolean::eTrue;
+   options.useAutoExposure = sl::Boolean::eTrue;
+   options.preExposure = SsxReconstructionColorPolicy::pre_exposure;
+@@ -327,6 +335,10 @@ bool Streamline::ConfigureSsxSR(Quality quality, uint32_t width, uint32_t height
+   impl_->sr_height = height;
+   impl_->sr_bounds = bounds;
+   impl_->sr_reset |= changed;
++  if (changed)
++    REXGPU_INFO("SSX_DLSS_CONFIG mode={} preset=L output={}x{} optimal_input={}x{}",
++                quality == Quality::kDLAA ? "DLAA" : quality == Quality::kQuality ? "Quality" : "other",
++                width, height, bounds.width, bounds.height);
+   return true;
+ #else
+   (void)quality;
+diff --git a/src/ui/shaders/bytecode/d3d12_5_1/ssx_reconstruction_encode_cs.h b/src/ui/shaders/bytecode/d3d12_5_1/ssx_reconstruction_encode_cs.h
+index c6c1cd5..2b1bcba 100644
+--- a/src/ui/shaders/bytecode/d3d12_5_1/ssx_reconstruction_encode_cs.h
++++ b/src/ui/shaders/bytecode/d3d12_5_1/ssx_reconstruction_encode_cs.h
+@@ -9,8 +9,9 @@
+ // {
+ //
+ //   uint2 extent;                      // Offset:    0 Size:     8
+-//   float inverse_color_scale;         // Offset:    8 Size:     4
+-//   uint unused;                       // Offset:   12 Size:     4 [unused]
++//   uint2 input_extent;                // Offset:    8 Size:     8
++//   float inverse_color_scale;         // Offset:   16 Size:     4
++//   uint3 unused;                      // Offset:   20 Size:    12 [unused]
+ //
+ // }
+ //
+@@ -39,52 +40,92 @@
+ // no Output
+ cs_5_1
+ dcl_globalFlags refactoringAllowed
+-dcl_constantbuffer CB0[0:0][1], immediateIndexed, space=0
++dcl_constantbuffer CB0[0:0][2], immediateIndexed, space=0
+ dcl_resource_texture2d (float,float,float,float) T0[0:0], space=0
+ dcl_resource_texture2d (float,float,float,float) T1[1:1], space=0
+ dcl_uav_typed_texture2d (float,float,float,float) U0[0:0], space=0
+ dcl_input vThreadID.xy
+-dcl_temps 3
++dcl_temps 6
+ dcl_thread_group 8, 8, 1
+ uge r0.xy, vThreadID.xyxx, CB0[0][0].xyxx
+ or r0.x, r0.y, r0.x
+ if_nz r0.x
+   ret 
+ endif 
+-mov r0.xy, vThreadID.xyxx
+-mov r0.zw, l(0,0,0,0)
+-ld r1.xyzw, r0.xyww, T1[1].xyzw
+-ld r0.xyz, r0.xyzw, T0[0].xyzw
+-and r2.xyz, r0.xyzx, l(0x7f800000, 0x7f800000, 0x7f800000, 0)
++ieq r0.xy, CB0[0][0].zwzz, CB0[0][0].xyxx
++and r0.x, r0.y, r0.x
++if_nz r0.x
++  mov r0.xy, vThreadID.xyxx
++  mov r0.zw, l(0,0,0,0)
++  ld r0.xyzw, r0.xyzw, T1[1].xyzw
++else 
++  utof r1.xy, vThreadID.xyxx
++  add r1.xy, r1.xyxx, l(0.500000, 0.500000, 0.000000, 0.000000)
++  utof r2.xyzw, CB0[0][0].zwxy
++  mul r1.xy, r1.xyxx, r2.xyxx
++  div r1.xy, r1.xyxx, r2.zwzz
++  add r1.xy, r1.xyxx, l(-0.500000, -0.500000, 0.000000, 0.000000)
++  round_ni r1.zw, r1.xxxy
++  ftoi r1.zw, r1.zzzw
++  frc r1.xy, r1.xyxx
++  iadd r2.xy, CB0[0][0].zwzz, l(-1, -1, 0, 0)
++  imax r2.zw, r1.zzzw, l(0, 0, 0, 0)
++  imin r3.xy, r2.xyxx, r2.zwzz
++  mov r3.zw, l(0,0,0,0)
++  ld r3.xyzw, r3.xyzw, T1[1].xyzw
++  iadd r4.xyzw, r1.zwzw, l(1, 0, 0, 1)
++  imax r4.xyzw, r4.xyzw, l(0, 0, 0, 0)
++  imin r4.xyzw, r2.xyxy, r4.zwxy
++  mov r5.xy, r4.zwzz
++  mov r5.zw, l(0,0,0,0)
++  ld r5.xyzw, r5.xyzw, T1[1].xyzw
++  mov r4.zw, l(0,0,0,0)
++  ld r4.xyzw, r4.xyzw, T1[1].xyzw
++  iadd r1.zw, r1.zzzw, l(0, 0, 1, 1)
++  imax r1.zw, r1.zzzw, l(0, 0, 0, 0)
++  imin r2.xy, r2.xyxx, r1.zwzz
++  mov r2.zw, l(0,0,0,0)
++  ld r2.xyzw, r2.xyzw, T1[1].xyzw
++  add r5.xyzw, -r3.xyzw, r5.xyzw
++  mad r3.xyzw, r1.xxxx, r5.xyzw, r3.xyzw
++  add r2.xyzw, -r4.xyzw, r2.xyzw
++  mad r2.xyzw, r1.xxxx, r2.xyzw, r4.xyzw
++  add r2.xyzw, -r3.xyzw, r2.xyzw
++  mad r0.xyzw, r1.yyyy, r2.xyzw, r3.xyzw
++endif 
++mov r1.xy, vThreadID.xyxx
++mov r1.zw, l(0,0,0,0)
++ld r1.xyz, r1.xyzw, T0[0].xyzw
++and r2.xyz, r1.xyzx, l(0x7f800000, 0x7f800000, 0x7f800000, 0)
+ ine r2.xyz, r2.xyzx, l(0x7f800000, 0x7f800000, 0x7f800000, 0)
+-and r0.w, r2.y, r2.x
+-and r0.w, r2.z, r0.w
+-max r0.xyz, r0.xyzx, l(0.000000, 0.000000, 0.000000, 0.000000)
+-sqrt r0.xyz, r0.xyzx
+-mul r0.xyz, r0.xyzx, CB0[0][0].zzzz
+-movc r1.xyz, r0.wwww, r0.xyzx, r1.xyzx
+-store_uav_typed U0[0].xyzw, vThreadID.xyyy, r1.xyzw
++and r1.w, r2.y, r2.x
++and r1.w, r2.z, r1.w
++max r1.xyz, r1.xyzx, l(0.000000, 0.000000, 0.000000, 0.000000)
++sqrt r1.xyz, r1.xyzx
++mul r1.xyz, r1.xyzx, CB0[0][1].xxxx
++movc r0.xyz, r1.wwww, r1.xyzx, r0.xyzx
++store_uav_typed U0[0].xyzw, vThreadID.xyyy, r0.xyzw
+ ret 
+-// Approximately 19 instruction slots used
++// Approximately 59 instruction slots used
+ #endif
+ 
+ const BYTE ssx_reconstruction_encode_cs[] =
+ {
+-     68,  88,  66,  67, 217, 192, 
+-    185, 107, 129,   3, 193, 103, 
+-    102, 154, 141,  81, 168,  95, 
+-     57,  25,   1,   0,   0,   0, 
+-    240,   5,   0,   0,   5,   0, 
++     68,  88,  66,  67, 237, 132, 
++    215,  65, 247, 139,   7, 199, 
++    104, 151, 247,  69,   4,  45, 
++     31, 112,   1,   0,   0,   0, 
++    204,  10,   0,   0,   5,   0, 
+       0,   0,  52,   0,   0,   0, 
+-    164,   2,   0,   0, 180,   2, 
+-      0,   0, 196,   2,   0,   0, 
+-     84,   5,   0,   0,  82,  68, 
+-     69,  70, 104,   2,   0,   0, 
++    216,   2,   0,   0, 232,   2, 
++      0,   0, 248,   2,   0,   0, 
++     48,  10,   0,   0,  82,  68, 
++     69,  70, 156,   2,   0,   0, 
+       1,   0,   0,   0,   8,   1, 
+       0,   0,   4,   0,   0,   0, 
+      60,   0,   0,   0,   1,   5, 
+      83,  67,   0, 133,   0,   0, 
+-     64,   2,   0,   0,  19,  19, 
++    116,   2,   0,   0,  19,  19, 
+      68,  37,  60,   0,   0,   0, 
+      24,   0,   0,   0,  40,   0, 
+       0,   0,  40,   0,   0,   0, 
+@@ -124,195 +165,403 @@ const BYTE ssx_reconstruction_encode_cs[] =
+     111, 100, 101, 100,   0,  67, 
+     111, 110, 115, 116,  97, 110, 
+     116, 115,   0, 171, 171, 171, 
+-    251,   0,   0,   0,   3,   0, 
++    251,   0,   0,   0,   4,   0, 
+       0,   0,  32,   1,   0,   0, 
+-     16,   0,   0,   0,   0,   0, 
++     32,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-    152,   1,   0,   0,   0,   0, 
++    192,   1,   0,   0,   0,   0, 
+       0,   0,   8,   0,   0,   0, 
+-      2,   0,   0,   0, 168,   1, 
++      2,   0,   0,   0, 208,   1, 
+       0,   0,   0,   0,   0,   0, 
+     255, 255, 255, 255,   0,   0, 
+       0,   0, 255, 255, 255, 255, 
+-      0,   0,   0,   0, 204,   1, 
++      0,   0,   0,   0, 244,   1, 
+       0,   0,   8,   0,   0,   0, 
+-      4,   0,   0,   0,   2,   0, 
+-      0,   0, 232,   1,   0,   0, 
++      8,   0,   0,   0,   2,   0, 
++      0,   0, 208,   1,   0,   0, 
+       0,   0,   0,   0, 255, 255, 
+     255, 255,   0,   0,   0,   0, 
+     255, 255, 255, 255,   0,   0, 
+-      0,   0,  12,   2,   0,   0, 
+-     12,   0,   0,   0,   4,   0, 
+-      0,   0,   0,   0,   0,   0, 
++      0,   0,   1,   2,   0,   0, 
++     16,   0,   0,   0,   4,   0, 
++      0,   0,   2,   0,   0,   0, 
+      28,   2,   0,   0,   0,   0, 
+       0,   0, 255, 255, 255, 255, 
+       0,   0,   0,   0, 255, 255, 
+     255, 255,   0,   0,   0,   0, 
+-    101, 120, 116, 101, 110, 116, 
+-      0, 117, 105, 110, 116,  50, 
+-      0, 171, 171, 171,   1,   0, 
+-     19,   0,   1,   0,   2,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
++     64,   2,   0,   0,  20,   0, 
++      0,   0,  12,   0,   0,   0, 
++      0,   0,   0,   0,  80,   2, 
+       0,   0,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0, 101, 120, 
++    116, 101, 110, 116,   0, 117, 
++    105, 110, 116,  50,   0, 171, 
++    171, 171,   1,   0,  19,   0, 
++      1,   0,   2,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0, 199,   1, 
++      0,   0, 105, 110, 112, 117, 
++    116,  95, 101, 120, 116, 101, 
++    110, 116,   0, 105, 110, 118, 
++    101, 114, 115, 101,  95,  99, 
++    111, 108, 111, 114,  95, 115, 
++     99,  97, 108, 101,   0, 102, 
++    108, 111,  97, 116,   0, 171, 
++      0,   0,   3,   0,   1,   0, 
++      1,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-    159,   1,   0,   0, 105, 110, 
+-    118, 101, 114, 115, 101,  95, 
+-     99, 111, 108, 111, 114,  95, 
+-    115,  99,  97, 108, 101,   0, 
+-    102, 108, 111,  97, 116,   0, 
+-    171, 171,   0,   0,   3,   0, 
+-      1,   0,   1,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
++      0,   0,  21,   2,   0,   0, 
++    117, 110, 117, 115, 101, 100, 
++      0, 117, 105, 110, 116,  51, 
++      0, 171, 171, 171,   1,   0, 
++     19,   0,   1,   0,   3,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0, 224,   1, 
+-      0,   0, 117, 110, 117, 115, 
+-    101, 100,   0, 100, 119, 111, 
+-    114, 100,   0, 171, 171, 171, 
+-      0,   0,  19,   0,   1,   0, 
+-      1,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,  19,   2,   0,   0, 
+-     77, 105,  99, 114, 111, 115, 
+-    111, 102, 116,  32,  40,  82, 
+-     41,  32,  72,  76,  83,  76, 
+-     32,  83, 104,  97, 100, 101, 
+-    114,  32,  67, 111, 109, 112, 
+-    105, 108, 101, 114,  32,  49, 
+-     48,  46,  49,   0,  73,  83, 
+-     71,  78,   8,   0,   0,   0, 
+-      0,   0,   0,   0,   8,   0, 
+-      0,   0,  79,  83,  71,  78, 
++     71,   2,   0,   0,  77, 105, 
++     99, 114, 111, 115, 111, 102, 
++    116,  32,  40,  82,  41,  32, 
++     72,  76,  83,  76,  32,  83, 
++    104,  97, 100, 101, 114,  32, 
++     67, 111, 109, 112, 105, 108, 
++    101, 114,  32,  49,  48,  46, 
++     49,   0,  73,  83,  71,  78, 
+       8,   0,   0,   0,   0,   0, 
+       0,   0,   8,   0,   0,   0, 
+-     83,  72,  69,  88, 136,   2, 
+-      0,   0,  81,   0,   5,   0, 
+-    162,   0,   0,   0, 106,   8, 
+-      0,   1,  89,   0,   0,   7, 
+-     70, 142,  48,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   1,   0, 
++     79,  83,  71,  78,   8,   0, 
+       0,   0,   0,   0,   0,   0, 
+-     88,  24,   0,   7,  70, 126, 
++      8,   0,   0,   0,  83,  72, 
++     69,  88,  48,   7,   0,   0, 
++     81,   0,   5,   0, 204,   1, 
++      0,   0, 106,   8,   0,   1, 
++     89,   0,   0,   7,  70, 142, 
+      48,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,  85,  85,   0,   0, 
++      0,   0,   2,   0,   0,   0, 
+       0,   0,   0,   0,  88,  24, 
+       0,   7,  70, 126,  48,   0, 
+-      1,   0,   0,   0,   1,   0, 
+-      0,   0,   1,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
+      85,  85,   0,   0,   0,   0, 
+-      0,   0, 156,  24,   0,   7, 
+-     70, 238,  49,   0,   0,   0, 
++      0,   0,  88,  24,   0,   7, 
++     70, 126,  48,   0,   1,   0, 
++      0,   0,   1,   0,   0,   0, 
++      1,   0,   0,   0,  85,  85, 
++      0,   0,   0,   0,   0,   0, 
++    156,  24,   0,   7,  70, 238, 
++     49,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,  85,  85, 
++      0,   0,  85,  85,   0,   0, 
++      0,   0,   0,   0,  95,   0, 
++      0,   2,  50,   0,   2,   0, 
++    104,   0,   0,   2,   6,   0, 
++      0,   0, 155,   0,   0,   4, 
++      8,   0,   0,   0,   8,   0, 
++      0,   0,   1,   0,   0,   0, 
++     80,   0,   0,   8,  50,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,   0,   2,   0,  70, 128, 
++     48,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-     95,   0,   0,   2,  50,   0, 
+-      2,   0, 104,   0,   0,   2, 
+-      3,   0,   0,   0, 155,   0, 
+-      0,   4,   8,   0,   0,   0, 
+-      8,   0,   0,   0,   1,   0, 
+-      0,   0,  80,   0,   0,   8, 
++      0,   0,  60,   0,   0,   7, 
++     18,   0,  16,   0,   0,   0, 
++      0,   0,  26,   0,  16,   0, 
++      0,   0,   0,   0,  10,   0, 
++     16,   0,   0,   0,   0,   0, 
++     31,   0,   4,   3,  10,   0, 
++     16,   0,   0,   0,   0,   0, 
++     62,   0,   0,   1,  21,   0, 
++      0,   1,  32,   0,   0,  11, 
+      50,   0,  16,   0,   0,   0, 
+-      0,   0,  70,   0,   2,   0, 
++      0,   0, 230, 138,  48,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
+      70, 128,  48,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,  60,   0, 
++      0,   0,   0,   0,   1,   0, 
+       0,   7,  18,   0,  16,   0, 
+       0,   0,   0,   0,  26,   0, 
+      16,   0,   0,   0,   0,   0, 
+      10,   0,  16,   0,   0,   0, 
+       0,   0,  31,   0,   4,   3, 
+      10,   0,  16,   0,   0,   0, 
+-      0,   0,  62,   0,   0,   1, 
+-     21,   0,   0,   1,  54,   0, 
+-      0,   4,  50,   0,  16,   0, 
+-      0,   0,   0,   0,  70,   0, 
+-      2,   0,  54,   0,   0,   8, 
+-    194,   0,  16,   0,   0,   0, 
++      0,   0,  54,   0,   0,   4, 
++     50,   0,  16,   0,   0,   0, 
++      0,   0,  70,   0,   2,   0, 
++     54,   0,   0,   8, 194,   0, 
++     16,   0,   0,   0,   0,   0, 
++      2,  64,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  45,   0,   0,   8, 
++    242,   0,  16,   0,   0,   0, 
++      0,   0,  70,  14,  16,   0, 
++      0,   0,   0,   0,  70, 126, 
++     32,   0,   1,   0,   0,   0, 
++      1,   0,   0,   0,  18,   0, 
++      0,   1,  86,   0,   0,   4, 
++     50,   0,  16,   0,   1,   0, 
++      0,   0,  70,   0,   2,   0, 
++      0,   0,   0,  10,  50,   0, 
++     16,   0,   1,   0,   0,   0, 
++     70,   0,  16,   0,   1,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0,   0,  63,   0,   0, 
++      0,  63,   0,   0,   0,   0, 
++      0,   0,   0,   0,  86,   0, 
++      0,   7, 242,   0,  16,   0, 
++      2,   0,   0,   0, 230, 132, 
++     48,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  56,   0,   0,   7, 
++     50,   0,  16,   0,   1,   0, 
++      0,   0,  70,   0,  16,   0, 
++      1,   0,   0,   0,  70,   0, 
++     16,   0,   2,   0,   0,   0, 
++     14,   0,   0,   7,  50,   0, 
++     16,   0,   1,   0,   0,   0, 
++     70,   0,  16,   0,   1,   0, 
++      0,   0, 230,  10,  16,   0, 
++      2,   0,   0,   0,   0,   0, 
++      0,  10,  50,   0,  16,   0, 
++      1,   0,   0,   0,  70,   0, 
++     16,   0,   1,   0,   0,   0, 
++      2,  64,   0,   0,   0,   0, 
++      0, 191,   0,   0,   0, 191, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  65,   0,   0,   5, 
++    194,   0,  16,   0,   1,   0, 
++      0,   0,   6,   4,  16,   0, 
++      1,   0,   0,   0,  27,   0, 
++      0,   5, 194,   0,  16,   0, 
++      1,   0,   0,   0, 166,  14, 
++     16,   0,   1,   0,   0,   0, 
++     26,   0,   0,   5,  50,   0, 
++     16,   0,   1,   0,   0,   0, 
++     70,   0,  16,   0,   1,   0, 
++      0,   0,  30,   0,   0,  12, 
++     50,   0,  16,   0,   2,   0, 
++      0,   0, 230, 138,  48,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      2,  64,   0,   0, 255, 255, 
++    255, 255, 255, 255, 255, 255, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  36,   0,   0,  10, 
++    194,   0,  16,   0,   2,   0, 
++      0,   0, 166,  14,  16,   0, 
++      1,   0,   0,   0,   2,  64, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     37,   0,   0,   7,  50,   0, 
++     16,   0,   3,   0,   0,   0, 
++     70,   0,  16,   0,   2,   0, 
++      0,   0, 230,  10,  16,   0, 
++      2,   0,   0,   0,  54,   0, 
++      0,   8, 194,   0,  16,   0, 
++      3,   0,   0,   0,   2,  64, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     45,   0,   0,   8, 242,   0, 
++     16,   0,   3,   0,   0,   0, 
++     70,  14,  16,   0,   3,   0, 
++      0,   0,  70, 126,  32,   0, 
++      1,   0,   0,   0,   1,   0, 
++      0,   0,  30,   0,   0,  10, 
++    242,   0,  16,   0,   4,   0, 
++      0,   0, 230,  14,  16,   0, 
++      1,   0,   0,   0,   2,  64, 
++      0,   0,   1,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   1,   0,   0,   0, 
++     36,   0,   0,  10, 242,   0, 
++     16,   0,   4,   0,   0,   0, 
++     70,  14,  16,   0,   4,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  37,   0, 
++      0,   7, 242,   0,  16,   0, 
++      4,   0,   0,   0,  70,   4, 
++     16,   0,   2,   0,   0,   0, 
++    230,   4,  16,   0,   4,   0, 
++      0,   0,  54,   0,   0,   5, 
++     50,   0,  16,   0,   5,   0, 
++      0,   0, 230,  10,  16,   0, 
++      4,   0,   0,   0,  54,   0, 
++      0,   8, 194,   0,  16,   0, 
++      5,   0,   0,   0,   2,  64, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     45,   0,   0,   8, 242,   0, 
++     16,   0,   5,   0,   0,   0, 
++     70,  14,  16,   0,   5,   0, 
++      0,   0,  70, 126,  32,   0, 
++      1,   0,   0,   0,   1,   0, 
++      0,   0,  54,   0,   0,   8, 
++    194,   0,  16,   0,   4,   0, 
+       0,   0,   2,  64,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,  45,   0, 
+       0,   8, 242,   0,  16,   0, 
+-      1,   0,   0,   0,  70,  15, 
+-     16,   0,   0,   0,   0,   0, 
++      4,   0,   0,   0,  70,  14, 
++     16,   0,   4,   0,   0,   0, 
+      70, 126,  32,   0,   1,   0, 
+       0,   0,   1,   0,   0,   0, 
+-     45,   0,   0,   8, 114,   0, 
+-     16,   0,   0,   0,   0,   0, 
+-     70,  14,  16,   0,   0,   0, 
+-      0,   0,  70, 126,  32,   0, 
++     30,   0,   0,  10, 194,   0, 
++     16,   0,   1,   0,   0,   0, 
++    166,  14,  16,   0,   1,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   1,   0,   0,   0, 
++      1,   0,   0,   0,  36,   0, 
++      0,  10, 194,   0,  16,   0, 
++      1,   0,   0,   0, 166,  14, 
++     16,   0,   1,   0,   0,   0, 
++      2,  64,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,   1,   0,   0,  10, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  37,   0,   0,   7, 
++     50,   0,  16,   0,   2,   0, 
++      0,   0,  70,   0,  16,   0, 
++      2,   0,   0,   0, 230,  10, 
++     16,   0,   1,   0,   0,   0, 
++     54,   0,   0,   8, 194,   0, 
++     16,   0,   2,   0,   0,   0, 
++      2,  64,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  45,   0,   0,   8, 
++    242,   0,  16,   0,   2,   0, 
++      0,   0,  70,  14,  16,   0, 
++      2,   0,   0,   0,  70, 126, 
++     32,   0,   1,   0,   0,   0, 
++      1,   0,   0,   0,   0,   0, 
++      0,   8, 242,   0,  16,   0, 
++      5,   0,   0,   0,  70,  14, 
++     16, 128,  65,   0,   0,   0, 
++      3,   0,   0,   0,  70,  14, 
++     16,   0,   5,   0,   0,   0, 
++     50,   0,   0,   9, 242,   0, 
++     16,   0,   3,   0,   0,   0, 
++      6,   0,  16,   0,   1,   0, 
++      0,   0,  70,  14,  16,   0, 
++      5,   0,   0,   0,  70,  14, 
++     16,   0,   3,   0,   0,   0, 
++      0,   0,   0,   8, 242,   0, 
++     16,   0,   2,   0,   0,   0, 
++     70,  14,  16, 128,  65,   0, 
++      0,   0,   4,   0,   0,   0, 
++     70,  14,  16,   0,   2,   0, 
++      0,   0,  50,   0,   0,   9, 
++    242,   0,  16,   0,   2,   0, 
++      0,   0,   6,   0,  16,   0, 
++      1,   0,   0,   0,  70,  14, 
++     16,   0,   2,   0,   0,   0, 
++     70,  14,  16,   0,   4,   0, 
++      0,   0,   0,   0,   0,   8, 
++    242,   0,  16,   0,   2,   0, 
++      0,   0,  70,  14,  16, 128, 
++     65,   0,   0,   0,   3,   0, 
++      0,   0,  70,  14,  16,   0, 
++      2,   0,   0,   0,  50,   0, 
++      0,   9, 242,   0,  16,   0, 
++      0,   0,   0,   0,  86,   5, 
++     16,   0,   1,   0,   0,   0, 
++     70,  14,  16,   0,   2,   0, 
++      0,   0,  70,  14,  16,   0, 
++      3,   0,   0,   0,  21,   0, 
++      0,   1,  54,   0,   0,   4, 
++     50,   0,  16,   0,   1,   0, 
++      0,   0,  70,   0,   2,   0, 
++     54,   0,   0,   8, 194,   0, 
++     16,   0,   1,   0,   0,   0, 
++      2,  64,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  45,   0,   0,   8, 
++    114,   0,  16,   0,   1,   0, 
++      0,   0,  70,  14,  16,   0, 
++      1,   0,   0,   0,  70, 126, 
++     32,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   1,   0, 
++      0,  10, 114,   0,  16,   0, 
++      2,   0,   0,   0,  70,   2, 
++     16,   0,   1,   0,   0,   0, 
++      2,  64,   0,   0,   0,   0, 
++    128, 127,   0,   0, 128, 127, 
++      0,   0, 128, 127,   0,   0, 
++      0,   0,  39,   0,   0,  10, 
+     114,   0,  16,   0,   2,   0, 
+       0,   0,  70,   2,  16,   0, 
+-      0,   0,   0,   0,   2,  64, 
++      2,   0,   0,   0,   2,  64, 
+       0,   0,   0,   0, 128, 127, 
+       0,   0, 128, 127,   0,   0, 
+     128, 127,   0,   0,   0,   0, 
+-     39,   0,   0,  10, 114,   0, 
+-     16,   0,   2,   0,   0,   0, 
+-     70,   2,  16,   0,   2,   0, 
+-      0,   0,   2,  64,   0,   0, 
+-      0,   0, 128, 127,   0,   0, 
+-    128, 127,   0,   0, 128, 127, 
+-      0,   0,   0,   0,   1,   0, 
++      1,   0,   0,   7, 130,   0, 
++     16,   0,   1,   0,   0,   0, 
++     26,   0,  16,   0,   2,   0, 
++      0,   0,  10,   0,  16,   0, 
++      2,   0,   0,   0,   1,   0, 
+       0,   7, 130,   0,  16,   0, 
+-      0,   0,   0,   0,  26,   0, 
++      1,   0,   0,   0,  42,   0, 
+      16,   0,   2,   0,   0,   0, 
+-     10,   0,  16,   0,   2,   0, 
+-      0,   0,   1,   0,   0,   7, 
+-    130,   0,  16,   0,   0,   0, 
+-      0,   0,  42,   0,  16,   0, 
+-      2,   0,   0,   0,  58,   0, 
+-     16,   0,   0,   0,   0,   0, 
+-     52,   0,   0,  10, 114,   0, 
+-     16,   0,   0,   0,   0,   0, 
+-     70,   2,  16,   0,   0,   0, 
+-      0,   0,   2,  64,   0,   0, 
++     58,   0,  16,   0,   1,   0, 
++      0,   0,  52,   0,   0,  10, 
++    114,   0,  16,   0,   1,   0, 
++      0,   0,  70,   2,  16,   0, 
++      1,   0,   0,   0,   2,  64, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,  75,   0, 
+-      0,   5, 114,   0,  16,   0, 
+-      0,   0,   0,   0,  70,   2, 
+-     16,   0,   0,   0,   0,   0, 
+-     56,   0,   0,   9, 114,   0, 
+-     16,   0,   0,   0,   0,   0, 
+-     70,   2,  16,   0,   0,   0, 
+-      0,   0, 166, 138,  48,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   0,   0, 
+-     55,   0,   0,   9, 114,   0, 
++     75,   0,   0,   5, 114,   0, 
+      16,   0,   1,   0,   0,   0, 
+-    246,  15,  16,   0,   0,   0, 
++     70,   2,  16,   0,   1,   0, 
++      0,   0,  56,   0,   0,   9, 
++    114,   0,  16,   0,   1,   0, 
+       0,   0,  70,   2,  16,   0, 
+-      0,   0,   0,   0,  70,   2, 
+-     16,   0,   1,   0,   0,   0, 
+-    164,   0,   0,   7, 242, 224, 
+-     33,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,  70,   5, 
+-      2,   0,  70,  14,  16,   0, 
+-      1,   0,   0,   0,  62,   0, 
+-      0,   1,  83,  84,  65,  84, 
+-    148,   0,   0,   0,  19,   0, 
+-      0,   0,   3,   0,   0,   0, 
++      1,   0,   0,   0,   6, 128, 
++     48,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   1,   0, 
+-      0,   0,   3,   0,   0,   0, 
+-      1,   0,   0,   0,   5,   0, 
++      0,   0,  55,   0,   0,   9, 
++    114,   0,  16,   0,   0,   0, 
++      0,   0, 246,  15,  16,   0, 
++      1,   0,   0,   0,  70,   2, 
++     16,   0,   1,   0,   0,   0, 
++     70,   2,  16,   0,   0,   0, 
++      0,   0, 164,   0,   0,   7, 
++    242, 224,  33,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     70,   5,   2,   0,  70,  14, 
++     16,   0,   0,   0,   0,   0, 
++     62,   0,   0,   1,  83,  84, 
++     65,  84, 148,   0,   0,   0, 
++     59,   0,   0,   0,   6,   0, 
++      0,   0,   0,   0,   0,   0, 
++      1,   0,   0,   0,  15,   0, 
++      0,   0,  11,   0,   0,   0, 
++      6,   0,   0,   0,   3,   0, 
+       0,   0,   2,   0,   0,   0, 
+-      1,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   2,   0, 
+       0,   0,   0,   0,   0,   0, 
++      6,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,   2,   0,   0,   0, 
+-      1,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   9,   0, 
++      0,   0,   1,   0,   0,   0, 
++      5,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+@@ -322,6 +571,5 @@ const BYTE ssx_reconstruction_encode_cs[] =
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+       0,   0,   0,   0,   0,   0, 
+-      0,   0,   0,   0,   1,   0, 
+-      0,   0
++      1,   0,   0,   0
+ };
+diff --git a/src/ui/shaders/ssx_reconstruction_encode.cs.hlsl b/src/ui/shaders/ssx_reconstruction_encode.cs.hlsl
+index 5d86050..9c1793c 100644
+--- a/src/ui/shaders/ssx_reconstruction_encode.cs.hlsl
++++ b/src/ui/shaders/ssx_reconstruction_encode.cs.hlsl
+@@ -1,13 +1,31 @@
+ // Return reconstructed linear RGB to the representation consumed by SSX's
+-// original tone map. Keep the original alpha; DLSS alpha upscaling is disabled.
+-cbuffer Constants : register(b0) { uint2 extent; float inverse_color_scale; uint unused; };
++// original tone map. Resample guest alpha separately; DLSS alpha is disabled.
++cbuffer Constants : register(b0) {
++  uint2 extent; uint2 input_extent;
++  float inverse_color_scale; uint3 unused;
++};
+ Texture2D<float4> reconstructed : register(t0);
+ Texture2D<float4> original : register(t1);
+ RWTexture2D<float4> encoded : register(u0);
+ [numthreads(8,8,1)]
+ void main(uint3 id : SV_DispatchThreadID) {
+   if (any(id.xy >= extent)) return;
+-  float4 raw = original.Load(int3(id.xy,0));
++  // Pixel centers, clamp-to-edge bilinear resampling. Equal extents retain the
++  // exact original texel (including alpha) without blending its neighbours.
++  float4 raw;
++  if (all(extent == input_extent)) {
++    raw = original.Load(int3(id.xy,0));
++  } else {
++    float2 source = (float2(id.xy)+.5)*float2(input_extent)/float2(extent)-.5;
++    int2 p = int2(floor(source));
++    float2 blend = frac(source);
++    int2 hi = int2(input_extent)-1;
++    float4 a = original.Load(int3(clamp(p,int2(0,0),hi),0));
++    float4 b = original.Load(int3(clamp(p+int2(1,0),int2(0,0),hi),0));
++    float4 c = original.Load(int3(clamp(p+int2(0,1),int2(0,0),hi),0));
++    float4 d = original.Load(int3(clamp(p+int2(1,1),int2(0,0),hi),0));
++    raw = lerp(lerp(a,b,blend.x),lerp(c,d,blend.x),blend.y);
++  }
+   float3 value = reconstructed.Load(int3(id.xy,0)).rgb;
+   // A failed numerical pixel keeps its guest color, not a purple/NaN result.
+   float3 result = all(isfinite(value)) ? sqrt(max(value,0))*inverse_color_scale : raw.rgb;

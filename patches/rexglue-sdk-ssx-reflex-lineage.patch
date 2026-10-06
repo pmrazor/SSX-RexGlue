@@ -1,0 +1,286 @@
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index 79e77a6..88c3079 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -29,6 +29,7 @@
+ #include <rex/system/xthread.h>
+ #include <rex/thread.h>
+ #include <rex/ui/presenter.h>
++#include <rex/ui/guest_frame_timing.h>
+ 
+ namespace rex::stream {
+ class ByteStream;
+@@ -132,6 +133,8 @@ class CommandProcessor {
+  protected:
+   // Valid only while processing this exact PM4_XE_SWAP, zero for ordinary packets.
+   uint64_t swap_timing_id_ = 0;
++  // Ordered frame-begin NOP to the following Swap; ambiguity clears identity.
++  ui::GuestRenderMarker guest_render_marker_;
+   struct IndexBufferInfo {
+     xenos::IndexFormat format = xenos::IndexFormat::kInt16;
+     xenos::Endian endianness = xenos::Endian::kNone;
+diff --git a/include/rex/ui/guest_frame_timing.h b/include/rex/ui/guest_frame_timing.h
+index 7fb5473..80247c7 100644
+--- a/include/rex/ui/guest_frame_timing.h
++++ b/include/rex/ui/guest_frame_timing.h
+@@ -2,6 +2,7 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <array>
+ #include <cstdint>
+ #include <filesystem>
+ #include <mutex>
+@@ -30,7 +31,20 @@ class GuestFrameTiming {
+     kReconstructionEnd,
+     kHostSubmit,
+     kPresentBegin,
+-    kPresentEnd
++    kPresentEnd,
++    kSampleWrite,
++    kSampleTime,
++    kSamplePublishBegin,
++    kSamplePublishEnd,
++    kSampleSelectPrevious,
++    kSampleSelectNext,
++    kSampleInterpolation,
++    kWorkerInputBegin,
++    kWorkerInputEnd,
++    kGuestRenderMarker,
++    kGuestRenderMarkerRejected,
++    kGpuRenderMarker,
++    kGpuRenderMarkerConflict
+   };
+   struct Record {
+     uint64_t time_ns, id, related, detail;
+@@ -71,4 +85,82 @@ inline uint64_t DecodeGuestTimingSwap(uint32_t signature, uint32_t lo, uint32_t
+   return signature == kGuestTimingSwapSignature ? uint64_t(lo) | (uint64_t(hi) << 32) : 0;
+ }
+ 
++// Diagnostic NOP payload. Ordinary guest NOPs are unaffected. Carry this before
++// the frame's draws, not at Swap (DLAA may already have run by then).
++constexpr uint32_t kGuestRenderMarkerSignature = 0x52465442;  // RFTB
++constexpr uint32_t kGuestRenderMarkerVersion = 1;
++inline uint64_t DecodeGuestRenderMarker(uint32_t signature, uint32_t version, uint32_t lo,
++                                        uint32_t hi) {
++  return signature == kGuestRenderMarkerSignature && version == kGuestRenderMarkerVersion
++             ? uint64_t(lo) | (uint64_t(hi) << 32)
++             : 0;
++}
++class GuestRenderMarker {
++ public:
++  bool Begin(uint64_t id) {
++    if (!id || id_ || conflict_) {
++      id_ = 0;
++      conflict_ = true;
++      return false;
++    }
++    id_ = id;
++    return true;
++  }
++  uint64_t id() const { return id_; }
++  void Reset() {
++    id_ = 0;
++    conflict_ = false;
++  }
++
++ private:
++  uint64_t id_ = 0;
++  bool conflict_ = false;
++};
++
++// Bounded diagnostic slot-generation table. The guest owns a slot exclusively
++// while writing and pins selected slots until render release. Never identify a
++// generation by timestamp alone: timestamps and slot addresses may repeat.
++class GuestSampleLineage {
++ public:
++  static constexpr size_t kCapacity = 128;
++  bool BeginWrite(uint64_t key, uint64_t timestamp, uint64_t generation) {
++    if (!key || !generation)
++      return false;
++    std::lock_guard lock(mutex_);
++    for (auto& entry : entries_) {
++      if (!entry.key || entry.key == key) {
++        entry = {key, timestamp, generation, false};
++        return true;
++      }
++    }
++    return false;
++  }
++  uint64_t Publish(uint64_t key, uint64_t timestamp) {
++    std::lock_guard lock(mutex_);
++    for (auto& entry : entries_) {
++      if (entry.key == key && entry.timestamp == timestamp) {
++        entry.published = true;
++        return entry.generation;
++      }
++    }
++    return 0;
++  }
++  uint64_t Selected(uint64_t key, uint64_t timestamp) {
++    std::lock_guard lock(mutex_);
++    for (const auto& entry : entries_) {
++      if (entry.key == key && entry.timestamp == timestamp && entry.published)
++        return entry.generation;
++    }
++    return 0;
++  }
++
++ private:
++  struct Entry {
++    uint64_t key = 0, timestamp = 0, generation = 0;
++    bool published = false;
++  };
++  std::mutex mutex_;
++  std::array<Entry, kCapacity> entries_{};
++};
++
+ }  // namespace rex::ui
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index a839116..a1b5435 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -295,6 +295,8 @@ bool CommandProcessor::Save(::rex::stream::ByteStream* stream) {
+ 
+ bool CommandProcessor::Restore(::rex::stream::ByteStream* stream) {
+   assert_true(paused_);
++  guest_render_marker_.Reset();
++  swap_timing_id_ = 0;
+ 
+   primary_buffer_ptr_ = stream->Read<uint32_t>();
+   primary_buffer_size_ = stream->Read<uint32_t>();
+@@ -905,6 +907,19 @@ bool CommandProcessor::ExecutePacketType3_ME_INIT(memory::RingBuffer* reader, ui
+ 
+ bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32_t packet,
+                                               uint32_t count) {
++  if (count == 4) {
++    const auto signature = reader->ReadAndSwap<uint32_t>();
++    const auto version = reader->ReadAndSwap<uint32_t>();
++    const auto lo = reader->ReadAndSwap<uint32_t>();
++    const auto hi = reader->ReadAndSwap<uint32_t>();
++    if (const auto id = ui::DecodeGuestRenderMarker(signature, version, lo, hi)) {
++      const bool valid = guest_render_marker_.Begin(id);
++      ui::GuestFrameTiming::Get().Add(valid ? ui::GuestFrameTiming::Event::kGpuRenderMarker
++                                            : ui::GuestFrameTiming::Event::kGpuRenderMarkerConflict,
++                                      id);
++    }
++    return true;
++  }
+   // skip N 32-bit words to get to the next packet
+   // No-op, ignore some data.
+   reader->AdvanceRead(count * sizeof(uint32_t));
+@@ -970,6 +985,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+ 
+   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+   swap_timing_id_ = 0;
++  guest_render_marker_.Reset();
+ 
+   ++counter_;
+   return true;
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 942ade4..f5b2188 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -2242,7 +2242,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
+ 
+   ui::GuestFrameTiming::Get().Add(ui::GuestFrameTiming::Event::kCommandProcessorSwap,
+-                                  swap_timing_id_, frame_current_);
++                                  swap_timing_id_, frame_current_, guest_render_marker_.id());
+   auto ssx_frame_inputs = SealSsxFrameInputs(
+       guest_output_width, guest_output_height,
+       frontbuffer_format == xenos::TextureFormat::k_2_10_10_10 ||
+diff --git a/src/graphics/d3d12/ssx_frame_inputs.cpp b/src/graphics/d3d12/ssx_frame_inputs.cpp
+index a2e788c..8184bf6 100644
+--- a/src/graphics/d3d12/ssx_frame_inputs.cpp
++++ b/src/graphics/d3d12/ssx_frame_inputs.cpp
+@@ -446,8 +446,8 @@ bool D3D12CommandProcessor::ReconstructSsxScene(uint64_t vs, uint64_t ps,
+   // Separate lists isolate DLSS/native-motion binding changes from guest draws.
+   if (!ssx_reconstruction_) ssx_reconstruction_ = std::make_unique<SsxReconstruction>();
+   const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+-  ui::GuestFrameTiming::Get().Add(ui::GuestFrameTiming::Event::kReconstructionBegin,
+-                                  frame_current_);
++  ui::GuestFrameTiming::Get().Add(ui::GuestFrameTiming::Event::kReconstructionBegin, frame_current_,
++                                  guest_render_marker_.id());
+   const auto result = ssx_reconstruction_->Submit(
+       GetD3D12Provider(), frozen, source.resource, source.state, seconds,
+       ssx_other_render_target_cache_ ? Streamline::Quality::kQuality : Streamline::Quality::kDLAA,
+diff --git a/src/ui/guest_frame_timing.cpp b/src/ui/guest_frame_timing.cpp
+index 8b2ca21..a300e23 100644
+--- a/src/ui/guest_frame_timing.cpp
++++ b/src/ui/guest_frame_timing.cpp
+@@ -31,7 +31,21 @@ constexpr const char* names[] = {"input_begin",
+                                  "reconstruction_end",
+                                  "host_submit",
+                                  "present_begin",
+-                                 "present_end"};
++                                 "present_end",
++                                 "sample_write",
++                                 "sample_time",
++                                 "sample_publish_begin",
++                                 "sample_publish_end",
++                                 "sample_select_previous",
++                                 "sample_select_next",
++                                 "sample_interpolation",
++                                 "worker_input_begin",
++                                 "worker_input_end",
++                                 "guest_render_marker",
++                                 "guest_render_marker_rejected",
++                                 "gpu_render_marker",
++                                 "gpu_render_marker_conflict"};
++static_assert(std::size(names) == size_t(GuestFrameTiming::Event::kGpuRenderMarkerConflict) + 1);
+ }  // namespace
+ GuestFrameTiming& GuestFrameTiming::Get() {
+   static GuestFrameTiming trace;
+diff --git a/tests/unit/graphics/guest_frame_timing_test.cpp b/tests/unit/graphics/guest_frame_timing_test.cpp
+index 1dc9419..bb1e611 100644
+--- a/tests/unit/graphics/guest_frame_timing_test.cpp
++++ b/tests/unit/graphics/guest_frame_timing_test.cpp
+@@ -6,6 +6,47 @@
+ using rex::ui::GuestFrameTiming;
+ using Event = GuestFrameTiming::Event;
+ 
++TEST_CASE("SSX sample lineage rejects unpublished, reused and overflowing slots", "[ssx-timing]") {
++  rex::ui::GuestSampleLineage samples;
++  CHECK(samples.BeginWrite(1, 100, 20));
++  CHECK(samples.Selected(1, 100) == 0);
++  CHECK(samples.Publish(1, 101) == 0);
++  CHECK(samples.Publish(1, 100) == 20);
++  CHECK(samples.Selected(1, 100) == 20);
++  CHECK(samples.Selected(2, 100) == 0);
++  // Reuse with even the same timestamp must not inherit the old publication.
++  CHECK(samples.BeginWrite(1, 100, 21));
++  CHECK(samples.Selected(1, 100) == 0);
++  CHECK(samples.Publish(1, 100) == 21);
++  CHECK(samples.Selected(1, 100) == 21);
++  CHECK(samples.BeginWrite(1, 102, 22));
++  CHECK(samples.Selected(1, 100) == 0);
++  for (uint64_t i = 2; i <= samples.kCapacity; ++i)
++    REQUIRE(samples.BeginWrite(i, 100, i + 30));
++  CHECK_FALSE(samples.BeginWrite(samples.kCapacity + 1, 100, 1000));
++  CHECK(samples.Publish(samples.kCapacity + 1, 100) == 0);
++  CHECK(samples.Publish(1, 102) == 22);
++}
++
++TEST_CASE("SSX ordered render markers fail closed until the next swap", "[ssx-timing]") {
++  using namespace rex::ui;
++  CHECK(DecodeGuestRenderMarker(kGuestRenderMarkerSignature, 99, 1, 0) == 0);
++  CHECK(DecodeGuestRenderMarker(0, kGuestRenderMarkerVersion, 1, 0) == 0);
++  CHECK(DecodeGuestRenderMarker(kGuestRenderMarkerSignature, kGuestRenderMarkerVersion, 0x89ABCDEF,
++                                0x12345678) == 0x1234567889ABCDEFull);
++  GuestRenderMarker marker;
++  CHECK(marker.id() == 0);
++  CHECK(marker.Begin(12));
++  CHECK(marker.id() == 12);
++  CHECK_FALSE(marker.Begin(12));
++  CHECK(marker.id() == 0);
++  CHECK_FALSE(marker.Begin(13));
++  marker.Reset();
++  CHECK(marker.Begin(14));
++  marker.Reset();
++  CHECK(marker.id() == 0);
++}
++
+ TEST_CASE("SSX timing keeps concurrent records bounded and uniquely identified", "[ssx-timing]") {
+   GuestFrameTiming trace;
+   trace.BeginCapture(60000000000ull);

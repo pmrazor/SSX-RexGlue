@@ -7,7 +7,10 @@
 #include <memory>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
+#include <rex/logging.h>
 #include <rex/rex_app.h>
+#include <rex/ui/keybinds.h>
 
 #include "fps_overlay.h"
 
@@ -24,14 +27,30 @@ class SsxApp : public rex::ReXApp {
   }
 
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
+    rex::ui::RegisterBind("bind_ssx_capture", "F8", "Capture a complete SSX GPU frame", [] {
+      if (!rex::cvar::InvokeCommand("d3d12_capture_guest_frame", "")) {
+        REXLOG_WARN("SSX capture requires the optional SDK guest-frame capture patch");
+      }
+    });
     if (REXCVAR_GET(ssx_show_fps)) {
       fps_overlay_ = std::make_unique<FpsOverlay>(drawer);
     }
   }
-  void OnShutdown() override { fps_overlay_.reset(); }
+  void OnShutdown() override {
+    rex::ui::UnregisterBind("bind_ssx_capture");
+    fps_overlay_.reset();
+  }
 
  private:
   std::unique_ptr<FpsOverlay> fps_overlay_;
+
+  bool SetupEnvironment() override {
+    // The pinned SDK resolves content paths before loading ssx.toml. Preload
+    // it so a direct desktop launch honors game_data_root and user_data_root.
+    // The cvar registry preserves command-line precedence over the TOML file.
+    rex::cvar::LoadConfig(rex::filesystem::GetExecutableFolder() / "ssx.toml");
+    return rex::ReXApp::SetupEnvironment();
+  }
 
   // Override virtual hooks for customization:
   // void OnPostInitLogging() override {}

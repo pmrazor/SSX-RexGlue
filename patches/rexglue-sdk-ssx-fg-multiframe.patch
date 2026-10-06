@@ -1,0 +1,352 @@
+diff --git a/include/rex/ui/d3d12/streamline.h b/include/rex/ui/d3d12/streamline.h
+index 5689c6f..039d760 100644
+--- a/include/rex/ui/d3d12/streamline.h
++++ b/include/rex/ui/d3d12/streamline.h
+@@ -162,7 +162,9 @@ class Streamline {
+   bool SetFrameGenerationLoaded(bool loaded);
+   // Short-lived pause/menu/loading suspension retains allocations. Clear tags
+   // for the invalid frame as well. Resume requires valid inputs and a reset.
+-  bool SetFrameGenerationActive(bool active);
++  // Two generated frames plus one rendered frame give 3x output. Reject a
++  // request above the runtime's capability instead of silently reducing it.
++  bool SetFrameGenerationActive(bool active, uint32_t generated_frames = 1);
+   void RequestFrameGenerationReset(bool requested = true);
+   struct FGFrame {
+     SRCamera camera;
+@@ -178,7 +180,6 @@ class Streamline {
+   };
+   // Depth/MV use NON_PIXEL_SHADER_RESOURCE, HUD/UI use the combined pixel and
+   // non-pixel shader read state. All are eValidUntilPresent, viewport zero.
+-  // The initial integration generates exactly one frame per rendered frame.
+   bool TagFrameGeneration(ID3D12GraphicsCommandList* list, const std::shared_ptr<Frame>& timeline,
+                           const FGFrame& frame, uint32_t backbuffer_width,
+                           uint32_t backbuffer_height);
+diff --git a/include/rex/ui/frame_generation_stats.h b/include/rex/ui/frame_generation_stats.h
+new file mode 100644
+index 0000000..568ed78
+--- /dev/null
++++ b/include/rex/ui/frame_generation_stats.h
+@@ -0,0 +1,33 @@
++#pragma once
++
++#include <cstdint>
++#include <mutex>
++
++namespace rex::ui {
++// One presenter publishes actual backend presentation counts. UI readers never
++// query Streamline (GetState consumes its counters), or multiply guest FPS.
++class FrameGenerationStats {
++ public:
++  struct Snapshot {
++    bool enabled = false, active = false, sampled = false;
++    uint32_t multiplier = 2;
++    double output_fps = 0;
++  };
++  static FrameGenerationStats& Get();
++  static double Now();
++  void Record(bool enabled, bool active, uint32_t multiplier, uint32_t presented) {
++    RecordAt(Now(), enabled, active, multiplier, presented);
++  }
++  Snapshot Read() const { return ReadAt(Now()); }
++  // Explicit times make pause, stale-data and multiplier transitions testable.
++  void RecordAt(double now, bool enabled, bool active, uint32_t multiplier, uint32_t presented);
++  Snapshot ReadAt(double now) const;
++
++ private:
++  mutable std::mutex mutex_;
++  Snapshot snapshot_;
++  double last_ = 0, begin_ = 0;
++  uint64_t presented_ = 0;
++  bool initialized_ = false;
++};
++}  // namespace rex::ui
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index 6e07a94..7e5c9a2 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -2,6 +2,7 @@
+ 
+ # Core UI sources
+ set(REXUI_CORE_SOURCES
++    frame_generation_stats.cpp
+     guest_frame_timing.cpp
+     guest_reflex.cpp
+     graphics_upload_buffer_pool.cpp
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 9d69d14..be9328b 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -1,5 +1,6 @@
+ #include <rex/ui/guest_frame_timing.h>
+ #include <rex/ui/guest_reflex.h>
++#include <rex/ui/frame_generation_stats.h>
+ /**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+@@ -39,11 +40,15 @@ REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D
+ REXCVAR_DECLARE(std::string, ssx_reflex_mode);
+ REXCVAR_DEFINE_BOOL(
+     d3d12_ssx_frame_generation, false, "UI/D3D12",
+-    "Experimental SSX DLAA + 2x Frame Generation presentation; requires race inputs and Reflex.")
++    "Experimental SSX DLAA + Frame Generation presentation; requires race inputs and Reflex.")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ REXCVAR_DEFINE_BOOL(
+     d3d12_ssx_fg_enable, false, "UI/D3D12",
+     "Enable experimental gameplay FG after HUD-free color validation. Requires FG launcher.");
++REXCVAR_DEFINE_INT32(d3d12_ssx_fg_multiplier, 2, "UI/D3D12",
++                    "Total FG output multiplier: 2x or 3x, subject to NVIDIA runtime support.")
++    .range(2, 3)
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ REXCVAR_DEFINE_BOOL(d3d12_log_presenter, false, "UI/D3D12",
+                     "Log swap chain dimensions and format on surface connect or resize.");
+ REXCVAR_DEFINE_BOOL(d3d12_ssx_scene_color, false, "UI/D3D12",
+@@ -364,6 +369,9 @@ bool D3D12Presenter::RequiresSurfaceRecreationOnFullscreenChange() const {
+ }
+ 
+ void D3D12Presenter::SuspendFrameGeneration() {
++  FrameGenerationStats::Get().Record(
++      REXCVAR_GET(d3d12_ssx_frame_generation) && REXCVAR_GET(d3d12_ssx_fg_enable), false,
++      uint32_t(REXCVAR_GET(d3d12_ssx_fg_multiplier)), 0);
+   if (auto* sl = provider_.GetStreamline(); sl && REXCVAR_GET(d3d12_ssx_frame_generation))
+     sl->SetFrameGenerationActive(false);
+   paint_context_.fg_active = false;
+@@ -1256,6 +1264,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+     auto& pc = paint_context_;
+     const char* reason = "inputs";
+     const auto temporal = frame_inputs ? frame_inputs->fg_temporal : nullptr;
++    const auto generated_frames = uint32_t(REXCVAR_GET(d3d12_ssx_fg_multiplier) - 1);
+     const bool fresh = frame_inputs && frame_inputs->metadata.guest_frame > pc.fg_last_frame;
+     uint64_t render_id = 0;
+     const bool render_known = sl->GetFrameRenderId(frame_token, render_id);
+@@ -1269,6 +1278,8 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+       reason = "validation_disabled";
+     else if (pc.fg_failed)
+       reason = "backend_failure";
++    else if (generated_frames > sl->support().max_generated_frames)
++      reason = "unsupported_multiplier";
+     else if (!scene)
+       reason = "pause_or_frontend";
+     else if (!focused)
+@@ -1288,7 +1299,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+         if (!pc.fg_active && !temporal->reset) {
+           sl->RequestFrameGenerationReset();
+           reason = "await_shared_reset";
+-        } else if (sl->SetFrameGenerationActive(true)) {
++        } else if (sl->SetFrameGenerationActive(true, generated_frames)) {
+           Streamline::FGFrame fg;
+           fg.camera = temporal->camera;
+           fg.jitter_pixels = temporal->jitter_pixels;
+@@ -1316,8 +1327,9 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+     if (frame_inputs)
+       pc.fg_last_frame = frame_inputs->metadata.guest_frame;
+     if (reason != pc.fg_reason) {
+-      REXGPU_INFO("SSX_FG active={} reason={} render={} guest={}", fg_tagged, reason, render_id,
+-                  frame_inputs ? frame_inputs->metadata.guest_frame : 0);
++      REXGPU_INFO("SSX_FG active={} reason={} render={} guest={} multiplier={}", fg_tagged,
++                  reason, render_id, frame_inputs ? frame_inputs->metadata.guest_frame : 0,
++                  generated_frames + 1);
+       pc.fg_reason = reason;
+     }
+   }
+@@ -1376,6 +1388,10 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   if (auto* sl = provider_.GetStreamline(); sl && REXCVAR_GET(d3d12_ssx_frame_generation)) {
+     Streamline::FGState state;
+     const bool queried = sl->GetFrameGenerationState(state);
++    FrameGenerationStats::Get().Record(
++        REXCVAR_GET(d3d12_ssx_fg_enable),
++        fg_tagged && queried && !state.status && state.inputs_fence && SUCCEEDED(present_result),
++        uint32_t(REXCVAR_GET(d3d12_ssx_fg_multiplier)), state.frames_presented);
+     if (fg_tagged && fg_color) {
+       // Keep color, depth, immutable MV, descriptors and source packet alive.
+       // Missing fence is a failure, never permission to recycle producer slots.
+@@ -1394,9 +1410,10 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+       paint_context_.fg_presented += state.frames_presented;
+       if (paint_context_.fg_rendered % 120 == 0)
+         REXGPU_INFO(
+-            "SSX_FG_STATS rendered={} presented={} last_presented={} status={} input_fence={}",
++            "SSX_FG_STATS rendered={} presented={} last_presented={} status={} input_fence={} multiplier={} output_fps={:.1f}",
+             paint_context_.fg_rendered, paint_context_.fg_presented, state.frames_presented,
+-            state.status, state.inputs_fence_value);
++            state.status, state.inputs_fence_value, REXCVAR_GET(d3d12_ssx_fg_multiplier),
++            FrameGenerationStats::Get().Read().output_fps);
+     }
+   }
+   GuestFrameTiming::Get().Add(GuestFrameTiming::Event::kPresentEnd, timing_id,
+diff --git a/src/ui/d3d12/streamline.cpp b/src/ui/d3d12/streamline.cpp
+index fde05a2..fec892d 100644
+--- a/src/ui/d3d12/streamline.cpp
++++ b/src/ui/d3d12/streamline.cpp
+@@ -183,6 +183,7 @@ struct Streamline::Impl {
+   ReflexMode reflex_mode = ReflexMode::kOff;
+   bool reflex_configured = false, fg_loaded = true, fg_active = false, fg_reset = true;
+   bool fg_reset_requested = false;
++  uint32_t fg_generated_frames = 1;
+   uint32_t ping_message = 0;
+   std::array<std::shared_ptr<Frame>, 3> render_tokens{};
+   size_t render_token_slot = 0;
+@@ -1078,28 +1079,33 @@ void Streamline::RequestFrameGenerationReset(bool requested) {
+ #endif
+ }
+ 
+-bool Streamline::SetFrameGenerationActive(bool active) {
++bool Streamline::SetFrameGenerationActive(bool active, uint32_t generated_frames) {
+   std::lock_guard lock(api_mutex_);
+ #if REX_HAS_STREAMLINE
+   if (!impl_->attached || !support_.fg ||
+-      (active && (!impl_->fg_loaded || !impl_->reflex_configured ||
++      (active && (!generated_frames || generated_frames > support_.max_generated_frames ||
++                  !impl_->fg_loaded || !impl_->reflex_configured ||
+                   impl_->reflex_mode == ReflexMode::kOff || !support_.low_latency_available)))
+     return false;
+   if (!impl_->fg_loaded)
+     return !active;
+-  if (active == impl_->fg_active)
++  if (active == impl_->fg_active && (!active || generated_frames == impl_->fg_generated_frames))
+     return true;
+   sl::DLSSGOptions options{};
+   options.mode = active ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
+-  options.numFramesToGenerate = 1;
++  options.numFramesToGenerate = active ? generated_frames : impl_->fg_generated_frames;
+   options.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
+   if (!Check(impl_->fg_options(sl::ViewportHandle(0), options), "FG activation"))
+     return false;
+-  impl_->fg_reset |= active != impl_->fg_active;
++  impl_->fg_reset |= active != impl_->fg_active ||
++                     (active && generated_frames != impl_->fg_generated_frames);
++  if (active)
++    impl_->fg_generated_frames = generated_frames;
+   impl_->fg_active = active;
+   return true;
+ #else
+   (void)active;
++  (void)generated_frames;
+   return false;
+ #endif
+ }
+diff --git a/src/ui/frame_generation_stats.cpp b/src/ui/frame_generation_stats.cpp
+new file mode 100644
+index 0000000..19efaa0
+--- /dev/null
++++ b/src/ui/frame_generation_stats.cpp
+@@ -0,0 +1,49 @@
++#include <rex/ui/frame_generation_stats.h>
++#include <chrono>
++#include <cmath>
++
++namespace rex::ui {
++FrameGenerationStats& FrameGenerationStats::Get() {
++  static FrameGenerationStats stats;
++  return stats;
++}
++double FrameGenerationStats::Now() {
++  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++void FrameGenerationStats::RecordAt(double now, bool enabled, bool active, uint32_t multiplier,
++                                    uint32_t presented) {
++  std::lock_guard lock(mutex_);
++  active &= enabled;
++  if (!std::isfinite(now)) {
++    snapshot_ = {};
++    initialized_ = false;
++    return;
++  }
++  if (!initialized_ || now < last_ || now - last_ > 1.0 || !active ||
++      snapshot_.enabled != enabled || snapshot_.active != active ||
++      snapshot_.multiplier != multiplier) {
++    snapshot_ = {enabled, active, false, multiplier, 0};
++    initialized_ = true;
++    begin_ = last_ = now;
++    presented_ = 0;
++    return;  // This Present establishes the new interval's starting boundary.
++  }
++  last_ = now;
++  presented_ += presented;
++  if (now - begin_ >= 0.5) {
++    snapshot_.output_fps = double(presented_) / (now - begin_);
++    snapshot_.sampled = true;
++    presented_ = 0;
++    begin_ = now;
++  }
++}
++FrameGenerationStats::Snapshot FrameGenerationStats::ReadAt(double now) const {
++  std::lock_guard lock(mutex_);
++  auto result = snapshot_;
++  if (!initialized_ || !std::isfinite(now) || now < last_ || now - last_ > 1.0) {
++    result.active = result.sampled = false;
++    result.output_fps = 0;
++  }
++  return result;
++}
++}  // namespace rex::ui
+diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
+index abde0d9..252d8e2 100644
+--- a/tests/unit/CMakeLists.txt
++++ b/tests/unit/CMakeLists.txt
+@@ -17,6 +17,7 @@ add_executable(unit_tests
+     system/function_dispatcher_test.cpp
+     input/input_assignment_test.cpp
+     graphics/guest_frame_timing_test.cpp
++    graphics/frame_generation_stats_test.cpp
+     graphics/guest_reflex_test.cpp
+     codegen/codegen_writer_test.cpp
+     codegen/output_partition_test.cpp
+diff --git a/tests/unit/graphics/frame_generation_stats_test.cpp b/tests/unit/graphics/frame_generation_stats_test.cpp
+new file mode 100644
+index 0000000..c959094
+--- /dev/null
++++ b/tests/unit/graphics/frame_generation_stats_test.cpp
+@@ -0,0 +1,54 @@
++#include <catch2/catch_test_macros.hpp>
++#include <rex/ui/frame_generation_stats.h>
++
++using rex::ui::FrameGenerationStats;
++
++TEST_CASE("SSX FG rate uses actual presentations rather than the requested multiplier", "[ssx-fg]") {
++  FrameGenerationStats stats;
++  CHECK_FALSE(stats.ReadAt(10).enabled);
++  stats.RecordAt(10, true, true, 3, 3);
++  CHECK_FALSE(stats.ReadAt(10).sampled);
++  // 64 rendered frames/sec, but only two real presentations per call even
++  // though the user selected 3x. The overlay must report 128, not 192 FPS.
++  for (unsigned i = 1; i <= 32; ++i)
++    stats.RecordAt(10 + double(i) / 64, true, true, 3, 2);
++  auto value = stats.ReadAt(10.5);
++  CHECK(value.sampled);
++  CHECK(value.multiplier == 3);
++  CHECK(value.output_fps == 128);
++  for (unsigned i = 33; i <= 64; ++i)
++    stats.RecordAt(10 + double(i) / 64, true, true, 3, 3);
++  CHECK(stats.ReadAt(11).output_fps == 192);
++}
++
++TEST_CASE("SSX FG rate clears stale output on pause resize and mode changes", "[ssx-fg]") {
++  FrameGenerationStats stats;
++  stats.RecordAt(1, true, true, 3, 3);
++  stats.RecordAt(1.5, true, true, 3, 90);
++  REQUIRE(stats.ReadAt(1.5).output_fps == 180);
++  SECTION("pause and resume") {
++    stats.RecordAt(1.6, true, false, 3, 1);
++    CHECK_FALSE(stats.ReadAt(1.6).active);
++    CHECK(stats.ReadAt(1.6).output_fps == 0);
++    stats.RecordAt(1.7, true, true, 3, 3);
++    CHECK_FALSE(stats.ReadAt(1.7).sampled);
++  }
++  SECTION("hidden window with no Present calls") {
++    auto stale = stats.ReadAt(2.6);
++    CHECK_FALSE(stale.active);
++    CHECK(stale.output_fps == 0);
++    stats.RecordAt(2.7, true, true, 3, 3);
++    CHECK_FALSE(stats.ReadAt(2.7).sampled);
++  }
++  SECTION("multiplier changes start a fresh measurement") {
++    stats.RecordAt(1.6, true, true, 2, 2);
++    CHECK_FALSE(stats.ReadAt(1.6).sampled);
++    CHECK(stats.ReadAt(1.6).multiplier == 2);
++  }
++  SECTION("disabled mode cannot show active FG") {
++    stats.RecordAt(1.6, false, true, 3, 3);
++    CHECK_FALSE(stats.ReadAt(1.6).active);
++    CHECK_FALSE(stats.ReadAt(1.6).enabled);
++    CHECK(stats.ReadAt(1.6).output_fps == 0);
++  }
++}

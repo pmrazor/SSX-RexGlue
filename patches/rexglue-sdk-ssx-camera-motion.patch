@@ -1,0 +1,1586 @@
+diff --git a/include/rex/ui/d3d12/d3d12_presenter.h b/include/rex/ui/d3d12/d3d12_presenter.h
+index fa4b01b..e99568f 100644
+--- a/include/rex/ui/d3d12/d3d12_presenter.h
++++ b/include/rex/ui/d3d12/d3d12_presenter.h
+@@ -20,6 +20,7 @@
+ #include <rex/ui/d3d12/d3d12_submission_tracker.h>
+ #include <rex/ui/presenter.h>
+ #include <rex/ui/d3d12/guest_frame_inputs.h>
++#include <rex/ui/d3d12/ssx_camera_motion.h>
+ #include <rex/ui/surface.h>
+ 
+ namespace rex::ui::d3d12 {
+@@ -245,6 +246,9 @@ class D3D12Presenter final : public Presenter {
+     // Keep inputs associated with their guest image, including repeat UI paints.
+     std::vector<std::pair<UINT64, std::shared_ptr<const SsxFrameInputs>>> frame_input_paint_refs;
+     uint64_t last_input_frame_logged = 0;
++    SsxCameraMotion camera_motion;
++    uint64_t last_motion_frame_logged = 0;
++    SsxMotionReset last_motion_reason = SsxMotionReset::kFirstFrame;
+ 
+     // Current intermediate textures for guest output painting, refreshed when
+     // painting guest output. While not in use, they are in
+diff --git a/include/rex/ui/d3d12/guest_frame_inputs.h b/include/rex/ui/d3d12/guest_frame_inputs.h
+index be7fe91..2032b09 100644
+--- a/include/rex/ui/d3d12/guest_frame_inputs.h
++++ b/include/rex/ui/d3d12/guest_frame_inputs.h
+@@ -51,6 +51,10 @@ struct SsxFrameMetadata {
+   std::array<float, 16> world_to_clip_candidate{};
+   std::array<float, 16> first_object_to_world{};
+   std::array<float, 2> guest_viewport_z{};
++  // Signed XY scale and effective offset, including window / half-pixel offset,
++  // in guest pixels. Captured from the SAME draw as the camera, not a post pass.
++  std::array<float, 4> guest_viewport_xy{};
++  bool camera_viewport_valid = false;
+   uint32_t guest_depth_info = 0;
+   // Guest PS c0..8 and c255, in register order (not packed host CB indices).
+   std::array<float, 40> tone_map_constants{};
+diff --git a/include/rex/ui/d3d12/ssx_camera_motion.h b/include/rex/ui/d3d12/ssx_camera_motion.h
+new file mode 100644
+index 0000000..a1fbd6d
+--- /dev/null
++++ b/include/rex/ui/d3d12/ssx_camera_motion.h
+@@ -0,0 +1,92 @@
++// Experimental camera reprojection. This is not dense object/animation motion.
++#pragma once
++
++#include <rex/ui/d3d12/guest_frame_inputs.h>
++
++namespace rex::ui::d3d12 {
++class D3D12Provider;
++
++enum class SsxMotionReset {
++  kNone,
++  kFirstFrame,
++  kMissingInputs,
++  kInvalidCamera,
++  kResize,
++  kFrameGap,
++  kDiscontinuity,
++  kExplicit,
++  kBusy,
++  kUnavailable
++};
++const char* SsxMotionResetName(SsxMotionReset reason);
++
++// Matches ssx_camera_motion.cs.hlsl. Row vectors, row-major matrices. Output is
++// previous pixel minus current pixel (+right, +down), at the scene resolution.
++struct SsxMotionConstants {
++  std::array<float, 16> clip_to_previous{};
++  std::array<float, 4> pixel_to_clip{};  // xy scale, xy offset
++  std::array<float, 4> previous_clip_to_pixel{};
++  std::array<float, 4> depth_to_clip{};
++  uint32_t width = 0, height = 0, reset = 1, reserved = 0;
++};
++static_assert(sizeof(SsxMotionConstants) == 128);
++
++struct SsxMotionPlan {
++  SsxMotionConstants constants;
++  uint64_t frame = 0, previous_frame = 0;
++  SsxMotionReset reason = SsxMotionReset::kFirstFrame;
++  bool usable = false, repeated = false;
++};
++
++class SsxMotionHistory {
++ public:
++  SsxMotionPlan Advance(const SsxFrameMetadata& frame, double seconds);
++  void Reset(SsxMotionReset reason = SsxMotionReset::kExplicit);
++
++ private:
++  SsxFrameMetadata previous_{};
++  SsxMotionPlan last_{};
++  double previous_seconds_ = 0;
++  bool have_previous_ = false;
++  SsxMotionReset pending_reset_ = SsxMotionReset::kFirstFrame;
++};
++
++// Single paint-thread owner, using the provider's direct queue. Caller submits
++// every recorded list and drains it before destruction. No waits or game writes.
++class SsxCameraMotion {
++ public:
++  struct Result {
++    ID3D12Resource* vectors = nullptr;   // R32G32_FLOAT, kReadState
++    ID3D12Resource* validity = nullptr;  // R8_UINT: 1 = camera reprojection exists
++    SsxMotionPlan plan;
++    bool dispatched = false;
++  };
++  Result Record(const D3D12Provider& provider, ID3D12GraphicsCommandList* list,
++                const std::shared_ptr<const SsxFrameInputs>& frame, uint64_t submission,
++                uint64_t completed, double seconds);
++  void Reset(SsxMotionReset reason = SsxMotionReset::kExplicit) {
++    history_.Reset(reason);
++    last_slot_ = -1;
++  }
++
++ private:
++  struct Slot {
++    Microsoft::WRL::ComPtr<ID3D12Resource> vectors, validity, samples, readback;
++    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;
++    std::shared_ptr<const SsxFrameInputs> input;
++    uint64_t last_submission = 0, diagnostic_frame = 0;
++    uint32_t width = 0, height = 0, sample_count = 0;
++    bool readback_pending = false;
++  };
++  bool Initialize(const D3D12Provider& provider);
++  bool Prepare(const D3D12Provider& provider, Slot& slot, uint32_t width, uint32_t height);
++  void ReadDiagnostics(Slot& slot);
++  std::array<Slot, 3> slots_;
++  Microsoft::WRL::ComPtr<ID3D12RootSignature> root_;
++  Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline_;
++  SsxMotionHistory history_;
++  int last_slot_ = -1;
++  bool unavailable_ = false;
++  uint64_t last_diagnostic_frame_ = 0;
++};
++}  // namespace rex::ui::d3d12
+diff --git a/src/graphics/d3d12/ssx_frame_inputs.cpp b/src/graphics/d3d12/ssx_frame_inputs.cpp
+index db00f84..eb53de2 100644
+--- a/src/graphics/d3d12/ssx_frame_inputs.cpp
++++ b/src/graphics/d3d12/ssx_frame_inputs.cpp
+@@ -3,6 +3,7 @@
+ #include <cmath>
+ #include <cstring>
+ #include <rex/cvar.h>
++#include <rex/graphics/flags.h>
+ #include <rex/logging.h>
+ 
+ REXCVAR_DEFINE_BOOL(d3d12_ssx_frame_inputs, false, "GPU/D3D12",
+@@ -119,6 +120,28 @@ void D3D12CommandProcessor::CollectSsxFrameInputs(uint64_t vs, uint64_t ps,
+   metadata.scale_y = sy;
+   const auto& regs = *register_file_;
+   if (pass == SsxPass::kWorldTransform) {
++    const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
++    const auto clip = regs.Get<reg::PA_CL_CLIP_CNTL>();
++    const auto depth = regs.Get<reg::RB_DEPTH_INFO>();
++    const bool viewport_valid = (vte.value & 0x73F) == 0x43F && !clip.clip_disable &&
++                                clip.dx_clip_space_def &&
++                                depth.depth_format == xenos::DepthRenderTargetFormat::kD24FS8;
++    std::array<float, 4> xy{regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE),
++                            regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE),
++                            regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET),
++                            regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET)};
++    if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
++      const auto offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
++      xy[2] += float(offset.window_x_offset);
++      xy[3] += float(offset.window_y_offset);
++    }
++    if (REXCVAR_GET(half_pixel_offset) &&
++        regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero) {
++      xy[2] += 0.5f;
++      xy[3] += 0.5f;
++    }
++    const std::array<float, 2> z{regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE),
++                                 regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET)};
+     std::array<float, 16> candidate;
+     std::memcpy(candidate.data(), &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 192 * 4],
+                 sizeof(candidate));
+@@ -126,14 +149,16 @@ void D3D12CommandProcessor::CollectSsxFrameInputs(uint64_t vs, uint64_t ps,
+       if (!std::isfinite(value))
+         metadata.camera_conflict = true;
+     if (metadata.camera_samples++) {
+-      if (metadata.world_to_clip_candidate != candidate)
++      if (metadata.world_to_clip_candidate != candidate || metadata.guest_viewport_xy != xy ||
++          metadata.guest_viewport_z != z || metadata.camera_viewport_valid != viewport_valid)
+         metadata.camera_conflict = true;
+     } else {
+       metadata.world_to_clip_candidate = candidate;
++      metadata.guest_viewport_xy = xy;
++      metadata.camera_viewport_valid = viewport_valid;
+       std::memcpy(metadata.first_object_to_world.data(),
+                   &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 244 * 4], sizeof(candidate));
+-      metadata.guest_viewport_z = {regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE),
+-                                   regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET)};
++      metadata.guest_viewport_z = z;
+       metadata.guest_depth_info = regs[XE_GPU_REG_RB_DEPTH_INFO];
+     }
+   } else if (pass == SsxPass::kToneMap) {
+@@ -194,6 +219,9 @@ std::shared_ptr<const ui::d3d12::SsxFrameInputs> D3D12CommandProcessor::SealSsxF
+     }
+     if (data.camera_samples) {
+       const auto& m = data.world_to_clip_candidate;
++      const auto& xy = data.guest_viewport_xy;
++      REXGPU_INFO("SSX_INPUT_VIEWPORT frame={} valid={} xy={},{},{},{}", data.guest_frame,
++                  data.camera_viewport_valid, xy[0], xy[1], xy[2], xy[3]);
+       REXGPU_INFO(
+           "SSX_INPUT_CAMERA frame={} guest_z_scale={} guest_z_offset={} depth_info={:08X} "
+           "world_to_clip={},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index 101f6d7..618ac34 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -62,6 +62,8 @@ if(REXGLUE_USE_D3D12)
+         d3d12/d3d12_util.cpp
+         d3d12/streamline.cpp
+         d3d12/guest_frame_inputs.cpp
++        d3d12/ssx_motion_history.cpp
++        d3d12/ssx_camera_motion.cpp
+     )
+ endif()
+ 
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 366ad11..92abc7e 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <climits>
++#include <chrono>
+ #include <cmath>
+ #include <memory>
+ #include <utility>
+@@ -34,6 +35,9 @@ REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D
+                     "Allow variable refresh rate and tearing");
+ REXCVAR_DEFINE_BOOL(d3d12_log_presenter, false, "UI/D3D12",
+                     "Log swap chain dimensions and format on surface connect or resize.");
++REXCVAR_DEFINE_BOOL(d3d12_ssx_camera_motion, false, "UI/D3D12",
++                    "Experimental SSX camera-only vectors; requires d3d12_ssx_frame_inputs. No DLSS/FG.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ namespace rex::ui::d3d12 {
+ 
+@@ -556,6 +560,7 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
+     return;
+   }
+   AwaitSwapChainUsageCompletion();
++  camera_motion.Reset(SsxMotionReset::kResize);
+   for (Microsoft::WRL::ComPtr<ID3D12Resource>& swap_chain_buffer_ref : swap_chain_buffers) {
+     swap_chain_buffer_ref.Reset();
+   }
+@@ -630,6 +635,24 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+     }
+   }
+ 
++  if (REXCVAR_GET(d3d12_ssx_camera_motion)) {
++    const double seconds = std::chrono::duration<double>(
++        std::chrono::steady_clock::now().time_since_epoch()).count();
++    const auto motion = paint_context_.camera_motion.Record(provider_, command_list, frame_inputs,
++        current_paint_submission, inputs_completed, seconds);
++    const auto& plan = motion.plan;
++    if (plan.reason != paint_context_.last_motion_reason ||
++        (plan.frame && (!paint_context_.last_motion_frame_logged ||
++         plan.frame - paint_context_.last_motion_frame_logged >= 120))) {
++      paint_context_.last_motion_reason = plan.reason;
++      paint_context_.last_motion_frame_logged = plan.frame;
++      REXGPU_INFO("SSX_MOTION frame={} previous={} size={}x{} dispatched={} reset={} "
++                  "reason={} coverage=camera_only dlss_ready=false", plan.frame, plan.previous_frame,
++                  plan.constants.width, plan.constants.height, motion.dispatched,
++                  plan.constants.reset, SsxMotionResetName(plan.reason));
++    }
++  }
++
+   if (guest_output_resource) {
+     GuestOutputPaintFlow guest_output_flow = GetGuestOutputPaintFlow(
+         guest_output_properties, paint_context_.swap_chain_width, paint_context_.swap_chain_height,
+diff --git a/src/ui/d3d12/ssx_camera_motion.cpp b/src/ui/d3d12/ssx_camera_motion.cpp
+new file mode 100644
+index 0000000..41d636c
+--- /dev/null
++++ b/src/ui/d3d12/ssx_camera_motion.cpp
+@@ -0,0 +1,261 @@
++#include <rex/ui/d3d12/ssx_camera_motion.h>
++
++#include <algorithm>
++#include <rex/logging.h>
++#include <rex/ui/d3d12/d3d12_provider.h>
++#include <rex/ui/d3d12/d3d12_util.h>
++
++namespace rex::ui::d3d12 {
++namespace {
++#include "ui/shaders/bytecode/d3d12_5_1/ssx_camera_motion_cs.h"
++using Microsoft::WRL::ComPtr;
++void Transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
++                D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
++  D3D12_RESOURCE_BARRIER b{};
++  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++  b.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
++  list->ResourceBarrier(1, &b);
++}
++bool Resource(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc, bool readback,
++              D3D12_RESOURCE_STATES state, ComPtr<ID3D12Resource>& result) {
++  D3D12_HEAP_PROPERTIES heap{};
++  heap.Type = readback ? D3D12_HEAP_TYPE_READBACK : D3D12_HEAP_TYPE_DEFAULT;
++  return SUCCEEDED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state,
++                                                   nullptr, IID_PPV_ARGS(&result)));
++}
++}  // namespace
++
++bool SsxCameraMotion::Initialize(const D3D12Provider& provider) {
++  if (pipeline_)
++    return true;
++  if (unavailable_)
++    return false;
++  unavailable_ = true;
++  D3D12_DESCRIPTOR_RANGE ranges[2]{};
++  ranges[0] = {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
++  ranges[1] = {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0, 1};
++  D3D12_ROOT_PARAMETER params[2]{};
++  params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++  params[0].Constants = {0, 0, sizeof(SsxMotionConstants) / 4};
++  params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++  params[1].DescriptorTable = {2, ranges};
++  D3D12_ROOT_SIGNATURE_DESC desc{};
++  desc.NumParameters = 2;
++  desc.pParameters = params;
++  root_.Attach(util::CreateRootSignature(provider, desc));
++  if (!root_)
++    return false;
++  pipeline_.Attach(util::CreateComputePipeline(provider.GetDevice(), ssx_camera_motion_cs,
++                                               sizeof(ssx_camera_motion_cs), root_.Get()));
++  if (!pipeline_)
++    return false;
++  pipeline_->SetName(L"SSX camera-only motion (not DLSS-ready)");
++  unavailable_ = false;
++  return true;
++}
++
++bool SsxCameraMotion::Prepare(const D3D12Provider& provider, Slot& slot, uint32_t width,
++                              uint32_t height) {
++  if (slot.vectors && slot.width == width && slot.height == height)
++    return true;
++  Slot replacement;  // Commit only after all allocations succeeded.
++  auto* device = provider.GetDevice();
++  D3D12_RESOURCE_DESC d{};
++  d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++  d.Width = width;
++  d.Height = height;
++  d.DepthOrArraySize = d.MipLevels = d.SampleDesc.Count = 1;
++  d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++  d.Format = DXGI_FORMAT_R32G32_FLOAT;
++  if (!Resource(device, d, false, GuestInputTexture::kReadState, replacement.vectors))
++    return false;
++  d.Format = DXGI_FORMAT_R8_UINT;
++  if (!Resource(device, d, false, GuestInputTexture::kReadState, replacement.validity))
++    return false;
++  replacement.sample_count = ((width + 31) / 32) * ((height + 31) / 32);
++  d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++  d.Width = uint64_t(replacement.sample_count) * 16;
++  d.Height = 1;
++  d.Format = DXGI_FORMAT_UNKNOWN;
++  d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++  if (!Resource(device, d, false, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, replacement.samples))
++    return false;
++  d.Flags = D3D12_RESOURCE_FLAG_NONE;
++  if (!Resource(device, d, true, D3D12_RESOURCE_STATE_COPY_DEST, replacement.readback))
++    return false;
++  D3D12_DESCRIPTOR_HEAP_DESC heap{};
++  heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
++  heap.NumDescriptors = 4;
++  heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
++  if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&replacement.heap))))
++    return false;
++  replacement.width = width;
++  replacement.height = height;
++  replacement.vectors->SetName(L"SSX camera-only motion XY pixels");
++  replacement.validity->SetName(L"SSX camera-only reprojection validity (not object coverage)");
++  replacement.samples->SetName(L"SSX motion diagnostic samples");
++  slot = std::move(replacement);
++  return true;
++}
++
++void SsxCameraMotion::ReadDiagnostics(Slot& slot) {
++  if (!slot.readback_pending)
++    return;
++  slot.readback_pending = false;
++  float* values = nullptr;
++  D3D12_RANGE range{0, size_t(slot.sample_count) * 16};
++  if (FAILED(slot.readback->Map(0, &range, reinterpret_cast<void**>(&values))))
++    return;
++  uint32_t valid = 0, moving = 0, nonfinite = 0;
++  float max_motion = 0, min_depth = 1, max_depth = 0;
++  for (uint32_t i = 0; i < slot.sample_count; ++i) {
++    const float* p = values + i * 4;
++    if (!std::isfinite(p[0]) || !std::isfinite(p[1]))
++      ++nonfinite;
++    if (p[3] == 0)
++      continue;
++    ++valid;
++    const float magnitude = std::hypot(p[0], p[1]);
++    if (magnitude > 0.01f)
++      ++moving;
++    max_motion = std::max(max_motion, magnitude);
++    min_depth = std::min(min_depth, p[2]);
++    max_depth = std::max(max_depth, p[2]);
++  }
++  D3D12_RANGE empty{0, 0};
++  slot.readback->Unmap(0, &empty);
++  REXGPU_INFO(
++      "SSX_MOTION_GPU frame={} sampled={} valid={} moving={} nonfinite={} max_pixels={} "
++      "depth_min={} depth_max={} coverage=camera_only dlss_ready=false",
++      slot.diagnostic_frame, slot.sample_count, valid, moving, nonfinite, max_motion, min_depth,
++      max_depth);
++}
++
++SsxCameraMotion::Result SsxCameraMotion::Record(const D3D12Provider& provider,
++                                                ID3D12GraphicsCommandList* list,
++                                                const std::shared_ptr<const SsxFrameInputs>& frame,
++                                                uint64_t submission, uint64_t completed,
++                                                double seconds) {
++  Result result;
++  for (auto& slot : slots_)
++    if (slot.last_submission <= completed) {
++      ReadDiagnostics(slot);
++      slot.input.reset();
++    }
++  if (!frame) {
++    Reset(SsxMotionReset::kMissingInputs);
++    result.plan.reason = SsxMotionReset::kMissingInputs;
++    return result;
++  }
++  const auto& depth = frame->textures[size_t(SsxInput::kResolvedDepth)];
++  const auto& f = frame->metadata;
++  // Raw resolved 20e4 depth expands to R32_FLOAT in the texture cache. Reject
++  // other views; the compute pass does not implement guest fetch conversions.
++  if (!depth.resource || depth.view_format != DXGI_FORMAT_R32_FLOAT ||
++      depth.width != uint64_t(f.scene_width) * f.scale_x ||
++      depth.height != uint64_t(f.scene_height) * f.scale_y || depth.source_mip ||
++      depth.host_swizzle || depth.swizzled_signs || (depth.guest_fetch[3] & (63u << 13))) {
++    Reset(SsxMotionReset::kMissingInputs);
++    result.plan.reason = SsxMotionReset::kMissingInputs;
++    return result;
++  }
++  result.plan = history_.Advance(f, seconds);
++  if (!result.plan.usable) {
++    last_slot_ = -1;
++    return result;
++  }
++  if (result.plan.repeated && last_slot_ >= 0) {
++    auto& slot = slots_[last_slot_];
++    slot.last_submission = submission;
++    result.vectors = slot.vectors.Get();
++    result.validity = slot.validity.Get();
++    return result;
++  }
++  if (!Initialize(provider)) {
++    Reset(SsxMotionReset::kUnavailable);
++    result.plan.usable = false;
++    result.plan.reason = SsxMotionReset::kUnavailable;
++    return result;
++  }
++  int chosen = -1;
++  for (int i = 0; i < int(slots_.size()); ++i)
++    if (slots_[i].last_submission <= completed) {
++      chosen = i;
++      break;
++    }
++  if (chosen < 0) {
++    Reset(SsxMotionReset::kBusy);
++    result.plan.usable = false;
++    result.plan.reason = SsxMotionReset::kBusy;
++    return result;
++  }
++  auto& slot = slots_[chosen];
++  if (!Prepare(provider, slot, depth.width, depth.height)) {
++    Reset(SsxMotionReset::kUnavailable);
++    result.plan.usable = false;
++    result.plan.reason = SsxMotionReset::kUnavailable;
++    return result;
++  }
++  auto* device = provider.GetDevice();
++  auto handle = slot.heap->GetCPUDescriptorHandleForHeapStart();
++  const auto increment =
++      device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++  D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
++  srv.Format = DXGI_FORMAT_R32_FLOAT;
++  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++  srv.Texture2D.MipLevels = 1;
++  device->CreateShaderResourceView(depth.resource.Get(), &srv, handle);
++  handle.ptr += increment;
++  D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
++  uav.Format = DXGI_FORMAT_R32G32_FLOAT;
++  uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
++  device->CreateUnorderedAccessView(slot.vectors.Get(), nullptr, &uav, handle);
++  handle.ptr += increment;
++  uav.Format = DXGI_FORMAT_R8_UINT;
++  device->CreateUnorderedAccessView(slot.validity.Get(), nullptr, &uav, handle);
++  handle.ptr += increment;
++  uav = {};
++  uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
++  uav.Buffer.NumElements = slot.sample_count;
++  uav.Buffer.StructureByteStride = 16;
++  device->CreateUnorderedAccessView(slot.samples.Get(), nullptr, &uav, handle);
++  Transition(list, slot.vectors.Get(), GuestInputTexture::kReadState,
++             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++  Transition(list, slot.validity.Get(), GuestInputTexture::kReadState,
++             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++  // Serialize writes on reuse, including frames where diagnostics weren't copied.
++  D3D12_RESOURCE_BARRIER samples_barrier{};
++  samples_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
++  samples_barrier.UAV.pResource = slot.samples.Get();
++  list->ResourceBarrier(1, &samples_barrier);
++  ID3D12DescriptorHeap* heaps[] = {slot.heap.Get()};
++  list->SetDescriptorHeaps(1, heaps);
++  list->SetPipelineState(pipeline_.Get());
++  list->SetComputeRootSignature(root_.Get());
++  list->SetComputeRoot32BitConstants(0, sizeof(SsxMotionConstants) / 4, &result.plan.constants, 0);
++  list->SetComputeRootDescriptorTable(1, slot.heap->GetGPUDescriptorHandleForHeapStart());
++  list->Dispatch((depth.width + 7) / 8, (depth.height + 7) / 8, 1);
++  Transition(list, slot.vectors.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++             GuestInputTexture::kReadState);
++  Transition(list, slot.validity.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++             GuestInputTexture::kReadState);
++  if (!last_diagnostic_frame_ || f.guest_frame < last_diagnostic_frame_ ||
++      f.guest_frame - last_diagnostic_frame_ >= 120) {
++    Transition(list, slot.samples.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++               D3D12_RESOURCE_STATE_COPY_SOURCE);
++    list->CopyResource(slot.readback.Get(), slot.samples.Get());
++    Transition(list, slot.samples.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
++               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++    slot.readback_pending = true;
++    last_diagnostic_frame_ = slot.diagnostic_frame = f.guest_frame;
++  }
++  slot.last_submission = submission;
++  slot.input = frame;
++  last_slot_ = chosen;
++  result.vectors = slot.vectors.Get();
++  result.validity = slot.validity.Get();
++  result.dispatched = true;
++  return result;
++}
++}  // namespace rex::ui::d3d12
+diff --git a/src/ui/d3d12/ssx_motion_history.cpp b/src/ui/d3d12/ssx_motion_history.cpp
+new file mode 100644
+index 0000000..7ed2e73
+--- /dev/null
++++ b/src/ui/d3d12/ssx_motion_history.cpp
+@@ -0,0 +1,173 @@
++#include <rex/ui/d3d12/ssx_camera_motion.h>
++
++#include <algorithm>
++
++namespace rex::ui::d3d12 {
++namespace {
++using Matrix = std::array<double, 16>;
++bool Inverse(const std::array<float, 16>& source, Matrix& inverse) {
++  double a[4][8]{};
++  for (size_t r = 0; r < 4; ++r) {
++    for (size_t c = 0; c < 4; ++c) {
++      if (!std::isfinite(source[r * 4 + c]))
++        return false;
++      a[r][c] = source[r * 4 + c];
++    }
++    a[r][r + 4] = 1;
++  }
++  for (size_t c = 0; c < 4; ++c) {
++    size_t pivot = c;
++    for (size_t r = c + 1; r < 4; ++r)
++      if (std::abs(a[r][c]) > std::abs(a[pivot][c]))
++        pivot = r;
++    if (std::abs(a[pivot][c]) < 1e-12)
++      return false;
++    for (size_t i = 0; i < 8; ++i)
++      std::swap(a[pivot][i], a[c][i]);
++    const double divisor = a[c][c];
++    for (double& value : a[c])
++      value /= divisor;
++    for (size_t r = 0; r < 4; ++r) {
++      if (r == c)
++        continue;
++      const double factor = a[r][c];
++      for (size_t i = 0; i < 8; ++i)
++        a[r][i] -= factor * a[c][i];
++    }
++  }
++  for (size_t r = 0; r < 4; ++r)
++    for (size_t c = 0; c < 4; ++c) {
++      inverse[r * 4 + c] = a[r][c + 4];
++      if (!std::isfinite(inverse[r * 4 + c]))
++        return false;
++    }
++  return true;
++}
++bool ValidCamera(const SsxFrameMetadata& f, Matrix& inverse) {
++  if (!f.camera_samples || f.camera_conflict || !f.camera_viewport_valid || !f.scene_width ||
++      !f.scene_height || !f.scale_x || !f.scale_y ||
++      uint64_t(f.scene_width) * f.scale_x > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
++      uint64_t(f.scene_height) * f.scale_y > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION)
++    return false;
++  for (float v : f.guest_viewport_xy)
++    if (!std::isfinite(v))
++      return false;
++  for (float v : f.guest_viewport_z)
++    if (!std::isfinite(v))
++      return false;
++  if (f.guest_viewport_xy[0] == 0 || f.guest_viewport_xy[1] == 0 || f.guest_viewport_z[0] != -1 ||
++      f.guest_viewport_z[1] != 1)
++    return false;  // Only the observed SSX reversed [0,1] depth path is supported.
++  return Inverse(f.world_to_clip_candidate, inverse);
++}
++// Conservative guard, not an SSX camera-cut event hook. Probe distant geometry,
++// not the near plane (near-plane parallax can be very large during normal play).
++bool Discontinuity(const std::array<float, 16>& m) {
++  for (double x : {-0.75, 0.0, 0.75})
++    for (double y : {-0.75, 0.0, 0.75}) {
++      double p[4]{x, y, 0.99, 1}, q[4]{};
++      for (size_t c = 0; c < 4; ++c)
++        for (size_t r = 0; r < 4; ++r)
++          q[c] += p[r] * m[r * 4 + c];
++      if (q[3] <= 1e-6 || std::abs(q[0] / q[3] - x) > 1.5 || std::abs(q[1] / q[3] - y) > 1.5)
++        return true;
++    }
++  return false;
++}
++}  // namespace
++
++const char* SsxMotionResetName(SsxMotionReset reason) {
++  switch (reason) {
++    case SsxMotionReset::kNone:
++      return "none";
++    case SsxMotionReset::kFirstFrame:
++      return "first_frame";
++    case SsxMotionReset::kMissingInputs:
++      return "missing_inputs";
++    case SsxMotionReset::kInvalidCamera:
++      return "invalid_camera";
++    case SsxMotionReset::kResize:
++      return "resize";
++    case SsxMotionReset::kFrameGap:
++      return "frame_gap";
++    case SsxMotionReset::kDiscontinuity:
++      return "camera_discontinuity";
++    case SsxMotionReset::kExplicit:
++      return "explicit";
++    case SsxMotionReset::kBusy:
++      return "pool_busy";
++    case SsxMotionReset::kUnavailable:
++      return "unavailable";
++  }
++  return "unknown";
++}
++void SsxMotionHistory::Reset(SsxMotionReset reason) {
++  have_previous_ = false;
++  pending_reset_ = reason;
++}
++SsxMotionPlan SsxMotionHistory::Advance(const SsxFrameMetadata& f, double seconds) {
++  SsxMotionPlan plan;
++  plan.frame = f.guest_frame;
++  if ((f.captured_mask & 3) != 3 || ((f.failed_mask | f.duplicate_mask) & 3)) {
++    Reset(SsxMotionReset::kMissingInputs);
++    plan.reason = pending_reset_;
++    return plan;
++  }
++  Matrix inverse;
++  if (!std::isfinite(seconds) || !ValidCamera(f, inverse)) {
++    Reset(SsxMotionReset::kInvalidCamera);
++    plan.reason = pending_reset_;
++    return plan;
++  }
++  if (have_previous_ && f.guest_frame == previous_.guest_frame) {
++    plan = last_;
++    plan.repeated = true;
++    return plan;  // UI repaint does not replace the last real frame's velocity.
++  }
++  plan.usable = true;
++  auto& k = plan.constants;
++  k.width = f.scene_width * f.scale_x;
++  k.height = f.scene_height * f.scale_y;
++  k.pixel_to_clip = {1 / (f.scale_x * f.guest_viewport_xy[0]),
++                     1 / (f.scale_y * f.guest_viewport_xy[1]),
++                     -f.guest_viewport_xy[2] / f.guest_viewport_xy[0],
++                     -f.guest_viewport_xy[3] / f.guest_viewport_xy[1]};
++  k.depth_to_clip = {1 / f.guest_viewport_z[0], -f.guest_viewport_z[1] / f.guest_viewport_z[0], 0,
++                     0};
++  plan.reason = have_previous_ ? SsxMotionReset::kNone : pending_reset_;
++  if (have_previous_) {
++    const auto& p = previous_;
++    plan.previous_frame = p.guest_frame;
++    if (p.scene_width != f.scene_width || p.scene_height != f.scene_height ||
++        p.scale_x != f.scale_x || p.scale_y != f.scale_y || p.output_width != f.output_width ||
++        p.output_height != f.output_height)
++      plan.reason = SsxMotionReset::kResize;
++    else if (f.guest_frame < p.guest_frame || f.guest_frame - p.guest_frame > 8 ||
++             seconds < previous_seconds_ || seconds - previous_seconds_ > 0.25)
++      plan.reason = SsxMotionReset::kFrameGap;
++    k.previous_clip_to_pixel = {
++        p.guest_viewport_xy[0] * p.scale_x, p.guest_viewport_xy[1] * p.scale_y,
++        p.guest_viewport_xy[2] * p.scale_x, p.guest_viewport_xy[3] * p.scale_y};
++    for (size_t r = 0; r < 4; ++r)
++      for (size_t c = 0; c < 4; ++c) {
++        double value = 0;
++        for (size_t i = 0; i < 4; ++i)
++          value += inverse[r * 4 + i] * p.world_to_clip_candidate[i * 4 + c];
++        // Identical cameras produce exact identity, including large world offsets.
++        k.clip_to_previous[r * 4 + c] =
++            f.world_to_clip_candidate == p.world_to_clip_candidate ? float(r == c) : float(value);
++        if (!std::isfinite(value))
++          plan.reason = SsxMotionReset::kInvalidCamera;
++      }
++    if (plan.reason == SsxMotionReset::kNone && Discontinuity(k.clip_to_previous))
++      plan.reason = SsxMotionReset::kDiscontinuity;
++  }
++  k.reset = plan.reason != SsxMotionReset::kNone;
++  previous_ = f;
++  previous_seconds_ = seconds;
++  have_previous_ = true;
++  pending_reset_ = SsxMotionReset::kNone;
++  last_ = plan;
++  return plan;
++}
++}  // namespace rex::ui::d3d12
+diff --git a/src/ui/shaders/bytecode/d3d12_5_1/ssx_camera_motion_cs.h b/src/ui/shaders/bytecode/d3d12_5_1/ssx_camera_motion_cs.h
+new file mode 100644
+index 0000000..d74b998
+--- /dev/null
++++ b/src/ui/shaders/bytecode/d3d12_5_1/ssx_camera_motion_cs.h
+@@ -0,0 +1,656 @@
++#if 0
++//
++// Generated by Microsoft (R) HLSL Shader Compiler 10.1
++//
++//
++// Buffer Definitions: 
++//
++// cbuffer Motion
++// {
++//
++//   row_major float4x4 clip_to_previous;// Offset:    0 Size:    64
++//   float4 pixel_to_clip;              // Offset:   64 Size:    16
++//   float4 previous_clip_to_pixel;     // Offset:   80 Size:    16
++//   float4 depth_to_clip;              // Offset:   96 Size:    16
++//   uint2 extent;                      // Offset:  112 Size:     8
++//   uint reset_history;                // Offset:  120 Size:     4
++//   uint reserved;                     // Offset:  124 Size:     4 [unused]
++//
++// }
++//
++// Resource bind info for diagnostic_samples
++// {
++//
++//   float4 $Element;                   // Offset:    0 Size:    16
++//
++// }
++//
++//
++// Resource Bindings:
++//
++// Name                                 Type  Format         Dim      ID      HLSL Bind  Count
++// ------------------------------ ---------- ------- ----------- ------- -------------- ------
++// scene_depth                       texture   float          2d      T0             t0      1 
++// vectors                               UAV  float2          2d      U0             u0      1 
++// validity                              UAV    uint          2d      U1             u1      1 
++// diagnostic_samples                    UAV  struct         r/w      U2             u2      1 
++// Motion                            cbuffer      NA          NA     CB0            cb0      1 
++//
++//
++//
++// Input signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Input
++//
++// Output signature:
++//
++// Name                 Index   Mask Register SysValue  Format   Used
++// -------------------- ----- ------ -------- -------- ------- ------
++// no Output
++cs_5_1
++dcl_globalFlags refactoringAllowed
++dcl_constantbuffer CB0[0:0][8], immediateIndexed, space=0
++dcl_resource_texture2d (float,float,float,float) T0[0:0], space=0
++dcl_uav_typed_texture2d (float,float,float,float) U0[0:0], space=0
++dcl_uav_typed_texture2d (uint,uint,uint,uint) U1[1:1], space=0
++dcl_uav_structured U2[2:2], 16, space=0
++dcl_input vThreadID.xy
++dcl_temps 4
++dcl_thread_group 8, 8, 1
++uge r0.xy, vThreadID.xyxx, CB0[0][7].xyxx
++or r0.x, r0.y, r0.x
++if_nz r0.x
++  ret 
++endif 
++mov r0.xy, vThreadID.xyxx
++mov r0.zw, l(0,0,0,0)
++ld r0.w, r0.xyzw, T0[0].yzwx
++ieq r1.x, CB0[0][7].z, l(0)
++and r1.y, r0.w, l(0x7f800000)
++ine r1.y, r1.y, l(0x7f800000)
++and r1.x, r1.y, r1.x
++lt r1.y, l(0.000000), r0.w
++and r1.x, r1.y, r1.x
++ge r1.y, l(1.000000), r0.w
++and r1.x, r1.y, r1.x
++if_nz r1.x
++  utof r1.xy, vThreadID.xyxx
++  add r1.xy, r1.xyxx, l(0.500000, 0.500000, 0.000000, 0.000000)
++  mad r1.zw, r1.xxxy, CB0[0][4].xxxy, CB0[0][4].zzzw
++  mad r2.x, r0.w, CB0[0][6].x, CB0[0][6].y
++  mul r3.xyzw, r1.wwww, CB0[0][1].xyzw
++  mad r3.xyzw, r1.zzzz, CB0[0][0].xyzw, r3.xyzw
++  mad r2.xyzw, r2.xxxx, CB0[0][2].xyzw, r3.xyzw
++  add r2.xyzw, r2.xyzw, CB0[0][3].xyzw
++  and r3.xyzw, r2.xyzw, l(0x7f800000, 0x7f800000, 0x7f800000, 0x7f800000)
++  ine r3.xyzw, r3.xyzw, l(0x7f800000, 0x7f800000, 0x7f800000, 0x7f800000)
++  and r1.zw, r3.zzzw, r3.xxxy
++  and r1.z, r1.w, r1.z
++  lt r1.w, l(0.000001), r2.w
++  and r1.z, r1.w, r1.z
++  if_nz r1.z
++    div r1.zw, r2.xxxy, r2.wwww
++    mad r1.zw, r1.zzzw, CB0[0][5].xxxy, CB0[0][5].zzzw
++    add r0.xy, -r1.xyxx, r1.zwzz
++    and r1.xy, r0.xyxx, l(0x7f800000, 0x7f800000, 0, 0)
++    ine r1.xy, r1.xyxx, l(0x7f800000, 0x7f800000, 0, 0)
++    and r1.x, r1.y, r1.x
++    and r1.y, r1.x, l(1)
++    if_z r1.x
++      mov r0.xy, l(0,0,0,0)
++    endif 
++  else 
++    mov r0.xy, l(0,0,0,0)
++    mov r1.y, l(0)
++  endif 
++else 
++  mov r0.xy, l(0,0,0,0)
++  mov r1.y, l(0)
++endif 
++store_uav_typed U0[0].xyzw, vThreadID.xyyy, r0.xyxx
++store_uav_typed U1[1].xyzw, vThreadID.xyyy, r1.yyyy
++or r1.x, vThreadID.y, vThreadID.x
++and r1.x, r1.x, l(31)
++if_z r1.x
++  ushr r1.xz, vThreadID.yyxy, l(5, 0, 5, 0)
++  iadd r1.w, CB0[0][7].x, l(31)
++  ushr r1.w, r1.w, l(5)
++  imad r1.x, r1.x, r1.w, r1.z
++  utof r0.z, r1.y
++  store_structured U2[2].xyzw, r1.x, l(0), r0.xywz
++endif 
++ret 
++// Approximately 63 instruction slots used
++#endif
++
++const BYTE ssx_camera_motion_cs[] =
++{
++     68,  88,  66,  67, 127, 255, 
++     88, 212,  83, 221,  35, 167, 
++     50,  46, 208, 172,  94,  89, 
++    140, 160,   1,   0,   0,   0, 
++     84,  12,   0,   0,   5,   0, 
++      0,   0,  52,   0,   0,   0, 
++     88,   4,   0,   0, 104,   4, 
++      0,   0, 120,   4,   0,   0, 
++    184,  11,   0,   0,  82,  68, 
++     69,  70,  28,   4,   0,   0, 
++      2,   0,   0,   0,  60,   1, 
++      0,   0,   5,   0,   0,   0, 
++     60,   0,   0,   0,   1,   5, 
++     83,  67,   0, 133,   4,   0, 
++    244,   3,   0,   0,  19,  19, 
++     68,  37,  60,   0,   0,   0, 
++     24,   0,   0,   0,  40,   0, 
++      0,   0,  40,   0,   0,   0, 
++     36,   0,   0,   0,  12,   0, 
++      0,   0,   0,   0,   0,   0, 
++      4,   1,   0,   0,   2,   0, 
++      0,   0,   5,   0,   0,   0, 
++      4,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++      1,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  16,   1, 
++      0,   0,   4,   0,   0,   0, 
++      5,   0,   0,   0,   4,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0,   1,   0, 
++      0,   0,   4,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  24,   1,   0,   0, 
++      4,   0,   0,   0,   4,   0, 
++      0,   0,   4,   0,   0,   0, 
++    255, 255, 255, 255,   1,   0, 
++      0,   0,   1,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   1,   0,   0,   0, 
++     33,   1,   0,   0,   6,   0, 
++      0,   0,   6,   0,   0,   0, 
++      1,   0,   0,   0,  16,   0, 
++      0,   0,   2,   0,   0,   0, 
++      1,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      2,   0,   0,   0,  52,   1, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   1,   0, 
++      0,   0,   1,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0, 115,  99, 101, 110, 
++    101,  95, 100, 101, 112, 116, 
++    104,   0, 118, 101,  99, 116, 
++    111, 114, 115,   0, 118,  97, 
++    108, 105, 100, 105, 116, 121, 
++      0, 100, 105,  97, 103, 110, 
++    111, 115, 116, 105,  99,  95, 
++    115,  97, 109, 112, 108, 101, 
++    115,   0,  77, 111, 116, 105, 
++    111, 110,   0, 171,  52,   1, 
++      0,   0,   7,   0,   0,   0, 
++    108,   1,   0,   0, 128,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  33,   1, 
++      0,   0,   1,   0,   0,   0, 
++    156,   3,   0,   0,  16,   0, 
++      0,   0,   0,   0,   0,   0, 
++      3,   0,   0,   0, 132,   2, 
++      0,   0,   0,   0,   0,   0, 
++     64,   0,   0,   0,   2,   0, 
++      0,   0, 160,   2,   0,   0, 
++      0,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 196,   2,   0,   0, 
++     64,   0,   0,   0,  16,   0, 
++      0,   0,   2,   0,   0,   0, 
++    220,   2,   0,   0,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++      0,   3,   0,   0,  80,   0, 
++      0,   0,  16,   0,   0,   0, 
++      2,   0,   0,   0, 220,   2, 
++      0,   0,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0,  23,   3, 
++      0,   0,  96,   0,   0,   0, 
++     16,   0,   0,   0,   2,   0, 
++      0,   0, 220,   2,   0,   0, 
++      0,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0,  37,   3,   0,   0, 
++    112,   0,   0,   0,   8,   0, 
++      0,   0,   2,   0,   0,   0, 
++     52,   3,   0,   0,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++     88,   3,   0,   0, 120,   0, 
++      0,   0,   4,   0,   0,   0, 
++      2,   0,   0,   0, 108,   3, 
++      0,   0,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0, 144,   3, 
++      0,   0, 124,   0,   0,   0, 
++      4,   0,   0,   0,   0,   0, 
++      0,   0, 108,   3,   0,   0, 
++      0,   0,   0,   0, 255, 255, 
++    255, 255,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0,  99, 108, 105, 112, 
++     95, 116, 111,  95, 112, 114, 
++    101, 118, 105, 111, 117, 115, 
++      0, 102, 108, 111,  97, 116, 
++     52, 120,  52,   0, 171, 171, 
++      2,   0,   3,   0,   4,   0, 
++      4,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0, 149,   2,   0,   0, 
++    112, 105, 120, 101, 108,  95, 
++    116, 111,  95,  99, 108, 105, 
++    112,   0, 102, 108, 111,  97, 
++    116,  52,   0, 171, 171, 171, 
++      1,   0,   3,   0,   1,   0, 
++      4,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0, 210,   2,   0,   0, 
++    112, 114, 101, 118, 105, 111, 
++    117, 115,  95,  99, 108, 105, 
++    112,  95, 116, 111,  95, 112, 
++    105, 120, 101, 108,   0, 100, 
++    101, 112, 116, 104,  95, 116, 
++    111,  95,  99, 108, 105, 112, 
++      0, 101, 120, 116, 101, 110, 
++    116,   0, 117, 105, 110, 116, 
++     50,   0, 171, 171,   1,   0, 
++     19,   0,   1,   0,   2,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     44,   3,   0,   0, 114, 101, 
++    115, 101, 116,  95, 104, 105, 
++    115, 116, 111, 114, 121,   0, 
++    100, 119, 111, 114, 100,   0, 
++      0,   0,  19,   0,   1,   0, 
++      1,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0, 102,   3,   0,   0, 
++    114, 101, 115, 101, 114, 118, 
++    101, 100,   0, 171, 171, 171, 
++    196,   3,   0,   0,   0,   0, 
++      0,   0,  16,   0,   0,   0, 
++      2,   0,   0,   0, 208,   3, 
++      0,   0,   0,   0,   0,   0, 
++    255, 255, 255, 255,   0,   0, 
++      0,   0, 255, 255, 255, 255, 
++      0,   0,   0,   0,  36,  69, 
++    108, 101, 109, 101, 110, 116, 
++      0, 171, 171, 171,   1,   0, 
++      3,   0,   1,   0,   4,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++    210,   2,   0,   0,  77, 105, 
++     99, 114, 111, 115, 111, 102, 
++    116,  32,  40,  82,  41,  32, 
++     72,  76,  83,  76,  32,  83, 
++    104,  97, 100, 101, 114,  32, 
++     67, 111, 109, 112, 105, 108, 
++    101, 114,  32,  49,  48,  46, 
++     49,   0,  73,  83,  71,  78, 
++      8,   0,   0,   0,   0,   0, 
++      0,   0,   8,   0,   0,   0, 
++     79,  83,  71,  78,   8,   0, 
++      0,   0,   0,   0,   0,   0, 
++      8,   0,   0,   0,  83,  72, 
++     69,  88,  56,   7,   0,   0, 
++     81,   0,   5,   0, 206,   1, 
++      0,   0, 106,   8,   0,   1, 
++     89,   0,   0,   7,  70, 142, 
++     48,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   8,   0,   0,   0, 
++      0,   0,   0,   0,  88,  24, 
++      0,   7,  70, 126,  48,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     85,  85,   0,   0,   0,   0, 
++      0,   0, 156,  24,   0,   7, 
++     70, 238,  49,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  85,  85, 
++      0,   0,   0,   0,   0,   0, 
++    156,  24,   0,   7,  70, 238, 
++     49,   0,   1,   0,   0,   0, 
++      1,   0,   0,   0,   1,   0, 
++      0,   0,  68,  68,   0,   0, 
++      0,   0,   0,   0, 158,   0, 
++      0,   7,  70, 238,  49,   0, 
++      2,   0,   0,   0,   2,   0, 
++      0,   0,   2,   0,   0,   0, 
++     16,   0,   0,   0,   0,   0, 
++      0,   0,  95,   0,   0,   2, 
++     50,   0,   2,   0, 104,   0, 
++      0,   2,   4,   0,   0,   0, 
++    155,   0,   0,   4,   8,   0, 
++      0,   0,   8,   0,   0,   0, 
++      1,   0,   0,   0,  80,   0, 
++      0,   8,  50,   0,  16,   0, 
++      0,   0,   0,   0,  70,   0, 
++      2,   0,  70, 128,  48,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   7,   0,   0,   0, 
++     60,   0,   0,   7,  18,   0, 
++     16,   0,   0,   0,   0,   0, 
++     26,   0,  16,   0,   0,   0, 
++      0,   0,  10,   0,  16,   0, 
++      0,   0,   0,   0,  31,   0, 
++      4,   3,  10,   0,  16,   0, 
++      0,   0,   0,   0,  62,   0, 
++      0,   1,  21,   0,   0,   1, 
++     54,   0,   0,   4,  50,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,   0,   2,   0,  54,   0, 
++      0,   8, 194,   0,  16,   0, 
++      0,   0,   0,   0,   2,  64, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     45,   0,   0,   8, 130,   0, 
++     16,   0,   0,   0,   0,   0, 
++     70,  14,  16,   0,   0,   0, 
++      0,   0, 150, 115,  32,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  32,   0,   0,   9, 
++     18,   0,  16,   0,   1,   0, 
++      0,   0,  42, 128,  48,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   7,   0,   0,   0, 
++      1,  64,   0,   0,   0,   0, 
++      0,   0,   1,   0,   0,   7, 
++     34,   0,  16,   0,   1,   0, 
++      0,   0,  58,   0,  16,   0, 
++      0,   0,   0,   0,   1,  64, 
++      0,   0,   0,   0, 128, 127, 
++     39,   0,   0,   7,  34,   0, 
++     16,   0,   1,   0,   0,   0, 
++     26,   0,  16,   0,   1,   0, 
++      0,   0,   1,  64,   0,   0, 
++      0,   0, 128, 127,   1,   0, 
++      0,   7,  18,   0,  16,   0, 
++      1,   0,   0,   0,  26,   0, 
++     16,   0,   1,   0,   0,   0, 
++     10,   0,  16,   0,   1,   0, 
++      0,   0,  49,   0,   0,   7, 
++     34,   0,  16,   0,   1,   0, 
++      0,   0,   1,  64,   0,   0, 
++      0,   0,   0,   0,  58,   0, 
++     16,   0,   0,   0,   0,   0, 
++      1,   0,   0,   7,  18,   0, 
++     16,   0,   1,   0,   0,   0, 
++     26,   0,  16,   0,   1,   0, 
++      0,   0,  10,   0,  16,   0, 
++      1,   0,   0,   0,  29,   0, 
++      0,   7,  34,   0,  16,   0, 
++      1,   0,   0,   0,   1,  64, 
++      0,   0,   0,   0, 128,  63, 
++     58,   0,  16,   0,   0,   0, 
++      0,   0,   1,   0,   0,   7, 
++     18,   0,  16,   0,   1,   0, 
++      0,   0,  26,   0,  16,   0, 
++      1,   0,   0,   0,  10,   0, 
++     16,   0,   1,   0,   0,   0, 
++     31,   0,   4,   3,  10,   0, 
++     16,   0,   1,   0,   0,   0, 
++     86,   0,   0,   4,  50,   0, 
++     16,   0,   1,   0,   0,   0, 
++     70,   0,   2,   0,   0,   0, 
++      0,  10,  50,   0,  16,   0, 
++      1,   0,   0,   0,  70,   0, 
++     16,   0,   1,   0,   0,   0, 
++      2,  64,   0,   0,   0,   0, 
++      0,  63,   0,   0,   0,  63, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  50,   0,   0,  13, 
++    194,   0,  16,   0,   1,   0, 
++      0,   0,   6,   4,  16,   0, 
++      1,   0,   0,   0,   6, 132, 
++     48,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   4,   0, 
++      0,   0, 166, 142,  48,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   4,   0,   0,   0, 
++     50,   0,   0,  13,  18,   0, 
++     16,   0,   2,   0,   0,   0, 
++     58,   0,  16,   0,   0,   0, 
++      0,   0,  10, 128,  48,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   6,   0,   0,   0, 
++     26, 128,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      6,   0,   0,   0,  56,   0, 
++      0,   9, 242,   0,  16,   0, 
++      3,   0,   0,   0, 246,  15, 
++     16,   0,   1,   0,   0,   0, 
++     70, 142,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      1,   0,   0,   0,  50,   0, 
++      0,  11, 242,   0,  16,   0, 
++      3,   0,   0,   0, 166,  10, 
++     16,   0,   1,   0,   0,   0, 
++     70, 142,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  70,  14, 
++     16,   0,   3,   0,   0,   0, 
++     50,   0,   0,  11, 242,   0, 
++     16,   0,   2,   0,   0,   0, 
++      6,   0,  16,   0,   2,   0, 
++      0,   0,  70, 142,  48,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   2,   0,   0,   0, 
++     70,  14,  16,   0,   3,   0, 
++      0,   0,   0,   0,   0,   9, 
++    242,   0,  16,   0,   2,   0, 
++      0,   0,  70,  14,  16,   0, 
++      2,   0,   0,   0,  70, 142, 
++     48,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   3,   0, 
++      0,   0,   1,   0,   0,  10, 
++    242,   0,  16,   0,   3,   0, 
++      0,   0,  70,  14,  16,   0, 
++      2,   0,   0,   0,   2,  64, 
++      0,   0,   0,   0, 128, 127, 
++      0,   0, 128, 127,   0,   0, 
++    128, 127,   0,   0, 128, 127, 
++     39,   0,   0,  10, 242,   0, 
++     16,   0,   3,   0,   0,   0, 
++     70,  14,  16,   0,   3,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0, 128, 127,   0,   0, 
++    128, 127,   0,   0, 128, 127, 
++      0,   0, 128, 127,   1,   0, 
++      0,   7, 194,   0,  16,   0, 
++      1,   0,   0,   0, 166,  14, 
++     16,   0,   3,   0,   0,   0, 
++      6,   4,  16,   0,   3,   0, 
++      0,   0,   1,   0,   0,   7, 
++     66,   0,  16,   0,   1,   0, 
++      0,   0,  58,   0,  16,   0, 
++      1,   0,   0,   0,  42,   0, 
++     16,   0,   1,   0,   0,   0, 
++     49,   0,   0,   7, 130,   0, 
++     16,   0,   1,   0,   0,   0, 
++      1,  64,   0,   0, 189,  55, 
++    134,  53,  58,   0,  16,   0, 
++      2,   0,   0,   0,   1,   0, 
++      0,   7,  66,   0,  16,   0, 
++      1,   0,   0,   0,  58,   0, 
++     16,   0,   1,   0,   0,   0, 
++     42,   0,  16,   0,   1,   0, 
++      0,   0,  31,   0,   4,   3, 
++     42,   0,  16,   0,   1,   0, 
++      0,   0,  14,   0,   0,   7, 
++    194,   0,  16,   0,   1,   0, 
++      0,   0,   6,   4,  16,   0, 
++      2,   0,   0,   0, 246,  15, 
++     16,   0,   2,   0,   0,   0, 
++     50,   0,   0,  13, 194,   0, 
++     16,   0,   1,   0,   0,   0, 
++    166,  14,  16,   0,   1,   0, 
++      0,   0,   6, 132,  48,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   5,   0,   0,   0, 
++    166, 142,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      5,   0,   0,   0,   0,   0, 
++      0,   8,  50,   0,  16,   0, 
++      0,   0,   0,   0,  70,   0, 
++     16, 128,  65,   0,   0,   0, 
++      1,   0,   0,   0, 230,  10, 
++     16,   0,   1,   0,   0,   0, 
++      1,   0,   0,  10,  50,   0, 
++     16,   0,   1,   0,   0,   0, 
++     70,   0,  16,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0, 128, 127,   0,   0, 
++    128, 127,   0,   0,   0,   0, 
++      0,   0,   0,   0,  39,   0, 
++      0,  10,  50,   0,  16,   0, 
++      1,   0,   0,   0,  70,   0, 
++     16,   0,   1,   0,   0,   0, 
++      2,  64,   0,   0,   0,   0, 
++    128, 127,   0,   0, 128, 127, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   1,   0,   0,   7, 
++     18,   0,  16,   0,   1,   0, 
++      0,   0,  26,   0,  16,   0, 
++      1,   0,   0,   0,  10,   0, 
++     16,   0,   1,   0,   0,   0, 
++      1,   0,   0,   7,  34,   0, 
++     16,   0,   1,   0,   0,   0, 
++     10,   0,  16,   0,   1,   0, 
++      0,   0,   1,  64,   0,   0, 
++      1,   0,   0,   0,  31,   0, 
++      0,   3,  10,   0,  16,   0, 
++      1,   0,   0,   0,  54,   0, 
++      0,   8,  50,   0,  16,   0, 
++      0,   0,   0,   0,   2,  64, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++     21,   0,   0,   1,  18,   0, 
++      0,   1,  54,   0,   0,   8, 
++     50,   0,  16,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  54,   0, 
++      0,   5,  34,   0,  16,   0, 
++      1,   0,   0,   0,   1,  64, 
++      0,   0,   0,   0,   0,   0, 
++     21,   0,   0,   1,  18,   0, 
++      0,   1,  54,   0,   0,   8, 
++     50,   0,  16,   0,   0,   0, 
++      0,   0,   2,  64,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,  54,   0, 
++      0,   5,  34,   0,  16,   0, 
++      1,   0,   0,   0,   1,  64, 
++      0,   0,   0,   0,   0,   0, 
++     21,   0,   0,   1, 164,   0, 
++      0,   7, 242, 224,  33,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,  70,   5,   2,   0, 
++     70,   0,  16,   0,   0,   0, 
++      0,   0, 164,   0,   0,   7, 
++    242, 224,  33,   0,   1,   0, 
++      0,   0,   1,   0,   0,   0, 
++     70,   5,   2,   0,  86,   5, 
++     16,   0,   1,   0,   0,   0, 
++     60,   0,   0,   5,  18,   0, 
++     16,   0,   1,   0,   0,   0, 
++     26,   0,   2,   0,  10,   0, 
++      2,   0,   1,   0,   0,   7, 
++     18,   0,  16,   0,   1,   0, 
++      0,   0,  10,   0,  16,   0, 
++      1,   0,   0,   0,   1,  64, 
++      0,   0,  31,   0,   0,   0, 
++     31,   0,   0,   3,  10,   0, 
++     16,   0,   1,   0,   0,   0, 
++     85,   0,   0,   9,  82,   0, 
++     16,   0,   1,   0,   0,   0, 
++     86,   4,   2,   0,   2,  64, 
++      0,   0,   5,   0,   0,   0, 
++      0,   0,   0,   0,   5,   0, 
++      0,   0,   0,   0,   0,   0, 
++     30,   0,   0,   9, 130,   0, 
++     16,   0,   1,   0,   0,   0, 
++     10, 128,  48,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      7,   0,   0,   0,   1,  64, 
++      0,   0,  31,   0,   0,   0, 
++     85,   0,   0,   7, 130,   0, 
++     16,   0,   1,   0,   0,   0, 
++     58,   0,  16,   0,   1,   0, 
++      0,   0,   1,  64,   0,   0, 
++      5,   0,   0,   0,  35,   0, 
++      0,   9,  18,   0,  16,   0, 
++      1,   0,   0,   0,  10,   0, 
++     16,   0,   1,   0,   0,   0, 
++     58,   0,  16,   0,   1,   0, 
++      0,   0,  42,   0,  16,   0, 
++      1,   0,   0,   0,  86,   0, 
++      0,   5,  66,   0,  16,   0, 
++      0,   0,   0,   0,  26,   0, 
++     16,   0,   1,   0,   0,   0, 
++    168,   0,   0,  10, 242, 224, 
++     33,   0,   2,   0,   0,   0, 
++      2,   0,   0,   0,  10,   0, 
++     16,   0,   1,   0,   0,   0, 
++      1,  64,   0,   0,   0,   0, 
++      0,   0,  70,  11,  16,   0, 
++      0,   0,   0,   0,  21,   0, 
++      0,   1,  62,   0,   0,   1, 
++     83,  84,  65,  84, 148,   0, 
++      0,   0,  63,   0,   0,   0, 
++      4,   0,   0,   0,   0,   0, 
++      0,   0,   1,   0,   0,   0, 
++     13,   0,   0,   0,   6,   0, 
++      0,   0,  17,   0,   0,   0, 
++      4,   0,   0,   0,   5,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   1,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      7,   0,   0,   0,   0,   0, 
++      0,   0,   2,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   0,   0,   0,   0, 
++      0,   0,   3,   0,   0,   0
++};
+diff --git a/src/ui/shaders/ssx_camera_motion.cs.hlsl b/src/ui/shaders/ssx_camera_motion.cs.hlsl
+new file mode 100644
+index 0000000..529c022
+--- /dev/null
++++ b/src/ui/shaders/ssx_camera_motion.cs.hlsl
+@@ -0,0 +1,41 @@
++// Camera-only motion, in scene pixels. No jitter is injected by this checkpoint.
++cbuffer Motion : register(b0) {
++  row_major float4x4 clip_to_previous;
++  float4 pixel_to_clip;
++  float4 previous_clip_to_pixel;
++  float4 depth_to_clip;
++  uint2 extent;
++  uint reset_history;
++  uint reserved;
++};
++Texture2D<float> scene_depth : register(t0);
++RWTexture2D<float2> vectors : register(u0);
++RWTexture2D<uint> validity : register(u1);
++RWStructuredBuffer<float4> diagnostic_samples : register(u2);
++
++[numthreads(8, 8, 1)]
++void main(uint3 id : SV_DispatchThreadID) {
++  if (any(id.xy >= extent)) return;
++  float2 pixel = float2(id.xy) + 0.5;
++  float depth = scene_depth.Load(int3(id.xy, 0));
++  float2 motion = 0;
++  uint valid = 0;
++  if (!reset_history && isfinite(depth) && depth > 0 && depth <= 1) {
++    float4 clip = float4(pixel * pixel_to_clip.xy + pixel_to_clip.zw,
++                        depth * depth_to_clip.x + depth_to_clip.y, 1);
++    float4 previous = mul(clip, clip_to_previous);
++    if (all(isfinite(previous)) && previous.w > 1e-6) {
++      motion = (previous.xy / previous.w) * previous_clip_to_pixel.xy +
++               previous_clip_to_pixel.zw - pixel;
++      valid = all(isfinite(motion));
++      if (!valid) motion = 0;
++    }
++  }
++  vectors[id.xy] = motion;
++  validity[id.xy] = valid;
++  // Sparse diagnostics, no global atomics and no per-frame CPU readback stall.
++  if (((id.x | id.y) & 31) == 0) {
++    uint index = (id.y / 32) * ((extent.x + 31) / 32) + id.x / 32;
++    diagnostic_samples[index] = float4(motion, depth, float(valid));
++  }
++}
+diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
+index 92473da..bebfa30 100644
+--- a/tests/unit/CMakeLists.txt
++++ b/tests/unit/CMakeLists.txt
+@@ -23,6 +23,7 @@ add_executable(unit_tests
+ 
+ if(REXGLUE_USE_D3D12)
+     target_sources(unit_tests PRIVATE graphics/ssx_frame_inputs_test.cpp)
++    target_sources(unit_tests PRIVATE graphics/ssx_motion_test.cpp)
+ endif()
+ 
+ target_sources(unit_tests PRIVATE
+diff --git a/tests/unit/graphics/ssx_motion_test.cpp b/tests/unit/graphics/ssx_motion_test.cpp
+new file mode 100644
+index 0000000..2561c2f
+--- /dev/null
++++ b/tests/unit/graphics/ssx_motion_test.cpp
+@@ -0,0 +1,139 @@
++#include <catch2/catch_test_macros.hpp>
++#include <catch2/catch_approx.hpp>
++#include <limits>
++#include <rex/ui/d3d12/ssx_camera_motion.h>
++
++using namespace rex::ui::d3d12;
++namespace {
++SsxFrameMetadata Frame(uint64_t id = 1) {
++  SsxFrameMetadata f;
++  f.guest_frame = id;
++  f.scene_width = 1120;
++  f.scene_height = 584;
++  f.scale_x = f.scale_y = 3;
++  f.output_width = 3840;
++  f.output_height = 2160;
++  f.camera_samples = 1;
++  f.captured_mask = 3;
++  f.camera_viewport_valid = true;
++  f.guest_viewport_xy = {560, -292, 560.5f, 292.5f};
++  f.guest_viewport_z = {-1, 1};
++  // Row-vector perspective, near 0.5, far 8000. Known analytic camera.
++  f.world_to_clip_candidate = {1, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1.0000625f, 1, 0, 0, -0.50003125f, 0};
++  return f;
++}
++}  // namespace
++TEST_CASE("SSX motion uses previous minus current scene pixels and signed viewport",
++          "[ssx-motion]") {
++  SsxMotionHistory h;
++  auto f = Frame();
++  CHECK(h.Advance(f, 1).constants.reset == 1);
++  f.guest_frame++;
++  f.world_to_clip_candidate[12] = -1;  // Camera moves +1 in world X.
++  auto p = h.Advance(f, 1.016);
++  REQUIRE(p.usable);
++  CHECK(p.reason == SsxMotionReset::kNone);
++  CHECK(p.previous_frame == 1);
++  auto& k = p.constants;
++  CHECK(k.width == 3360);
++  CHECK(k.height == 1752);
++  // Point (0,0,10) projects from 1513.5 to previous 1681.5 => +168 pixels.
++  double depth =
++      1 - (10 * double(f.world_to_clip_candidate[10]) + f.world_to_clip_candidate[14]) / 10;
++  double pos[4]{1513.5 * k.pixel_to_clip[0] + k.pixel_to_clip[2],
++                877.5 * k.pixel_to_clip[1] + k.pixel_to_clip[3],
++                depth * k.depth_to_clip[0] + k.depth_to_clip[1], 1};
++  double prev[4]{};
++  for (size_t c = 0; c < 4; ++c)
++    for (size_t r = 0; r < 4; ++r)
++      prev[c] += pos[r] * k.clip_to_previous[r * 4 + c];
++  CHECK(prev[0] / prev[3] * k.previous_clip_to_pixel[0] + k.previous_clip_to_pixel[2] - 1513.5 ==
++        Catch::Approx(168).margin(.002));
++  CHECK(prev[1] / prev[3] * k.previous_clip_to_pixel[1] + k.previous_clip_to_pixel[3] - 877.5 ==
++        Catch::Approx(0).margin(.002));
++}
++TEST_CASE("SSX repeat paints preserve vectors and skipped guest frames use last consumed camera",
++          "[ssx-motion]") {
++  SsxMotionHistory h;
++  auto f = Frame();
++  h.Advance(f, 1);
++  f.guest_frame = 3;
++  f.world_to_clip_candidate[12] = -.2f;
++  auto p = h.Advance(f, 1.03);
++  REQUIRE(p.reason == SsxMotionReset::kNone);
++  auto repeat = h.Advance(f, 1.04);
++  CHECK(repeat.repeated);
++  CHECK(repeat.previous_frame == 1);
++  CHECK(repeat.constants.clip_to_previous == p.constants.clip_to_previous);
++  f.guest_frame = 4;
++  p = h.Advance(f, 1.05);
++  CHECK(p.previous_frame == 3);
++  const std::array<float, 16> identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
++  CHECK(p.constants.clip_to_previous == identity);
++}
++TEST_CASE("SSX motion resets for missing inputs resize frame gaps cuts and explicit events",
++          "[ssx-motion]") {
++  SsxMotionHistory h;
++  auto f = Frame();
++  h.Advance(f, 1);
++  f.guest_frame++;
++  f.scale_x = f.scale_y = 2;
++  CHECK(h.Advance(f, 1.02).reason == SsxMotionReset::kResize);
++  f.guest_frame++;
++  CHECK(h.Advance(f, 1.04).reason == SsxMotionReset::kNone);
++  f.guest_frame += 20;
++  CHECK(h.Advance(f, 1.05).reason == SsxMotionReset::kFrameGap);
++  f.guest_frame++;
++  CHECK(h.Advance(f, 2).reason == SsxMotionReset::kFrameGap);
++  f.guest_frame++;
++  f.world_to_clip_candidate[12] = 1000;
++  CHECK(h.Advance(f, 2.01).reason == SsxMotionReset::kDiscontinuity);
++  f.guest_frame++;
++  f.captured_mask = 1;
++  CHECK_FALSE(h.Advance(f, 2.02).usable);
++  f.guest_frame++;
++  f.captured_mask = 3;
++  CHECK(h.Advance(f, 2.03).reason == SsxMotionReset::kMissingInputs);
++  h.Reset();
++  CHECK(h.Advance(f, 2.04).reason == SsxMotionReset::kExplicit);
++}
++TEST_CASE("SSX invalid or ambiguous camera and depth mappings cannot generate motion",
++          "[ssx-motion]") {
++  for (int invalid = 0; invalid < 8; ++invalid) {
++    SsxMotionHistory h;
++    auto f = Frame();
++    h.Advance(f, 1);
++    f.guest_frame++;
++    switch (invalid) {
++      case 0:
++        f.world_to_clip_candidate = {};
++        break;
++      case 1:
++        f.world_to_clip_candidate[0] = std::numeric_limits<float>::quiet_NaN();
++        break;
++      case 2:
++        f.camera_conflict = true;
++        break;
++      case 3:
++        f.camera_viewport_valid = false;
++        break;
++      case 4:
++        f.guest_viewport_xy[0] = 0;
++        break;
++      case 5:
++        f.guest_viewport_z = {1, 0};
++        break;
++      case 6:
++        f.failed_mask = 2;
++        break;
++      case 7:
++        f.duplicate_mask = 2;
++        break;
++    }
++    const auto p = h.Advance(f, 1.016);
++    CHECK_FALSE(p.usable);
++    CHECK(p.constants.reset == 1);
++    f = Frame(3);
++    CHECK(h.Advance(f, 1.03).constants.reset == 1);
++  }
++}

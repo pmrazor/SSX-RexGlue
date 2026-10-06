@@ -1,0 +1,295 @@
+diff --git a/include/rex/ui/d3d12/streamline.h b/include/rex/ui/d3d12/streamline.h
+index 8237ed9..645bdbb 100644
+--- a/include/rex/ui/d3d12/streamline.h
++++ b/include/rex/ui/d3d12/streamline.h
+@@ -1,6 +1,7 @@
+ // Optional NVIDIA Streamline connection. No NVIDIA headers in the public ABI.
+ #pragma once
+ 
++#include <array>
+ #include <cstdint>
+ #include <filesystem>
+ #include <memory>
+@@ -10,8 +11,8 @@
+ 
+ namespace rex::ui::d3d12 {
+ 
+-// This checkpoint connects the real SDK and presentation hooks, but deliberately
+-// does not enable SR or FG without a game-specific temporal resource producer.
++// Optional SDK backend. Gameplay activation is separate from this API; callers
++// must produce and validate temporal inputs before evaluating a frame.
+ class Streamline {
+  public:
+   enum class Quality { kQuality, kBalanced, kPerformance, kUltraPerformance, kDLAA };
+@@ -53,6 +54,40 @@ class Streamline {
+   // frame; callers must supply validated inputs and matching frame tokens.
+   bool ConfigureSsxSR(Quality quality, uint32_t output_width, uint32_t output_height);
+ 
++  struct SRCamera {
++    // Row vectors, row-major, unjittered D3D clip space (depth 0..1).
++    std::array<float, 16> view_to_clip{}, clip_to_view{};
++    std::array<float, 16> clip_to_previous{}, previous_to_clip{};
++    std::array<float, 3> position{}, up{}, right{}, forward{};
++    float near_plane = 0, far_plane = 0, vertical_fov = 0, aspect = 0;
++  };
++  struct SRFrame {
++    uint64_t id = 0;  // Strictly increasing, per rendered frame, not per Present.
++    SRCamera camera;
++    std::array<float, 2> jitter_pixels{};
++    // All are single-mip, single-sample textures, retained by the caller until
++    // GPU completion. Input states must be NON_PIXEL_SHADER_RESOURCE, output
++    // UNORDERED_ACCESS; Streamline restores these resource states on return.
++    ID3D12Resource* color = nullptr;   // FP16 RGBA, decoded linear, unexposed.
++    ID3D12Resource* depth = nullptr;   // R32_FLOAT, non-inverted device depth.
++    ID3D12Resource* motion = nullptr;  // RG32/RG16 float, prev-current pixels.
++    ID3D12Resource* output = nullptr;  // FP16 RGBA, distinct UAV texture.
++    // Motion includes camera and object motion, excluding projection jitter.
++    // First frame, configuration change, ID gap or failure also force a reset.
++    bool reset = false;
++  };
++  struct SREvaluation {
++    bool recorded = false;
++    bool history_reset = false;
++  };
++  // Uses one matching token for constants, tags and evaluation, viewport zero.
++  // Regardless of success, callers must submit/drain the list and restore all
++  // graphics/compute binding state before issuing subsequent renderer draws.
++  SREvaluation EvaluateSR(ID3D12GraphicsCommandList* list, const SRFrame& frame);
++  // Drain all recorded evaluations before releasing resources or changing mode
++  // or output dimensions. Does not release the caller's input/output textures.
++  bool ReleaseSR();
++
+   // Caller must first drain GPU work. Shut down before releasing the device and
+   // factory; destroy this object only AFTER releasing every Streamline COM proxy.
+   void Shutdown();
+diff --git a/src/ui/d3d12/streamline.cpp b/src/ui/d3d12/streamline.cpp
+index 1cbce7a..4f394d7 100644
+--- a/src/ui/d3d12/streamline.cpp
++++ b/src/ui/d3d12/streamline.cpp
+@@ -2,6 +2,8 @@
+ #include <rex/ui/d3d12/ssx_temporal_alignment.h>
+ 
+ #include <bit>
++#include <algorithm>
++#include <cmath>
+ #include <utility>
+ 
+ #include <rex/logging.h>
+@@ -80,12 +82,23 @@ struct Streamline::Impl {
+   PFun_slUpgradeInterface* upgrade = nullptr;
+   PFun_slIsFeatureSupported* is_supported = nullptr;
+   PFun_slGetFeatureFunction* get_function = nullptr;
++  PFun_slGetNewFrameToken* frame_token = nullptr;
++  PFun_slSetConstants* constants = nullptr;
++  PFun_slSetTagForFrame* tag_frame = nullptr;
++  PFun_slEvaluateFeature* evaluate = nullptr;
++  PFun_slFreeResources* free_resources = nullptr;
+   PFun_slDLSSGetOptimalSettings* optimal = nullptr;
+   PFun_slDLSSSetOptions* sr_options = nullptr;
+   PFun_slDLSSGGetState* fg_state = nullptr;
+   PFun_slDLSSGSetOptions* fg_options = nullptr;
+   PFun_slReflexGetState* reflex_state = nullptr;
+   PFun_slReflexSetOptions* reflex_options = nullptr;
++  bool sr_configured = false, sr_attempted = false, sr_have_frame = false;
++  bool sr_reset = true;
++  Quality sr_quality = Quality::kQuality;
++  uint32_t sr_width = 0, sr_height = 0, sr_input_width = 0, sr_input_height = 0;
++  uint64_t sr_frame = 0;
++  OptimalSettings sr_bounds{};
+ 
+   // The provider releases its COM proxies before destroying this Impl.
+   ~Impl() {
+@@ -153,7 +166,12 @@ bool Streamline::Initialize(const std::filesystem::path& directory) {
+       !impl_->Import(impl_->set_device, "slSetD3DDevice") ||
+       !impl_->Import(impl_->upgrade, "slUpgradeInterface") ||
+       !impl_->Import(impl_->is_supported, "slIsFeatureSupported") ||
+-      !impl_->Import(impl_->get_function, "slGetFeatureFunction"))
++      !impl_->Import(impl_->get_function, "slGetFeatureFunction") ||
++      !impl_->Import(impl_->frame_token, "slGetNewFrameToken") ||
++      !impl_->Import(impl_->constants, "slSetConstants") ||
++      !impl_->Import(impl_->tag_frame, "slSetTagForFrame") ||
++      !impl_->Import(impl_->evaluate, "slEvaluateFeature") ||
++      !impl_->Import(impl_->free_resources, "slFreeResources"))
+     return false;
+ 
+   const wchar_t* plugin_paths[] = {absolute_directory.c_str()};
+@@ -293,7 +311,23 @@ bool Streamline::ConfigureSsxSR(Quality quality, uint32_t width, uint32_t height
+   const auto options = SsxOptions(quality, width, height);
+   if (options.mode == sl::DLSSMode::eOff)
+     return false;
+-  return Check(impl_->sr_options(sl::ViewportHandle(0), options), "SSX SR color/exposure options");
++  const bool changed = !impl_->sr_configured || quality != impl_->sr_quality ||
++                       width != impl_->sr_width || height != impl_->sr_height;
++  if (changed && impl_->sr_attempted) {
++    REXGPU_WARN("DLSS configuration change requires a GPU drain and ReleaseSR first");
++    return false;
++  }
++  OptimalSettings bounds{};
++  if (!GetOptimalSettings(quality, width, height, bounds) ||
++      !Check(impl_->sr_options(sl::ViewportHandle(0), options), "SSX SR color/exposure options"))
++    return false;
++  impl_->sr_configured = true;
++  impl_->sr_quality = quality;
++  impl_->sr_width = width;
++  impl_->sr_height = height;
++  impl_->sr_bounds = bounds;
++  impl_->sr_reset |= changed;
++  return true;
+ #else
+   (void)quality;
+   (void)width;
+@@ -302,9 +336,154 @@ bool Streamline::ConfigureSsxSR(Quality quality, uint32_t width, uint32_t height
+ #endif
+ }
+ 
++Streamline::SREvaluation Streamline::EvaluateSR(ID3D12GraphicsCommandList* list,
++                                                const SRFrame& frame) {
++#if REX_HAS_STREAMLINE
++  // Fail closed. Even rejected inputs invalidate the next temporal history.
++  const bool pending_reset = impl_->sr_reset;
++  impl_->sr_reset = true;
++  if (!impl_->attached || !impl_->sr_configured || !list || !frame.color || !frame.depth ||
++      !frame.motion || !frame.output || frame.color == frame.output ||
++      frame.depth == frame.output || frame.motion == frame.output ||
++      (impl_->sr_have_frame && frame.id <= impl_->sr_frame))
++    return {};
++  auto finite = [](const auto& values) {
++    return std::all_of(values.begin(), values.end(), [](float x) { return std::isfinite(x); });
++  };
++  const auto& c = frame.camera;
++  if (!finite(c.view_to_clip) || !finite(c.clip_to_view) || !finite(c.clip_to_previous) ||
++      !finite(c.previous_to_clip) || !finite(c.position) || !finite(c.up) || !finite(c.right) ||
++      !finite(c.forward) || !finite(frame.jitter_pixels) || !std::isfinite(c.far_plane) ||
++      !std::isfinite(c.vertical_fov) || !std::isfinite(c.aspect) ||
++      !(c.near_plane > 0 && c.far_plane > c.near_plane && c.vertical_fov > 0 &&
++        c.vertical_fov < 3.141593f && c.aspect > 0) ||
++      std::abs(frame.jitter_pixels[0]) > 0.5f || std::abs(frame.jitter_pixels[1]) > 0.5f)
++    return {};
++  auto inverse_pair = [](const auto& a, const auto& b) {
++    for (unsigned row = 0; row < 4; ++row) {
++      for (unsigned col = 0; col < 4; ++col) {
++        double value = 0;
++        for (unsigned k = 0; k < 4; ++k)
++          value += double(a[row * 4 + k]) * b[k * 4 + col];
++        if (std::abs(value - (row == col ? 1.0 : 0.0)) > 0.01)
++          return false;
++      }
++    }
++    return true;
++  };
++  if (!inverse_pair(c.view_to_clip, c.clip_to_view) ||
++      !inverse_pair(c.clip_to_previous, c.previous_to_clip))
++    return {};
++  auto dot = [](const auto& a, const auto& b) {
++    return double(a[0]) * b[0] + double(a[1]) * b[1] + double(a[2]) * b[2];
++  };
++  if (std::abs(dot(c.up, c.up) - 1) > 0.01 || std::abs(dot(c.right, c.right) - 1) > 0.01 ||
++      std::abs(dot(c.forward, c.forward) - 1) > 0.01 || std::abs(dot(c.up, c.right)) > 0.01 ||
++      std::abs(dot(c.up, c.forward)) > 0.01 || std::abs(dot(c.right, c.forward)) > 0.01)
++    return {};
++  const auto color = frame.color->GetDesc(), depth = frame.depth->GetDesc();
++  const auto motion = frame.motion->GetDesc(), output = frame.output->GetDesc();
++  auto texture = [](const D3D12_RESOURCE_DESC& d) {
++    return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.DepthOrArraySize == 1 &&
++           d.MipLevels == 1 && d.SampleDesc.Count == 1 && d.Width && d.Height &&
++           !(d.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
++  };
++  const auto& bounds = impl_->sr_bounds;
++  if (!texture(color) || !texture(depth) || !texture(motion) || !texture(output) ||
++      color.Format != DXGI_FORMAT_R16G16B16A16_FLOAT || depth.Format != DXGI_FORMAT_R32_FLOAT ||
++      (motion.Format != DXGI_FORMAT_R32G32_FLOAT && motion.Format != DXGI_FORMAT_R16G16_FLOAT) ||
++      output.Format != DXGI_FORMAT_R16G16B16A16_FLOAT ||
++      !(output.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || color.Width != depth.Width ||
++      color.Height != depth.Height || color.Width != motion.Width ||
++      color.Height != motion.Height || output.Width != impl_->sr_width ||
++      output.Height != impl_->sr_height || color.Width < bounds.min_width ||
++      color.Width > bounds.max_width || color.Height < bounds.min_height ||
++      color.Height > bounds.max_height)
++    return {};
++  const uint32_t width = uint32_t(color.Width), height = color.Height;
++  const bool reset = pending_reset || frame.reset || !impl_->sr_have_frame ||
++                     frame.id - impl_->sr_frame != 1 || width != impl_->sr_input_width ||
++                     height != impl_->sr_input_height;
++  sl::Constants constants{};
++  auto matrix = [](sl::float4x4& out, const std::array<float, 16>& in) {
++    for (unsigned i = 0; i < 4; ++i)
++      out[i] = {in[i * 4], in[i * 4 + 1], in[i * 4 + 2], in[i * 4 + 3]};
++  };
++  matrix(constants.cameraViewToClip, c.view_to_clip);
++  matrix(constants.clipToCameraView, c.clip_to_view);
++  matrix(constants.clipToPrevClip, c.clip_to_previous);
++  matrix(constants.prevClipToClip, c.previous_to_clip);
++  constants.jitterOffset = {frame.jitter_pixels[0], frame.jitter_pixels[1]};
++  constants.mvecScale = {1.0f / width, 1.0f / height};
++  constants.cameraPinholeOffset = {0, 0};
++  constants.cameraPos = {c.position[0], c.position[1], c.position[2]};
++  constants.cameraUp = {c.up[0], c.up[1], c.up[2]};
++  constants.cameraRight = {c.right[0], c.right[1], c.right[2]};
++  constants.cameraFwd = {c.forward[0], c.forward[1], c.forward[2]};
++  constants.cameraNear = c.near_plane;
++  constants.cameraFar = c.far_plane;
++  constants.cameraFOV = c.vertical_fov;
++  constants.cameraAspectRatio = c.aspect;
++  constants.depthInverted = sl::Boolean::eFalse;
++  constants.cameraMotionIncluded = sl::Boolean::eTrue;
++  constants.motionVectors3D = sl::Boolean::eFalse;
++  constants.motionVectorsJittered = sl::Boolean::eFalse;
++  constants.motionVectorsDilated = sl::Boolean::eFalse;
++  constants.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
++  sl::FrameToken* token = nullptr;
++  const sl::ViewportHandle viewport(0);
++  if (!Check(impl_->frame_token(token, nullptr), "SR frame token") || !token ||
++      !Check(impl_->constants(constants, *token, viewport), "SR constants"))
++    return {};
++  sl::Resource resources[] = {
++      {sl::ResourceType::eTex2d, frame.color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE},
++      {sl::ResourceType::eTex2d, frame.depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE},
++      {sl::ResourceType::eTex2d, frame.motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE},
++      {sl::ResourceType::eTex2d, frame.output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS}};
++  const sl::Extent input_extent{0, 0, width, height};
++  const sl::Extent output_extent{0, 0, impl_->sr_width, impl_->sr_height};
++  sl::ResourceTag tags[] = {
++      {&resources[0], sl::kBufferTypeScalingInputColor, sl::eValidUntilEvaluate, &input_extent},
++      {&resources[1], sl::kBufferTypeDepth, sl::eValidUntilEvaluate, &input_extent},
++      {&resources[2], sl::kBufferTypeMotionVectors, sl::eValidUntilEvaluate, &input_extent},
++      {&resources[3], sl::kBufferTypeScalingOutputColor, sl::eValidUntilEvaluate, &output_extent}};
++  // No exposure tag: the SSX policy is decoded linear color with NGX auto-exposure.
++  if (!Check(impl_->tag_frame(*token, viewport, tags, uint32_t(std::size(tags)), list), "SR tags"))
++    return {};
++  impl_->sr_attempted = true;
++  const sl::BaseStructure* inputs[] = {&viewport};
++  if (!Check(impl_->evaluate(sl::kFeatureDLSS, *token, inputs, 1, list), "SR evaluation"))
++    return {};
++  impl_->sr_reset = false;
++  impl_->sr_have_frame = true;
++  impl_->sr_frame = frame.id;
++  impl_->sr_input_width = width;
++  impl_->sr_input_height = height;
++  return {true, reset};
++#else
++  (void)list;
++  (void)frame;
++  return {};
++#endif
++}
++
++bool Streamline::ReleaseSR() {
++#if REX_HAS_STREAMLINE
++  if (impl_->sr_attempted &&
++      !Check(impl_->free_resources(sl::kFeatureDLSS, sl::ViewportHandle(0)), "SR release"))
++    return false;
++  impl_->sr_attempted = false;
++  impl_->sr_configured = false;
++  impl_->sr_have_frame = false;
++  impl_->sr_reset = true;
++#endif
++  return true;
++}
++
+ void Streamline::Shutdown() {
+ #if REX_HAS_STREAMLINE
+   if (impl_->init_called) {
++    ReleaseSR();
+     Check(impl_->shutdown(), "slShutdown");
+     impl_->init_called = false;
+     impl_->attached = false;
