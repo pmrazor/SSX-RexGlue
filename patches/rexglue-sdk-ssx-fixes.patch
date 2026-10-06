@@ -1,7 +1,7 @@
 From bd94bda0887acb368f86c681c0b181642fb6657c Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 14:08:40 +0900
-Subject: [PATCH 1/9] Fix crashes and rendering bugs found while porting SSX
+Subject: [PATCH 01/10] Fix crashes and rendering bugs found while porting SSX
  (2012)
 
 - Input: serialize InputSystem entry points; concurrent guest polling
@@ -649,7 +649,7 @@ index f4e0efd..80d7148 100644
 From 03f07b3cb779aa11714c227ed536047fb19180cf Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 14:52:59 +0900
-Subject: [PATCH 2/9] Add D3D12 GPU time profiler (--d3d12_gpu_profile)
+Subject: [PATCH 02/10] Add D3D12 GPU time profiler (--d3d12_gpu_profile)
 
 Timestamp queries split each submission into guest draws, render target
 ownership transfers, resolves, texture loads and swap, and the totals are
@@ -949,8 +949,8 @@ index abc26d9..fc8ad84 100644
 From 55a9d2cbb85945dc003de875cdd3b3743083ee31 Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 15:14:18 +0900
-Subject: [PATCH 3/9] Fix GPU profiler recording timestamps with no query heap
- when disabled
+Subject: [PATCH 03/10] Fix GPU profiler recording timestamps with no query
+ heap when disabled
 
 GpuProfileMark ran at every submission start even with --d3d12_gpu_profile
 off, writing EndQuery on a null heap and crashing D3D12 on the first swap.
@@ -981,7 +981,8 @@ index f34a5ba..7bc0e02 100644
 From e9329e90fdc90da14bbdd80f758c3bff788ba258 Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 15:51:48 +0900
-Subject: [PATCH 4/9] Add --d3d12_log_texture_loads texture (re)load statistics
+Subject: [PATCH 04/10] Add --d3d12_log_texture_loads texture (re)load
+ statistics
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -1077,7 +1078,7 @@ index fc8ad84..b27ddd7 100644
 From a3ab07c3c098dbc0fc9b2af5b4bce1aecd846bdd Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 16:15:17 +0900
-Subject: [PATCH 5/9] Reload only GPU-written slices of 2D array textures
+Subject: [PATCH 05/10] Reload only GPU-written slices of 2D array textures
 
 Guest code resolves into one slice of large 2D arrays per frame (SSX: a
 128x128x256 snow trail atlas), and the texture cache reloaded the whole
@@ -1339,7 +1340,7 @@ index 76f5600..081feea 100644
 From bcae94cf46283b366e634901bf309daf73d3a0e9 Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 17:07:55 +0900
-Subject: [PATCH 6/9] Split GPU profiler texture loads into array/large/other
+Subject: [PATCH 06/10] Split GPU profiler texture loads into array/large/other
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -1421,7 +1422,7 @@ index c9489a4..719cee5 100644
 From 6b351a6a602c5ebd136f39f3324df7d95e7a868e Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 17:27:42 +0900
-Subject: [PATCH 7/9] Partial reloads for tiled 3D textures in groups of 8
+Subject: [PATCH 07/10] Partial reloads for tiled 3D textures in groups of 8
  slices
 
 SSX's snow trail texture is a tiled 128x128x256 volume, not a 2D array, so
@@ -1587,7 +1588,7 @@ index 081feea..729bdbb 100644
 From b8229f8e03af8888a232f4904df448b9b5572a71 Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 22:07:24 +0900
-Subject: [PATCH 8/9] Use RB_COPY_SURFACE_SLICE height for volume resolves
+Subject: [PATCH 08/10] Use RB_COPY_SURFACE_SLICE height for volume resolves
  (from xenia-canary)
 
 For resolves into 3D textures, D3D writes pitch * level height to
@@ -1654,7 +1655,7 @@ index 305380e..1c2cc1b 100644
 From 5f79de941cdd04e262fbbd81c40a12e2c6260ad2 Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 22:20:23 +0900
-Subject: [PATCH 9/9] GPU profiler: split guest draws by render target MSAA
+Subject: [PATCH 09/10] GPU profiler: split guest draws by render target MSAA
  sample count
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -1729,6 +1730,75 @@ index 1523eb6..acadd7b 100644
    if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                      normalized_color_mask, *vertex_shader)) {
      return false;
+-- 
+2.55.0.windows.3
+
+
+From e9de3eacda2db238269ed161ef4180d797d3704e Mon Sep 17 00:00:00 2001
+From: "PM.RAZOR" <hslee1659@naver.com>
+Date: Tue, 6 Oct 2026 21:03:03 +0900
+Subject: [PATCH 10/10] Vulkan: fix 8_8_8_8_GAMMA transfer direction; add
+ --gpu_backend
+
+- Vulkan render target cache: the 8_8_8_8 <-> 8_8_8_8_GAMMA ownership
+  transfer converted in the wrong direction (same bug as D3D12). Only convert
+  when _GAMMA is stored as linear R16G16B16A16_UNORM; as R8G8B8A8_UNORM both
+  formats hold the same bits.
+- --gpu_backend (any/d3d12/vulkan) selects the GPU plugin backend, so the
+  Vulkan renderer can be run on Windows when both are compiled in.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/vulkan/render_target_cache.cpp | 8 +++++---
+ src/ui/rex_app.cpp                          | 8 +++++++-
+ 2 files changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 0298f06..8e93be2 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -3505,10 +3505,12 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
+           } else if (dest_is_color &&
+                      (dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
+                       dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
+-            if (source_color_format != dest_color_format) {
++            if (source_color_format != dest_color_format && gamma_render_target_as_unorm16_) {
+               // Color space conversion between k_8_8_8_8 and
+-              // k_8_8_8_8_GAMMA.
+-              if (dest_color_format != xenos::ColorRenderTargetFormat::k_8_8_8_8) {
++              // k_8_8_8_8_GAMMA. _GAMMA is stored as linear in R16G16B16A16_UNORM,
++              // so converting to plain k_8_8_8_8 encodes gamma, and converting to
++              // _GAMMA decodes. As R8G8B8A8_UNORM, both hold the same bits.
++              if (dest_color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8) {
+                 for (uint32_t i = 0; i < 3; ++i) {
+                   source_color[0][i] = LinearToPWLGamma(source_color[0][i], true);
+                 }
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index b94fe9e..6e9aae4 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -51,6 +51,11 @@ REXCVAR_DEFINE_STRING(gpu_plugin, "", "GPU",
+                       "GPU emulation")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU",
++                      "Graphics backend of the GPU plugin: 'any' (first compiled in: d3d12, "
++                      "then vulkan), 'd3d12' or 'vulkan'")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ namespace rex {
+ 
+ // --- ReXApp ---
+@@ -314,7 +319,8 @@ bool ReXApp::SetupPresentation() {
+   OnPreSetup(config_);
+ 
+   if (!config_.graphics && !config_.gpu_plugin.empty()) {
+-    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin);
++    config_.graphics =
++        rex::system::LoadGpuPlugin(config_.gpu_plugin, REXCVAR_GET(gpu_backend));
+     if (!config_.graphics) {
+       // Fatal by design: no silent headless fallback.
+       auto msg =
 -- 
 2.55.0.windows.3
 

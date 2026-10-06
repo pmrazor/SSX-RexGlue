@@ -19,6 +19,10 @@ and the kernel still go through rexglue's runtime (derived from Xenia).
   races, 120 fps in menus.
 - Known issues: occasional UI texture glitches at 2x; online features (RiderNet)
   are gone with EA's servers.
+- Linux and macOS: untested. rexglue supports both through its Vulkan backend
+  (MoltenVK on macOS). On Windows the Vulkan backend (`--gpu_backend=vulkan`)
+  reaches the menus at 120 fps; races have not been tested on it. Most of the
+  2x resolution and performance fixes below are D3D12-only, so use 1x there.
 
 ## Requirements
 
@@ -51,6 +55,18 @@ and the kernel still go through rexglue's runtime (derived from Xenia).
    configured with `-DREXGLUE_ENABLE_FIDELITYFX=ON`, `amd_fidelityfx_dx12.dll`
    is required too.
 
+### Linux / macOS
+
+Same steps with the SDK's `linux-amd64`, `linux-arm64`, `mac-amd64` or
+`mac-arm64` preset (Vulkan only; macOS needs Xcode 16+), then this project's
+matching `*-release` preset. The project's Linux presets expect `clang-20`;
+override `CMAKE_C_COMPILER`/`CMAKE_CXX_COMPILER` for other versions. The SDK
+copies the Vulkan loader and MoltenVK next to the executable on macOS. Run with
+`scripts/play_1x_120fps.sh`.
+
+To try the Vulkan renderer on Windows, configure the SDK with
+`-DREXGLUE_USE_VULKAN=ON` and run with `--gpu_backend=vulkan`.
+
 ## Run
 
 Copy a launcher from `scripts/` next to `ssx.exe` and put (or link) the
@@ -60,6 +76,7 @@ extracted game folder next to it as `game`:
 |---|---|---|---|
 | `play_1x_120fps.bat` | 1280x720 | RTV | Stable 120 fps, lowest GPU load and input lag |
 | `play_qhd.bat` | 2560x1440 | ROV | Sharper, ~70–90 fps in races |
+| `play_1x_120fps.sh` | 1280x720 | Vulkan | Linux / macOS (untested) |
 
 An FPS counter is drawn in the top-left corner (`--ssx_show_fps=false` hides it).
 
@@ -73,6 +90,7 @@ An FPS counter is drawn in the top-left corner (`--ssx_show_fps=false` hides it)
 | `--resolution_scale=2` | 2x internal resolution |
 | `--render_target_path_d3d12=rov` | ROV render path; at 2x, RTV spends most GPU time on EDRAM copies |
 | `--ssx_show_fps=false` | Hide the FPS overlay |
+| `--gpu_backend=vulkan` | Vulkan renderer when the SDK has both (SDK fix; default `any` = D3D12 first) |
 | `--texture_partial_array_reload=false` | Disable partial reloads of array/3D textures (SDK fix, on by default) |
 
 Diagnostics (off by default): `--d3d12_gpu_profile` (GPU time per category),
@@ -101,6 +119,8 @@ Diagnostics (off by default): `--d3d12_gpu_profile` (GPU time per category),
   removal with `INVALID_CALL`); volume resolves used the wrong height
   (`RB_COPY_SURFACE_SLICE`, ported from xenia-canary)
 - Render target 8_8_8_8 ↔ 8_8_8_8_GAMMA transfer converted in the wrong direction
+  (D3D12 and Vulkan)
+- `--gpu_backend` to pick D3D12 or Vulkan when both are compiled in
 - Partial reloads of GPU-written slices of 2D array and tiled 3D textures (SSX's
   snow trail volume was fully reloaded many times per frame)
 - Optional diagnostics listed above
@@ -122,6 +142,7 @@ SSX(2012, Xbox 360)를 rexglue-sdk로 정적 리컴파일한 Windows 네이티�
 
 - `play_1x_120fps.bat`: 기본 해상도, 120fps 안정
 - `play_qhd.bat`: 2배 해상도(QHD), 레이스 약 70~90fps
+- `play_1x_120fps.sh`: Linux/macOS용 (Vulkan, 테스트 안 됨)
 
 ## License
 
