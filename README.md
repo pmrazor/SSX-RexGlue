@@ -21,9 +21,9 @@ and the kernel still go through rexglue's runtime (derived from Xenia).
   are gone with EA's servers.
 - Linux and macOS: untested. rexglue supports both through its Vulkan backend
   (MoltenVK on macOS). On Windows the Vulkan backend (`--gpu_backend=vulkan`)
-  renders menus and races correctly at 1x, but runs slower than D3D12 (about
-  55–90 fps in races on an RTX 4070). Most of the 2x resolution and performance
-  fixes below are D3D12-only, so use 1x there.
+  renders menus and races correctly at 1x, at about 95–115 fps in races on an
+  RTX 4070 (D3D12 holds 120). The 2x resolution fixes below are D3D12-only, so
+  use 1x there.
 
 ## Requirements
 
@@ -102,7 +102,7 @@ Diagnostics (off by default): `--d3d12_gpu_profile` (GPU time per category),
 `--d3d12_log_texture_loads`, `--d3d12_diagnose_invalid_command_lists`,
 `--log_wait_stats`, `--log_resolves`, `--dump_shaders=<dir>` (also SPIR-V on
 Vulkan). With RenderDoc's Vulkan layer enabled, `--renderdoc_capture_swap=N`
-captures the guest frame after swap N. Fatal errors write `ssx_crash.txt` next
+captures the guest frame after swap N (`-1`: after pressing F11). Fatal errors write `ssx_crash.txt` next
 to the exe.
 
 ## What's in here
@@ -134,6 +134,9 @@ to the exe.
   bit transfers (GPUs without `VK_EXT_shader_stencil_export`, e.g. NVIDIA) set
   every stencil bit; `VK_KHR_portability_enumeration` is requested only on
   macOS (RenderDoc rejects it)
+- Vulkan performance: partial reloads of the snow trail volume (as on D3D12),
+  and no per-bit stencil transfer draws from depth targets whose stencil can
+  only be zero (`--vulkan_skip_zero_stencil_transfers`)
 - Partial reloads of GPU-written slices of 2D array and tiled 3D textures (SSX's
   snow trail volume was fully reloaded many times per frame)
 - Optional diagnostics listed above

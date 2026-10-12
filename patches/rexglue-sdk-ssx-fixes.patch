@@ -1,7 +1,7 @@
 From bd94bda0887acb368f86c681c0b181642fb6657c Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 14:08:40 +0900
-Subject: [PATCH 01/11] Fix crashes and rendering bugs found while porting SSX
+Subject: [PATCH 01/12] Fix crashes and rendering bugs found while porting SSX
  (2012)
 
 - Input: serialize InputSystem entry points; concurrent guest polling
@@ -649,7 +649,7 @@ index f4e0efd..80d7148 100644
 From 03f07b3cb779aa11714c227ed536047fb19180cf Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 14:52:59 +0900
-Subject: [PATCH 02/11] Add D3D12 GPU time profiler (--d3d12_gpu_profile)
+Subject: [PATCH 02/12] Add D3D12 GPU time profiler (--d3d12_gpu_profile)
 
 Timestamp queries split each submission into guest draws, render target
 ownership transfers, resolves, texture loads and swap, and the totals are
@@ -949,7 +949,7 @@ index abc26d9..fc8ad84 100644
 From 55a9d2cbb85945dc003de875cdd3b3743083ee31 Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 15:14:18 +0900
-Subject: [PATCH 03/11] Fix GPU profiler recording timestamps with no query
+Subject: [PATCH 03/12] Fix GPU profiler recording timestamps with no query
  heap when disabled
 
 GpuProfileMark ran at every submission start even with --d3d12_gpu_profile
@@ -981,7 +981,7 @@ index f34a5ba..7bc0e02 100644
 From e9329e90fdc90da14bbdd80f758c3bff788ba258 Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 15:51:48 +0900
-Subject: [PATCH 04/11] Add --d3d12_log_texture_loads texture (re)load
+Subject: [PATCH 04/12] Add --d3d12_log_texture_loads texture (re)load
  statistics
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -1078,7 +1078,7 @@ index fc8ad84..b27ddd7 100644
 From a3ab07c3c098dbc0fc9b2af5b4bce1aecd846bdd Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 16:15:17 +0900
-Subject: [PATCH 05/11] Reload only GPU-written slices of 2D array textures
+Subject: [PATCH 05/12] Reload only GPU-written slices of 2D array textures
 
 Guest code resolves into one slice of large 2D arrays per frame (SSX: a
 128x128x256 snow trail atlas), and the texture cache reloaded the whole
@@ -1340,7 +1340,7 @@ index 76f5600..081feea 100644
 From bcae94cf46283b366e634901bf309daf73d3a0e9 Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 17:07:55 +0900
-Subject: [PATCH 06/11] Split GPU profiler texture loads into array/large/other
+Subject: [PATCH 06/12] Split GPU profiler texture loads into array/large/other
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -1422,7 +1422,7 @@ index c9489a4..719cee5 100644
 From 6b351a6a602c5ebd136f39f3324df7d95e7a868e Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 17:27:42 +0900
-Subject: [PATCH 07/11] Partial reloads for tiled 3D textures in groups of 8
+Subject: [PATCH 07/12] Partial reloads for tiled 3D textures in groups of 8
  slices
 
 SSX's snow trail texture is a tiled 128x128x256 volume, not a 2D array, so
@@ -1588,7 +1588,7 @@ index 081feea..729bdbb 100644
 From b8229f8e03af8888a232f4904df448b9b5572a71 Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 22:07:24 +0900
-Subject: [PATCH 08/11] Use RB_COPY_SURFACE_SLICE height for volume resolves
+Subject: [PATCH 08/12] Use RB_COPY_SURFACE_SLICE height for volume resolves
  (from xenia-canary)
 
 For resolves into 3D textures, D3D writes pitch * level height to
@@ -1655,7 +1655,7 @@ index 305380e..1c2cc1b 100644
 From 5f79de941cdd04e262fbbd81c40a12e2c6260ad2 Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 22:20:23 +0900
-Subject: [PATCH 09/11] GPU profiler: split guest draws by render target MSAA
+Subject: [PATCH 09/12] GPU profiler: split guest draws by render target MSAA
  sample count
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -1737,7 +1737,7 @@ index 1523eb6..acadd7b 100644
 From e9de3eacda2db238269ed161ef4180d797d3704e Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Tue, 6 Oct 2026 21:03:03 +0900
-Subject: [PATCH 10/11] Vulkan: fix 8_8_8_8_GAMMA transfer direction; add
+Subject: [PATCH 10/12] Vulkan: fix 8_8_8_8_GAMMA transfer direction; add
  --gpu_backend
 
 - Vulkan render target cache: the 8_8_8_8 <-> 8_8_8_8_GAMMA ownership
@@ -1806,7 +1806,7 @@ index b94fe9e..6e9aae4 100644
 From 573e75d583ebde8bd2b5a3f883cdd86557697f0a Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Mon, 12 Oct 2026 18:00:25 +0900
-Subject: [PATCH 11/11] Vulkan: fix texture exponent bias and
+Subject: [PATCH 11/12] Vulkan: fix texture exponent bias and
  depth-to-stencil-bit transfers
 
 - SPIR-V translator: the texture fetch result exponent bias was read from
@@ -2022,6 +2022,342 @@ index 914b311..b17002b 100644
    if (with_surface) {
      // #1.
      requested_extensions.emplace("VK_KHR_surface", &vulkan_instance->extensions_.ext_KHR_surface);
+-- 
+2.55.0.windows.3
+
+
+From 57a178d9410e348373e37718b4b250f76d507411 Mon Sep 17 00:00:00 2001
+From: "PM.RAZOR" <hslee1659@naver.com>
+Date: Mon, 12 Oct 2026 18:57:06 +0900
+Subject: [PATCH 12/12] Vulkan: partial texture reloads, skip zero stencil
+ transfers, F11 capture
+
+- Port the partial base reloads of GPU-written 2D array slices and tiled 3D
+  depth ranges (groups of 8 slices) to the Vulkan texture cache. SSX's
+  128x128x256 snow trail volume was fully reloaded 17 times per frame (about
+  5 ms of GPU time on an RTX 4070). The texture_partial_array_reload cvar now
+  lives in the common texture cache so that non-D3D12 builds have it.
+- Without VK_EXT_shader_stencil_export, depth -> stencil transfers take 8
+  draws. Track per depth render target whether its stencil may be nonzero
+  (guest draws with stencil enabled, nonzero stencil clears, transfers from
+  color or such targets) and skip the bit draws for sources that can only be
+  zero, after the stencil clear (--vulkan_skip_zero_stencil_transfers).
+- --renderdoc_capture_swap=-1 captures the guest frame after F11 (Windows).
+
+SSX races on Vulkan, 1x: about 70 -> 105 fps.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../rex/graphics/vulkan/render_target_cache.h | 10 +++
+ src/graphics/d3d12/texture_cache.cpp          |  4 +-
+ src/graphics/pipeline/texture/cache.cpp       |  3 +
+ src/graphics/vulkan/command_processor.cpp     | 19 +++-
+ src/graphics/vulkan/render_target_cache.cpp   | 30 +++++++
+ src/graphics/vulkan/texture_cache.cpp         | 86 ++++++++++++++++++-
+ 6 files changed, 143 insertions(+), 9 deletions(-)
+
+diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
+index 34f7033..b18210a 100644
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -32,6 +32,9 @@ class VulkanCommandProcessor;
+ 
+ class VulkanRenderTargetCache final : public RenderTargetCache {
+  public:
++  // Called for draws that may write the stencil of the bound depth target.
++  void MarkBoundDepthStencilMaybeNonzero();
++
+   union RenderPassKey {
+     struct {
+       // If emulating 2x as 4x, this is still 2x for simplicity of using this
+@@ -361,6 +364,12 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+     uint32_t temporary_sort_index() const { return temporary_sort_index_; }
+     void SetTemporarySortIndex(uint32_t index) { temporary_sort_index_ = index; }
+ 
++    // Conservative: false only if nothing could have written a nonzero
++    // stencil value to this depth render target - then transferring its
++    // stencil without VK_EXT_shader_stencil_export (8 bit draws) is skipped.
++    bool stencil_maybe_nonzero() const { return stencil_maybe_nonzero_; }
++    void SetStencilMaybeNonzero() { stencil_maybe_nonzero_ = true; }
++
+    private:
+     VulkanRenderTargetCache& render_target_cache_;
+ 
+@@ -384,6 +393,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+     VkImageLayout current_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+ 
+     // Temporary storage for indices in operations like transfers and dumps.
++    bool stencil_maybe_nonzero_ = false;
+     uint32_t temporary_sort_index_ = 0;
+   };
+ 
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index 2e385e4..1a84123 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -36,9 +36,7 @@
+ #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
+ #include <rex/ui/d3d12/d3d12_util.h>
+ 
+-REXCVAR_DEFINE_BOOL(texture_partial_array_reload, true, "GPU",
+-                    "Reload only the slices of 2D array textures that the GPU wrote "
+-                    "(resolves) instead of the whole array.");
++REXCVAR_DECLARE(bool, texture_partial_array_reload);
+ REXCVAR_DEFINE_BOOL(d3d12_log_texture_loads, false, "GPU/D3D12",
+                     "Every 2 seconds, log which guest textures were (re)loaded and how many "
+                     "host texels that took.");
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 729bdbb..fbc13c1 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -45,6 +45,9 @@ REXCVAR_DEFINE_INT32(texture_cache_memory_limit_soft_lifetime, 30, "GPU",
+                      "Soft texture cache memory limit lifetime (seconds)")
+     .range(1, 3600);
+ 
++REXCVAR_DEFINE_BOOL(texture_partial_array_reload, true, "GPU",
++                    "Reload only the slices of 2D array textures (and the depth ranges of "
++                    "tiled 3D textures) that the GPU wrote instead of the whole texture.");
+ REXCVAR_DEFINE_BOOL(gpu_3d_to_2d_texture, true, "GPU",
+                     "Sample problematic 3D textures through 2D-compatible wrappers")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index ae0bf85..b42a789 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -67,7 +67,7 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
+ 
+ REXCVAR_DEFINE_INT32(renderdoc_capture_swap, 0, "GPU/Vulkan",
+                      "Debug: capture the guest frame after this many swaps in RenderDoc "
+-                     "(0 = off)");
++                     "(0 = off, -1 = when F11 is pressed, Windows only)");
+ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
+                     "device (falls back to render passes otherwise)")
+@@ -2296,10 +2296,20 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+   // Debug: capture all guest GPU work between two guest swaps in RenderDoc
+   // (host presentation runs at its own rate, so the host frame boundary
+   // doesn't contain the guest frame).
+-  if (int32_t capture_swap = REXCVAR_GET(renderdoc_capture_swap); capture_swap > 0) {
++  if (int32_t capture_swap = REXCVAR_GET(renderdoc_capture_swap); capture_swap != 0) {
+     static uint32_t swap_counter = 0;
+     static std::unique_ptr<ui::RenderDocAPI> renderdoc_api = ui::RenderDocAPI::CreateIfConnected();
+     ++swap_counter;
++#if REX_PLATFORM_WINDOWS
++    // -1: capture the guest frame after F11 is pressed.
++    static uint32_t hotkey_capture_swap = 0;
++    if (capture_swap < 0) {
++      if ((GetAsyncKeyState(VK_F11) & 0x8000) && swap_counter > hotkey_capture_swap + 120) {
++        hotkey_capture_swap = swap_counter + 1;
++      }
++      capture_swap = int32_t(hotkey_capture_swap);
++    }
++#endif
+     if (swap_counter == uint32_t(capture_swap) || swap_counter == uint32_t(capture_swap) + 1) {
+       if (renderdoc_api) {
+         // Put the guest work recorded so far on the right side of the range.
+@@ -3873,6 +3883,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+                                     normalized_color_mask, *vertex_shader)) {
+     return draw_fail("render_target_update");
+   }
++  // Track depth render targets the guest may write a nonzero stencil to (see
++  // VulkanRenderTarget::stencil_maybe_nonzero).
++  if (normalized_depth_control.stencil_enable) {
++    render_target_cache_->MarkBoundDepthStencilMaybeNonzero();
++  }
+ 
+   // Create the pipeline (for this, need the render pass from the render target
+   // cache), translating the shaders - doing this now to obtain the used
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 261e979..e750718 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -37,6 +37,9 @@
+ #include <rex/math.h>
+ #include <rex/ui/vulkan/util.h>
+ 
++REXCVAR_DEFINE_BOOL(vulkan_skip_zero_stencil_transfers, true, "GPU/Vulkan",
++                    "Without VK_EXT_shader_stencil_export, skip the per-bit stencil transfer "
++                    "draws from depth render targets whose stencil can only be zero");
+ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
+                       "Vulkan render target implementation path")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+@@ -1312,6 +1315,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+         if (PrepareHostRenderTargetsResolveClear(resolve_info, clear_rectangle,
+                                                  clear_render_targets[0], clear_transfers_[0],
+                                                  clear_render_targets[1], clear_transfers_[1])) {
++          if (clear_render_targets[0] && (resolve_info.rb_depth_clear & 0xFF)) {
++            static_cast<VulkanRenderTarget*>(clear_render_targets[0])->SetStencilMaybeNonzero();
++          }
+           uint64_t clear_values[2];
+           clear_values[0] = resolve_info.rb_depth_clear;
+           clear_values[1] =
+@@ -1720,6 +1726,16 @@ bool VulkanRenderTargetCache::IsColor16FormatFloatLike(
+   }
+ }
+ 
++void VulkanRenderTargetCache::MarkBoundDepthStencilMaybeNonzero() {
++  if (GetPath() != Path::kHostRenderTargets) {
++    return;
++  }
++  RenderTarget* depth_rt = last_update_accumulated_render_targets()[0];
++  if (depth_rt) {
++    static_cast<VulkanRenderTarget*>(depth_rt)->SetStencilMaybeNonzero();
++  }
++}
++
+ VkFormat VulkanRenderTargetCache::GetColorVulkanFormat(
+     xenos::ColorRenderTargetFormat format) const {
+   switch (format) {
+@@ -4903,6 +4919,12 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+             stencil_clear_rectangle_count += transfer.GetRectangles(
+                 dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
+                 nullptr, resolve_clear_rectangle);
++            // The stencil is cleared to zero before the bit draws - if the
++            // source stencil can only be zero, the bit draws would do nothing.
++            if (source_rt_key.is_depth && !source_vulkan_rt.stencil_maybe_nonzero() &&
++                REXCVAR_GET(vulkan_skip_zero_stencil_transfers)) {
++              continue;
++            }
+           } else {
+             if (dest_rt_key.is_depth) {
+               if (host_depth_source_vulkan_rt) {
+@@ -4931,6 +4953,14 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+         }
+       }
+       std::sort(current_transfer_invocations_.begin(), current_transfer_invocations_.end());
++      if (dest_rt_key.is_depth) {
++        for (const Transfer& transfer : current_transfers) {
++          auto& source_vulkan_rt = *static_cast<VulkanRenderTarget*>(transfer.source);
++          if (!source_vulkan_rt.key().is_depth || source_vulkan_rt.stencil_maybe_nonzero()) {
++            dest_vulkan_rt.SetStencilMaybeNonzero();
++          }
++        }
++      }
+ 
+       for (auto it = current_transfer_invocations_.cbegin();
+            it != current_transfer_invocations_.cend(); ++it) {
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index ecbd940..32ab79c 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -33,6 +33,7 @@
+ #include <rex/ui/vulkan/ui_samplers.h>
+ #include <rex/ui/vulkan/util.h>
+ 
++REXCVAR_DECLARE(bool, texture_partial_array_reload);
+ REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
+ 
+ namespace rex::graphics::vulkan {
+@@ -1364,6 +1365,54 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+         level_host_layout.y_pitch_blocks * level_guest_z_extent_texels;
+     host_buffer_size += level_host_layout.slice_size_bytes * array_size;
+   }
++  // Base slices to (re)load - only the ones the GPU wrote since the last load
++  // for tracked 2D arrays (see Texture::NoteBaseWrite), otherwise all. Tiled
++  // 3D textures are reloaded by groups of 8 depth slices, the period of the 3D
++  // tiling. The host buffer layout stays the same, only part of it is filled.
++  uint32_t base_slice_first = 0;
++  uint32_t base_slice_count = array_size;
++  constexpr uint32_t kZGroupDepth = 8;
++  uint32_t base_z_first = 0;
++  uint32_t base_z_count = depth;
++  uint32_t base_z_group_stride = 0;
++  if (load_base && vulkan_texture.partial_reload_tracked() &&
++      REXCVAR_GET(texture_partial_array_reload)) {
++    uint32_t dirty_first, dirty_last;
++    bool partial;
++    {
++      auto lock = rex::thread::global_critical_region::AcquireDirect();
++      partial = vulkan_texture.GetBasePartialReload(lock, dirty_first, dirty_last);
++    }
++    const texture_util::TextureGuestLayout::Level& base_layout = guest_layout.base;
++    uint32_t base_address = uint32_t(texture_key.base_page) << 12;
++    if (is_3d) {
++      base_z_group_stride = uint32_t(texture_util::GetTiledOffset3D(
++          0, 0, int32_t(kZGroupDepth), base_layout.row_pitch_bytes / bytes_per_block,
++          base_layout.z_slice_stride_block_rows, rex::log2_floor(bytes_per_block)));
++      if (partial && base_z_group_stride && dirty_first >= base_address) {
++        uint32_t z_first = (dirty_first - base_address) / base_z_group_stride * kZGroupDepth;
++        uint32_t z_end = std::min(
++            ((dirty_last - base_address) / base_z_group_stride + 1) * kZGroupDepth, depth);
++        if (z_first < z_end) {
++          base_z_first = z_first;
++          base_z_count = z_end - z_first;
++        }
++      }
++    } else if (partial && base_layout.array_slice_stride_bytes && dirty_first >= base_address) {
++      uint32_t first = (dirty_first - base_address) / base_layout.array_slice_stride_bytes;
++      uint32_t last = std::min((dirty_last - base_address) / base_layout.array_slice_stride_bytes,
++                               array_size - 1);
++      if (first <= last) {
++        base_slice_first = first;
++        base_slice_count = last - first + 1;
++      }
++    }
++  }
++  // Bytes of one depth slice of the base in the host buffer.
++  VkDeviceSize host_base_z_slice_bytes = VkDeviceSize(load_shader_info.bytes_per_host_block) *
++                                         host_layout_base.x_pitch_blocks *
++                                         host_layout_base.y_pitch_blocks;
++
+   VulkanCommandProcessor::ScratchBufferAcquisition scratch_buffer_acquisition(
+       command_processor_.AcquireScratchGpuBuffer(
+           host_buffer_size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT));
+@@ -1591,14 +1640,31 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+     load_constants.host_pitch =
+         load_shader_info.bytes_per_host_block * level_host_layout.x_pitch_blocks;
+ 
+-    command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+-                                      sizeof(load_constants), &load_constants);
++    if (is_base && is_3d && base_z_count != depth) {
++      // The tiled 3D address is linear in whole groups of 8 slices, so the
++      // shader can start at a group boundary with only the offsets shifted.
++      load_constants.guest_offset += base_z_group_stride * (base_z_first / kZGroupDepth) *
++                                     (texture_resolution_scale_x * texture_resolution_scale_y);
++      load_constants.host_offset += uint32_t(host_base_z_slice_bytes * base_z_first);
++      load_constants.size_blocks[2] = base_z_count;
++    }
+ 
+     uint32_t level_array_slice_stride_bytes_scaled =
+         level_guest_layout.array_slice_stride_bytes *
+         (texture_resolution_scale_x * texture_resolution_scale_y);
+-    for (uint32_t slice = 0; slice < array_size; ++slice) {
+-      if (slice != 0) {
++    uint32_t dispatch_slice_first = is_base ? base_slice_first : 0;
++    uint32_t dispatch_slice_end = is_base ? base_slice_first + base_slice_count : array_size;
++    if (dispatch_slice_first) {
++      load_constants.guest_offset += level_array_slice_stride_bytes_scaled * dispatch_slice_first;
++      load_constants.host_offset +=
++          uint32_t(level_host_layout.slice_size_bytes * dispatch_slice_first);
++    }
++
++    command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                                      sizeof(load_constants), &load_constants);
++
++    for (uint32_t slice = dispatch_slice_first; slice < dispatch_slice_end; ++slice) {
++      if (slice != dispatch_slice_first) {
+         command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
+                                           offsetof(LoadConstants, guest_offset),
+                                           sizeof(load_constants.guest_offset),
+@@ -1781,6 +1847,18 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+     copy_region.imageExtent.height =
+         std::max((height * texture_resolution_scale_y) >> level, UINT32_C(1));
+     copy_region.imageExtent.depth = std::max(depth >> level, UINT32_C(1));
++    if (level == 0) {
++      // Partial base reloads - only copy what was loaded.
++      if (is_3d && base_z_count != depth) {
++        copy_region.bufferOffset += host_base_z_slice_bytes * base_z_first;
++        copy_region.imageOffset.z = int32_t(base_z_first);
++        copy_region.imageExtent.depth = base_z_count;
++      } else if (base_slice_count != array_size) {
++        copy_region.bufferOffset += host_layout_base.slice_size_bytes * base_slice_first;
++        copy_region.imageSubresource.baseArrayLayer = base_slice_first;
++        copy_region.imageSubresource.layerCount = base_slice_count;
++      }
++    }
+   }
+ 
+   return true;
 -- 
 2.55.0.windows.3
 
