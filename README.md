@@ -21,8 +21,9 @@ and the kernel still go through rexglue's runtime (derived from Xenia).
   are gone with EA's servers.
 - Linux and macOS: untested. rexglue supports both through its Vulkan backend
   (MoltenVK on macOS). On Windows the Vulkan backend (`--gpu_backend=vulkan`)
-  reaches the menus at 120 fps; races have not been tested on it. Most of the
-  2x resolution and performance fixes below are D3D12-only, so use 1x there.
+  renders menus and races correctly at 1x, but runs slower than D3D12 (about
+  55–90 fps in races on an RTX 4070). Most of the 2x resolution and performance
+  fixes below are D3D12-only, so use 1x there.
 
 ## Requirements
 
@@ -95,7 +96,10 @@ An FPS counter is drawn in the top-left corner (`--ssx_show_fps=false` hides it)
 
 Diagnostics (off by default): `--d3d12_gpu_profile` (GPU time per category),
 `--d3d12_log_texture_loads`, `--d3d12_diagnose_invalid_command_lists`,
-`--log_wait_stats`. Fatal errors write `ssx_crash.txt` next to the exe.
+`--log_wait_stats`, `--log_resolves`, `--dump_shaders=<dir>` (also SPIR-V on
+Vulkan). With RenderDoc's Vulkan layer enabled, `--renderdoc_capture_swap=N`
+captures the guest frame after swap N. Fatal errors write `ssx_crash.txt` next
+to the exe.
 
 ## What's in here
 
@@ -121,6 +125,11 @@ Diagnostics (off by default): `--d3d12_gpu_profile` (GPU time per category),
 - Render target 8_8_8_8 ↔ 8_8_8_8_GAMMA transfer converted in the wrong direction
   (D3D12 and Vulkan)
 - `--gpu_backend` to pick D3D12 or Vulkan when both are compiled in
+- Vulkan: texture fetches read the result exponent bias from the wrong fetch
+  constant word (SSX textures came out at 1/256 brightness); depth → stencil
+  bit transfers (GPUs without `VK_EXT_shader_stencil_export`, e.g. NVIDIA) set
+  every stencil bit; `VK_KHR_portability_enumeration` is requested only on
+  macOS (RenderDoc rejects it)
 - Partial reloads of GPU-written slices of 2D array and tiled 3D textures (SSX's
   snow trail volume was fully reloaded many times per frame)
 - Optional diagnostics listed above

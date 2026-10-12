@@ -1,7 +1,7 @@
 From bd94bda0887acb368f86c681c0b181642fb6657c Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 14:08:40 +0900
-Subject: [PATCH 01/10] Fix crashes and rendering bugs found while porting SSX
+Subject: [PATCH 01/11] Fix crashes and rendering bugs found while porting SSX
  (2012)
 
 - Input: serialize InputSystem entry points; concurrent guest polling
@@ -649,7 +649,7 @@ index f4e0efd..80d7148 100644
 From 03f07b3cb779aa11714c227ed536047fb19180cf Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 14:52:59 +0900
-Subject: [PATCH 02/10] Add D3D12 GPU time profiler (--d3d12_gpu_profile)
+Subject: [PATCH 02/11] Add D3D12 GPU time profiler (--d3d12_gpu_profile)
 
 Timestamp queries split each submission into guest draws, render target
 ownership transfers, resolves, texture loads and swap, and the totals are
@@ -949,7 +949,7 @@ index abc26d9..fc8ad84 100644
 From 55a9d2cbb85945dc003de875cdd3b3743083ee31 Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 15:14:18 +0900
-Subject: [PATCH 03/10] Fix GPU profiler recording timestamps with no query
+Subject: [PATCH 03/11] Fix GPU profiler recording timestamps with no query
  heap when disabled
 
 GpuProfileMark ran at every submission start even with --d3d12_gpu_profile
@@ -981,7 +981,7 @@ index f34a5ba..7bc0e02 100644
 From e9329e90fdc90da14bbdd80f758c3bff788ba258 Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 15:51:48 +0900
-Subject: [PATCH 04/10] Add --d3d12_log_texture_loads texture (re)load
+Subject: [PATCH 04/11] Add --d3d12_log_texture_loads texture (re)load
  statistics
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -1078,7 +1078,7 @@ index fc8ad84..b27ddd7 100644
 From a3ab07c3c098dbc0fc9b2af5b4bce1aecd846bdd Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 16:15:17 +0900
-Subject: [PATCH 05/10] Reload only GPU-written slices of 2D array textures
+Subject: [PATCH 05/11] Reload only GPU-written slices of 2D array textures
 
 Guest code resolves into one slice of large 2D arrays per frame (SSX: a
 128x128x256 snow trail atlas), and the texture cache reloaded the whole
@@ -1340,7 +1340,7 @@ index 76f5600..081feea 100644
 From bcae94cf46283b366e634901bf309daf73d3a0e9 Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 17:07:55 +0900
-Subject: [PATCH 06/10] Split GPU profiler texture loads into array/large/other
+Subject: [PATCH 06/11] Split GPU profiler texture loads into array/large/other
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -1422,7 +1422,7 @@ index c9489a4..719cee5 100644
 From 6b351a6a602c5ebd136f39f3324df7d95e7a868e Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 17:27:42 +0900
-Subject: [PATCH 07/10] Partial reloads for tiled 3D textures in groups of 8
+Subject: [PATCH 07/11] Partial reloads for tiled 3D textures in groups of 8
  slices
 
 SSX's snow trail texture is a tiled 128x128x256 volume, not a 2D array, so
@@ -1588,7 +1588,7 @@ index 081feea..729bdbb 100644
 From b8229f8e03af8888a232f4904df448b9b5572a71 Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 22:07:24 +0900
-Subject: [PATCH 08/10] Use RB_COPY_SURFACE_SLICE height for volume resolves
+Subject: [PATCH 08/11] Use RB_COPY_SURFACE_SLICE height for volume resolves
  (from xenia-canary)
 
 For resolves into 3D textures, D3D writes pitch * level height to
@@ -1655,7 +1655,7 @@ index 305380e..1c2cc1b 100644
 From 5f79de941cdd04e262fbbd81c40a12e2c6260ad2 Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Sat, 3 Oct 2026 22:20:23 +0900
-Subject: [PATCH 09/10] GPU profiler: split guest draws by render target MSAA
+Subject: [PATCH 09/11] GPU profiler: split guest draws by render target MSAA
  sample count
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -1737,7 +1737,7 @@ index 1523eb6..acadd7b 100644
 From e9de3eacda2db238269ed161ef4180d797d3704e Mon Sep 17 00:00:00 2001
 From: "PM.RAZOR" <hslee1659@naver.com>
 Date: Tue, 6 Oct 2026 21:03:03 +0900
-Subject: [PATCH 10/10] Vulkan: fix 8_8_8_8_GAMMA transfer direction; add
+Subject: [PATCH 10/11] Vulkan: fix 8_8_8_8_GAMMA transfer direction; add
  --gpu_backend
 
 - Vulkan render target cache: the 8_8_8_8 <-> 8_8_8_8_GAMMA ownership
@@ -1799,6 +1799,229 @@ index b94fe9e..6e9aae4 100644
      if (!config_.graphics) {
        // Fatal by design: no silent headless fallback.
        auto msg =
+-- 
+2.55.0.windows.3
+
+
+From 573e75d583ebde8bd2b5a3f883cdd86557697f0a Mon Sep 17 00:00:00 2001
+From: "PM.RAZOR" <hslee1659@naver.com>
+Date: Mon, 12 Oct 2026 18:00:25 +0900
+Subject: [PATCH 11/11] Vulkan: fix texture exponent bias and
+ depth-to-stencil-bit transfers
+
+- SPIR-V translator: the texture fetch result exponent bias was read from
+  bits 13:18 of fetch constant word 4 (the LOD bias word) instead of word 3,
+  scaling textures by up to 2^-32..2^31 (SSX: 2^-8, almost black frames). The
+  DXBC translator already used word 3.
+- Render target cache: depth -> stencil bit ownership transfers (used when
+  VK_EXT_shader_stencil_export is unavailable, e.g. NVIDIA) never killed
+  samples whose stencil bit is clear, because only color sources set the
+  packed value. The stencil became 0xFF and leaked into aliased color targets.
+- Instance: request VK_KHR_portability_enumeration only on macOS. Capture
+  layers such as RenderDoc reject it at instance creation.
+- Diagnostics (off by default): --renderdoc_capture_swap=N captures the guest
+  frame after swap N in RenderDoc; --dump_shaders also dumps Vulkan SPIR-V;
+  --log_resolves logs each distinct resolve configuration once.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../shader/spirv_translator_fetch.cpp         | 16 ++++++++--
+ src/graphics/util/draw.cpp                    | 30 +++++++++++++++++++
+ src/graphics/vulkan/command_processor.cpp     | 30 +++++++++++++++++++
+ src/graphics/vulkan/pipeline_cache.cpp        |  5 ++++
+ src/graphics/vulkan/render_target_cache.cpp   |  5 ++++
+ src/ui/vulkan/vulkan_instance.cpp             |  5 +++-
+ 6 files changed, 88 insertions(+), 3 deletions(-)
+
+diff --git a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+index 9ce3bb4..52dae81 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+@@ -2030,10 +2030,22 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+         }
+ 
+         // Apply the exponent bias from the bits 13:18 of the fetch constant
+-        // word 4.
++        // word 3 (word 4 bits 12:21 are the LOD bias).
++        id_vector_temp_.clear();
++        id_vector_temp_.push_back(const_int_0_);
++        id_vector_temp_.push_back(
++            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) >> 2)));
++        id_vector_temp_.push_back(
++            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) & 3)));
++        spv::Id fetch_constant_word_3_signed = builder_->createUnaryOp(
++            spv::OpBitcast, type_int_,
++            builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
++                                                             uniform_fetch_constants_,
++                                                             id_vector_temp_),
++                                 spv::NoPrecision));
+         spv::Id result_exponent_bias = builder_->createBinBuiltinCall(
+             type_float_, ext_inst_glsl_std_450_, GLSLstd450Ldexp, const_float_1_,
+-            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_4_signed,
++            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_3_signed,
+                                   builder_->makeUintConstant(13), builder_->makeUintConstant(6)));
+         {
+           uint32_t result_remaining_components = used_result_nonzero_components;
+diff --git a/src/graphics/util/draw.cpp b/src/graphics/util/draw.cpp
+index 1c2cc1b..a29f596 100644
+--- a/src/graphics/util/draw.cpp
++++ b/src/graphics/util/draw.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <mutex>
++#include <set>
+ 
+ #include <rex/assert.h>
+ #include <rex/cvar.h>
+@@ -27,6 +29,9 @@
+ #include <rex/ui/graphics_util.h>
+ 
+ REXCVAR_DEFINE_BOOL(half_pixel_offset, true, "GPU", "Enable half pixel offset");
++REXCVAR_DEFINE_BOOL(log_resolves, false, "GPU",
++                    "Log each distinct resolve configuration (source format, destination "
++                    "format, copy shader) once");
+ 
+ REXCVAR_DEFINE_BOOL(resolve_resolution_scale_fill_half_pixel_offset, true, "GPU",
+                     "Fill half pixel offset during resolution scale resolve");
+@@ -1167,6 +1172,31 @@ ResolveCopyShaderIndex ResolveInfo::GetCopyShader(uint32_t draw_resolution_scale
+     }
+   }
+ 
++  if (REXCVAR_GET(log_resolves)) {
++    static std::mutex logged_mutex;
++    static std::set<std::pair<uint32_t, uint32_t>> logged;
++    // Coordinates and base addresses vary per resolve; key by format state.
++    uint32_t key_edram = edram_info.packed & ~((1u << xenos::kEdramPitchTilesBits) - 1);
++    uint32_t key_dest = copy_dest_info.value & ~(0x7u << 4);
++    key_dest ^= uint32_t(copy_dest_coordinate_info.copy_sample_select) << 28;
++    std::lock_guard<std::mutex> lock(logged_mutex);
++    if (logged.emplace(key_edram, key_dest).second) {
++      REXGPU_INFO(
++          "Resolve: {} format {} msaa {} 64bpp {} -> dest format {} number {} endian {} "
++          "exp_bias {} swap {} array {} sample_select {}, shader {}, {}x{} at {:08X}",
++          is_depth ? "depth" : "color", uint32_t(edram_info.format),
++          1u << uint32_t(edram_info.msaa_samples), uint32_t(edram_info.format_is_64bpp),
++          uint32_t(copy_dest_info.copy_dest_format), uint32_t(copy_dest_info.copy_dest_number),
++          uint32_t(copy_dest_info.copy_dest_endian), int32_t(copy_dest_info.copy_dest_exp_bias),
++          uint32_t(copy_dest_info.copy_dest_swap), uint32_t(copy_dest_info.copy_dest_array),
++          uint32_t(copy_dest_coordinate_info.copy_sample_select),
++          shader != ResolveCopyShaderIndex::kUnknown
++              ? resolve_copy_shader_info[size_t(shader)].debug_name
++              : "unknown",
++          coordinate_info.width_div_8 << 3, height_div_8 << 3, copy_dest_base);
++    }
++  }
++
+   constants_out.dest_relative.edram_info = edram_info;
+   constants_out.dest_relative.coordinate_info = coordinate_info;
+   constants_out.dest_relative.dest_info = copy_dest_info;
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 001f36b..ae0bf85 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -34,6 +34,7 @@
+ #include <rex/graphics/pipeline/shader/spirv_translator.h>
+ #include <rex/graphics/registers.h>
+ #include <rex/graphics/vulkan/command_processor.h>
++#include <rex/ui/renderdoc_api.h>
+ #include <rex/graphics/vulkan/pipeline_cache.h>
+ #include <rex/graphics/vulkan/render_target_cache.h>
+ #include <rex/graphics/vulkan/shader.h>
+@@ -64,6 +65,9 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
+                     "Submit command buffer when PM4 primary buffer ends")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_INT32(renderdoc_capture_swap, 0, "GPU/Vulkan",
++                     "Debug: capture the guest frame after this many swaps in RenderDoc "
++                     "(0 = off)");
+ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
+                     "device (falls back to render passes otherwise)")
+@@ -2289,6 +2293,32 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+     return;
+   }
+ 
++  // Debug: capture all guest GPU work between two guest swaps in RenderDoc
++  // (host presentation runs at its own rate, so the host frame boundary
++  // doesn't contain the guest frame).
++  if (int32_t capture_swap = REXCVAR_GET(renderdoc_capture_swap); capture_swap > 0) {
++    static uint32_t swap_counter = 0;
++    static std::unique_ptr<ui::RenderDocAPI> renderdoc_api = ui::RenderDocAPI::CreateIfConnected();
++    ++swap_counter;
++    if (swap_counter == uint32_t(capture_swap) || swap_counter == uint32_t(capture_swap) + 1) {
++      if (renderdoc_api) {
++        // Put the guest work recorded so far on the right side of the range.
++        EndSubmission(false);
++        if (swap_counter == uint32_t(capture_swap)) {
++          renderdoc_api->api_1_0_0()->StartFrameCapture(nullptr, nullptr);
++          REXGPU_INFO("RenderDoc capture started at swap {}", swap_counter);
++        } else {
++          AwaitAllQueueOperationsCompletion();
++          renderdoc_api->api_1_0_0()->EndFrameCapture(nullptr, nullptr);
++          REXGPU_INFO("RenderDoc capture ended at swap {}", swap_counter);
++        }
++        BeginSubmission(true);
++      } else if (swap_counter == uint32_t(capture_swap)) {
++        REXGPU_WARN("renderdoc_capture_swap is set, but RenderDoc is not attached");
++      }
++    }
++  }
++
+   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
+                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
+                                             frame_used_async_placeholder_pipeline_;
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 91ac08f..f03995b 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -1246,6 +1246,11 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
+     return false;
+   }
+ 
++  // Dump shader files if desired.
++  if (!REXCVAR_GET(dump_shaders).empty()) {
++    translation.Dump(REXCVAR_GET(dump_shaders), "vulkan");
++  }
++
+   // TODO(Triang3l): Log that the shader has been successfully translated in
+   // common code.
+ 
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 8e93be2..261e979 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -3735,6 +3735,11 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
+                                         builder.makeUintConstant(8), builder.makeUintConstant(24));
+         }
+       }
++    } else if (mode.output == TransferOutput::kStencilBit && source_stencil[0] != spv::NoResult) {
++      // Depth -> stencil bit: only the stencil is loaded, and it's in the low
++      // 8 bits of the packed value. Without this, nothing kills the samples
++      // whose bit is not set, and the stencil ends up 0xFF everywhere.
++      packed = source_stencil[0];
+     }
+     switch (mode.output) {
+       case TransferOutput::kColor: {
+diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
+index 914b311..b17002b 100644
+--- a/src/ui/vulkan/vulkan_instance.cpp
++++ b/src/ui/vulkan/vulkan_instance.cpp
+@@ -134,9 +134,12 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+   // #129.
+   requested_extensions.emplace("VK_EXT_debug_utils",
+                                &vulkan_instance->extensions_.ext_EXT_debug_utils);
+-  // #395.
++  // #395. Only needed for portability subset implementations (MoltenVK);
++  // capture layers such as RenderDoc reject it at instance creation.
++#if REX_PLATFORM_MAC
+   requested_extensions.emplace("VK_KHR_portability_enumeration",
+                                &vulkan_instance->extensions_.ext_KHR_portability_enumeration);
++#endif
+   if (with_surface) {
+     // #1.
+     requested_extensions.emplace("VK_KHR_surface", &vulkan_instance->extensions_.ext_KHR_surface);
 -- 
 2.55.0.windows.3
 
