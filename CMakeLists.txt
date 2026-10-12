@@ -28,5 +28,8 @@ rexglue_setup_target(ssx)
 # One function with ~110k registration calls: optimizing it takes Apple clang
 # far longer than the rest of the build combined, and it only runs once.
 if(NOT WIN32)
+    # The precompiled header is built with optimization, which clang refuses
+    # to mix with -O0 (__OPTIMIZE__ differs), so this file goes without it.
     set_property(SOURCE generated/default/ssx_register.cpp APPEND PROPERTY COMPILE_OPTIONS -O0)
+    set_property(SOURCE generated/default/ssx_register.cpp PROPERTY SKIP_PRECOMPILE_HEADERS ON)
 endif()
