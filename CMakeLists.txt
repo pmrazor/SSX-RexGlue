@@ -35,6 +35,6 @@ if(NOT WIN32)
     # On ARM64, -O0 uses GlobalISel, which also stalls on this function.
     if(CMAKE_OSX_ARCHITECTURES MATCHES "arm64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64")
         set_property(SOURCE generated/default/ssx_register.cpp APPEND PROPERTY COMPILE_OPTIONS
-                     "SHELL:-mllvm -global-isel=0")
+                     -fno-global-isel)
     endif()
 endif()
