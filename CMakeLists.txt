@@ -23,7 +23,7 @@ else()
     add_executable(ssx ${SSX_SOURCES})
 endif()
 
-rexglue_setup_target(ssx)
+rexglue_setup_target(ssx GPU_PLUGINS xenos)
 
 # One function with ~110k registration calls: optimizing it takes Apple clang
 # far longer than the rest of the build combined, and it only runs once.
