@@ -43,15 +43,19 @@ and the kernel still go through rexglue's runtime (derived from Xenia).
    cmake --preset win-amd64
    cmake --build out/build/win-amd64 --config Release --target install
    ```
-2. **This project** (from an environment with `vcvars64.bat`, LLVM, CMake and
+2. **Recompile the game code.** From this directory, run the SDK's `rexglue`
+   tool (in the SDK install's `bin/`) on the manifest. It reads
+   `game/default.xex` and writes `generated/` (~4 minutes):
+   ```
+   rexglue codegen ssx_manifest.toml
+   ```
+3. **This project** (from an environment with `vcvars64.bat`, LLVM, CMake and
    Ninja on `PATH`):
    ```
    cmake --preset win-amd64-release
    cmake --build out/build/win-amd64-release
    ```
-   The first build runs codegen on `game/default.xex` (~4 minutes) and then
-   compiles the generated sources.
-3. Copy the SDK's runtime DLLs (`rexruntime.dll`, `rexgpu-xenos.dll`,
+4. Copy the SDK's runtime DLLs (`rexruntime.dll`, `rexgpu-xenos.dll`,
    `TracyClient.dll`) next to `ssx.exe` if the build didn't. If the SDK was
    configured with `-DREXGLUE_ENABLE_FIDELITYFX=ON`, `amd_fidelityfx_dx12.dll`
    is required too.
