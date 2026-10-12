@@ -32,4 +32,9 @@ if(NOT WIN32)
     # to mix with -O0 (__OPTIMIZE__ differs), so this file goes without it.
     set_property(SOURCE generated/default/ssx_register.cpp APPEND PROPERTY COMPILE_OPTIONS -O0)
     set_property(SOURCE generated/default/ssx_register.cpp PROPERTY SKIP_PRECOMPILE_HEADERS ON)
+    # On ARM64, -O0 uses GlobalISel, which also stalls on this function.
+    if(CMAKE_OSX_ARCHITECTURES MATCHES "arm64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64")
+        set_property(SOURCE generated/default/ssx_register.cpp APPEND PROPERTY COMPILE_OPTIONS
+                     "SHELL:-mllvm -global-isel=0")
+    endif()
 endif()
